@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 微信交流群 / WeChat Group
+    url: https://github.com/xuanyustudio/LocalMiniDrama#-联系--社区
+    about: 扫码加入用户交流群，获取使用帮助 / Scan to join the community group
+  - name: 📖 使用文档 / Documentation
+    url: https://github.com/xuanyustudio/LocalMiniDrama/tree/main/docs
+    about: 查阅快速开始、AI配置等文档 / Read quickstart and configuration docs

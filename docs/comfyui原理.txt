@@ -1,0 +1,28 @@
+
+文件 欧先生提供@全力以赴提供
+ 
+自动注入原理
+代理在收到请求后会加载对应的工作流 JSON 文件，并遍历所有节点，基于节点类型和标题识别注入点：
+
+CLIPTextEncode：标题中含有 "Positive" 的节点注入正向提示词，含有 "Negative" 的注入负向提示词。
+EmptyLatentImage / EmptySD3LatentImage / EmptyFlux2LatentImage：注入 width、height、batch_size。
+LoadImage：按标题中的 "Reference Image 1"、"Reference Image 2" 等序号排序后，依次注入参考图的文件名（参考图已被代理上传至 ComfyUI）。
+PrimitiveInt / INTConstant / PrimitiveFloat / FloatSlider：标题为 "Width"、"Height"、"Duration"、"FPS" 等会被注入相应的数值。
+RandomNoise / KSampler：统一注入生成用的随机种子。
+PromptRelayEncode：自动构建 local_prompts 和 segment_lengths（用于多镜头视频）。
+LTXVAddGuideMulti：根据参考图数量动态计算并注入引导帧索引。
+创建自定义工作流
+在 ComfyUI 中设计工作流，并为关键节点设置具有语义的标题（title）：
+正向提示词 CLIPTextEncode → 标题包含 "Positive"
+负向提示词 CLIPTextEncode → 标题包含 "Negative"
+宽度整数/浮点节点 → "Width"
+高度整数/浮点节点 → "Height"
+帧率节点 → "FPS"
+时长节点 → "Duration"
+参考图 LoadImage 节点 → "Reference Image 1"、"Reference Image 2" …（序号将决定注入顺序）
+保存工作流为 JSON 文件（文件名将作为 model 参数的值）。
+将 JSON 文件放入配置的 workflows_folder 目录。
+启动代理，即可通过指定 model 参数调用该工作流。
+
+
+https://github.com/553556705-tech/ComfyUI-OpenAI-API-Refactored/blob/main/apps/rust/comfyui-openai-api/README.md
