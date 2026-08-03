@@ -102,7 +102,7 @@ function createConfig(db, log, req) {
         endpoint = '/api/v1/nanobanana/generate-2';
         queryEndpoint = '/api/v1/nanobanana/record-info';
       }
-    } else if (p === 'agnes') {
+    } else if (p === 'agnes' || p === 'yinzi') {
       if (st === 'text') endpoint = '/chat/completions';
       else if (st === 'image' || st === 'storyboard_image') endpoint = '/images/generations';
       else if (st === 'video') {
@@ -243,6 +243,15 @@ function rowToConfig(r) {
   return cfg;
 }
 
+function toPublicConfig(config) {
+  if (!config) return config;
+  return {
+    ...config,
+    api_key: '',
+    has_api_key: Boolean(config.api_key),
+  };
+}
+
 /**
  * 测试连接：与 Go AIService.TestConnection 对齐，根据 provider 发最小请求验证 base_url + api_key
  * @param opts { base_url, api_key, model (string|string[]), provider?, endpoint?, settings? }
@@ -258,6 +267,21 @@ async function testConnection(opts) {
   const provider = (opts.provider || 'openai').toLowerCase();
   const serviceType = (opts.service_type || '').toLowerCase();
   let endpoint = opts.endpoint || '';
+
+  // YinziAPI 图片/视频固定分组不保证能枚举 /models；视频连接使用无副作用的不存在任务查询。
+  // 图片连接测试不能调用 /images/generations，否则一次“测试”就会真实扣费。
+  if (provider === 'yinzi') {
+    const probePath = serviceType === 'video'
+      ? '/videos/codex-connectivity-check-does-not-exist'
+      : '/models';
+    const res = await fetch(base + probePath, {
+      method: 'GET',
+      headers: { Authorization: 'Bearer ' + (opts.api_key || '') },
+    });
+    if (res.status === 401) throw new Error('API Key 无效 (401)');
+    if (res.status >= 500) throw new Error(`YinziAPI 服务暂时不可用 (${res.status})`);
+    return;
+  }
 
   // --- NanoBanana ---
   if (provider === 'nano_banana') {
@@ -579,4 +603,5 @@ module.exports = {
   getVendorLockStatus,
   applyVendorLock,
   bulkUpdateApiKey,
+  toPublicConfig,
 };

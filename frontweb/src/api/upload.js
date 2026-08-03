@@ -17,6 +17,13 @@ export const uploadAPI = {
       headers: { 'Content-Type': 'multipart/form-data' }
     })
   },
+  uploadReferenceMedia(file) {
+    const form = new FormData()
+    form.append('file', file)
+    return request.post('/upload/reference-media', form, {
+      headers: { 'Content-Type': 'multipart/form-data' }
+    })
+  },
   /**
    * 从图片（base64 data URL 或 http URL）提取实体特征描述，不依赖已有实体 ID。
    * entityType: 'character' | 'scene' | 'prop'

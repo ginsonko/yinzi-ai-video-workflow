@@ -100,9 +100,27 @@ function failOrphanedAsyncTasksOnStartup(db, log) {
     `SELECT id, type, status, resource_id FROM async_tasks
      WHERE status IN ('pending', 'processing') AND deleted_at IS NULL`
   ).all();
-  if (!rows.length) return 0;
-  log.warn('Failing orphaned async tasks after startup', { count: rows.length });
-  for (const row of rows) {
+  const orphaned = rows.filter((row) => {
+    if (row.type !== 'video_generation') return true;
+    try {
+      const resumable = db.prepare(
+        `SELECT id FROM video_generations
+         WHERE task_id = ? AND status = 'processing' AND deleted_at IS NULL
+           AND provider_task_id IS NOT NULL AND TRIM(provider_task_id) != ''
+         LIMIT 1`
+      ).get(row.id);
+      if (resumable) {
+        log.info('Preserving resumable video task after startup', { task_id: row.id, video_generation_id: resumable.id });
+        return false;
+      }
+    } catch (error) {
+      if (!String(error.message || '').includes('no such table')) throw error;
+    }
+    return true;
+  });
+  if (!orphaned.length) return 0;
+  log.warn('Failing orphaned async tasks after startup', { count: orphaned.length });
+  for (const row of orphaned) {
     updateTaskError(db, row.id, ORPHAN_ASYNC_TASK_MSG);
     log.info('Orphaned async task marked failed', {
       task_id: row.id,
@@ -111,7 +129,7 @@ function failOrphanedAsyncTasksOnStartup(db, log) {
       previous_status: row.status,
     });
   }
-  return rows.length;
+  return orphaned.length;
 }
 
 module.exports = {

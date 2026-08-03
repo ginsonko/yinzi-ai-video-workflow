@@ -6,6 +6,10 @@ let sharp; try { sharp = require('sharp'); } catch (_) { sharp = null; }
 const { uploadLocalImageToProxy, uploadToImageProxy } = require('./uploadService');
 const imageClient = require('./imageClient');
 const {
+  getYinziVideoCapability,
+  clampYinziVideoDuration,
+} = require('./yinziVideoCapabilities');
+const {
   clampToGeminiImageAspectRatio,
   clampToViduAspectRatio,
   pickViduResolutionParam,
@@ -32,6 +36,7 @@ function inferVideoProtocol(provider) {
   if (p === 'jimeng_ai_api') return 'jimeng_ai_api';
   if (p === 'xai' || p === 'grok') return 'xai';
   if (p === 'agnes') return 'agnes';
+  if (p === 'yinzi') return 'yinzi';
   return 'openai';
 }
 
@@ -48,7 +53,8 @@ function resolveVideoProtocol(config, modelHint) {
   if (!explicit && protocol === 'openai') {
     if (/api\.x\.ai(\/|$)/.test(baseLower)) protocol = 'xai';
     else if (/grok-imagine|grok.*video/.test(modelLower)) protocol = 'xai';
-    else if (p === 'agnes' || /agnes-video|apihub\.agnes-ai\.com/i.test(baseLower)) protocol = 'agnes';
+    else if (provider === 'yinzi' || /(^|\.)api\.yinziapi\.top(\/|$)/i.test(baseLower)) protocol = 'yinzi';
+    else if (provider === 'agnes' || /agnes-video|apihub\.agnes-ai\.com/i.test(baseLower)) protocol = 'agnes';
   }
   return protocol;
 }
@@ -992,6 +998,15 @@ function buildAgnesPollUrl(config, pollId) {
   return `${root}/v1/videos/${encodeURIComponent(id)}`;
 }
 
+function buildYinziPollUrl(config, pollId) {
+  const root = getAgnesApiRoot(config.base_url);
+  return `${root}/v1/videos/${encodeURIComponent(String(pollId || '').trim())}`;
+}
+
+function buildYinziContentUrl(config, pollId) {
+  return `${buildYinziPollUrl(config, pollId)}/content`;
+}
+
 /**
  * 对齐 new-api：extractVideoURL + taskcommon.ExtractVideoURLFromJSON，
  * 并兼容当前 Agnes 完成态把直链放在 metadata.url（实测 2026-07）。
@@ -1020,6 +1035,21 @@ function extractAgnesVideoUrl(data) {
   return pickProxyVideoUrl(data);
 }
 
+function extractYinziVideoUrl(data) {
+  if (!data || typeof data !== 'object') return null;
+  const artifacts = Array.isArray(data.artifacts) ? data.artifacts : [];
+  const candidates = [
+    data.content_url,
+    ...artifacts.flatMap((artifact) => [artifact?.download_url, artifact?.content_url]),
+    data.url,
+  ];
+  for (const candidate of candidates) {
+    const url = coerceHttpVideoUrl(candidate);
+    if (url) return url;
+  }
+  return extractAgnesVideoUrl(data);
+}
+
 function buildQueryUrl(config, taskId) {
   const p = (config.provider || '').toLowerCase();
   const proto = resolveVideoProtocol(config);
@@ -1028,6 +1058,7 @@ function buildQueryUrl(config, taskId) {
   const isSora = proto === 'sora';
   if (isVolc) return getVolcVideoBase(config) + VOLC_VIDEO_QUERY_PATH + '/' + encodeURIComponent(taskId);
   if (proto === 'agnes') return buildAgnesPollUrl(config, taskId);
+  if (proto === 'yinzi') return buildYinziPollUrl(config, taskId);
   const base = (config.base_url || '').replace(/\/$/, '');
   let defaultEp;
   if (isSora) defaultEp = '/v1/videos/{taskId}';
@@ -2375,6 +2406,15 @@ function formatVideoPostBodyForLog(body) {
       return out;
     });
   }
+  if (Array.isArray(clone.references)) {
+    clone.references = clone.references.map((item, i) => {
+      const safe = { type: item?.type, role: item?.role, index: i };
+      if (item?.url) safe.url = summarizeMediaValueForLog(item.url);
+      if (item?.data_url) safe.data_url = summarizeMediaValueForLog(item.data_url);
+      if (item?.file_id) safe.file_id = '(site file reference)';
+      return safe;
+    });
+  }
   if (Array.isArray(clone.content)) {
     clone.content = clone.content.map((part) => {
       if (part?.type === 'image_url' && part.image_url?.url) {
@@ -2618,6 +2658,336 @@ async function callAgnesVideoApi(db, config, log, opts) {
 
   log.error('[Agnes] 无 task_id 或 video_url', { data: JSON.stringify(data).slice(0, 500), video_gen_id });
   return { error: 'Agnes 未返回 task_id 或 video_url: ' + JSON.stringify(data).slice(0, 300) };
+}
+
+function isYinziAizzzVideoModel(model) {
+  return !!getYinziVideoCapability(model)
+    || /^(mg-seedance2\.0|cc-seedance2\.0|xx-seedance|破甲seedance)/i.test(String(model || '').trim());
+}
+
+function buildYinziVideoRequest({ model, prompt, duration, aspect_ratio, resolution, references }) {
+  const seconds = clampYinziVideoDuration(model, duration);
+  const body = {
+    model: String(model || ''),
+    prompt: String(prompt || ''),
+    aspect_ratio: aspect_ratio || '16:9',
+    duration: seconds,
+    seconds,
+  };
+  if (resolution) body.resolution = String(resolution);
+  if (Array.isArray(references) && references.length) {
+    body.references = references.map((item) => {
+      const reference = { type: item.type || 'image', role: item.role || 'reference' };
+      if (item.file_id) reference.file_id = item.file_id;
+      else if (item.data_url) reference.data_url = item.data_url;
+      else reference.url = item.url;
+      return reference;
+    });
+  }
+  return body;
+}
+
+function yinziReference(type, role, source) {
+  if (!source) return null;
+  if (typeof source === 'object') {
+    const reference = { type, role };
+    if (source.file_id) reference.file_id = source.file_id;
+    else if (source.data_url) reference.data_url = source.data_url;
+    else if (source.url) reference.url = source.url;
+    else return null;
+    return reference;
+  }
+  const value = String(source).trim();
+  if (!value) return null;
+  return value.startsWith('data:')
+    ? { type, role, data_url: value }
+    : { type, role, url: value };
+}
+
+function buildYinziReferences(input, resolved = {}) {
+  const refs = [];
+  const rawImages = Array.isArray(input?.reference_urls) ? input.reference_urls.filter(Boolean) : [];
+  if (rawImages.length) {
+    for (const source of resolved.images || resolved.references || []) {
+      const reference = yinziReference('image', 'reference', source);
+      if (reference) refs.push(reference);
+    }
+  } else if (isYinziAizzzVideoModel(input?.model)) {
+    const reference = yinziReference('image', 'reference', resolved.first);
+    if (reference) refs.push(reference);
+  } else {
+    const first = yinziReference('image', 'first_frame', resolved.first);
+    const last = yinziReference('image', 'last_frame', resolved.last);
+    if (first) refs.push(first);
+    if (last && JSON.stringify(last) !== JSON.stringify(first)) refs.push(last);
+  }
+  for (const source of resolved.videos || []) {
+    const reference = yinziReference('video', 'reference', source);
+    if (reference) refs.push(reference);
+  }
+  for (const source of resolved.audios || []) {
+    const reference = yinziReference('audio', 'reference', source);
+    if (reference) refs.push(reference);
+  }
+  return refs;
+}
+
+function dedupeReferenceInputs(values) {
+  const seen = new Set();
+  const result = [];
+  for (const value of Array.isArray(values) ? values : []) {
+    const normalized = String(value || '').trim();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    result.push(normalized);
+  }
+  return result;
+}
+
+function validateYinziReferenceCounts(model, images, videos, audios) {
+  const capability = getYinziVideoCapability(model);
+  if (!capability) return null;
+  const checks = [
+    ['图片', images.length, capability.max_images],
+    ['视频', videos.length, capability.max_videos],
+    ['音频', audios.length, capability.max_audios],
+  ];
+  for (const [label, actual, maximum] of checks) {
+    if (actual > maximum) return `${model} 最多支持 ${maximum} 个参考${label}，当前为 ${actual} 个；已在提交前停止。`;
+  }
+  if (images.length + videos.length + audios.length > capability.max_total_references) {
+    return `${model} 的参考媒体总数超过 ${capability.max_total_references}；已在提交前停止。`;
+  }
+  return null;
+}
+
+function localReferencePath(raw, storageLocalPath) {
+  if (!storageLocalPath) return null;
+  let value = String(raw || '').trim();
+  if (!value || value.startsWith('data:')) return null;
+  if (/^https?:\/\//i.test(value)) {
+    try {
+      const parsed = new URL(value);
+      if (!['localhost', '127.0.0.1', '0.0.0.0'].includes(parsed.hostname)) return null;
+      value = parsed.pathname;
+    } catch (_) {
+      return null;
+    }
+  }
+  const staticIndex = value.indexOf('/static/');
+  if (staticIndex >= 0) value = value.slice(staticIndex + '/static/'.length);
+  value = decodeURIComponent(value).replace(/^[/\\]+/, '');
+  const root = path.resolve(storageLocalPath);
+  const candidate = path.resolve(root, value);
+  if (candidate !== root && !candidate.startsWith(root + path.sep)) return null;
+  return fs.existsSync(candidate) && fs.statSync(candidate).isFile() ? candidate : null;
+}
+
+function mimeTypeForReference(filePath, type) {
+  const ext = path.extname(filePath).toLowerCase();
+  const mime = {
+    '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif',
+    '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm', '.mkv': 'video/x-matroska',
+    '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.m4a': 'audio/mp4', '.ogg': 'audio/ogg', '.aac': 'audio/aac',
+  }[ext];
+  return mime || `${type}/octet-stream`;
+}
+
+async function uploadYinziReferenceFile(config, filePath, type, capability, log, videoGenId, index) {
+  const size = fs.statSync(filePath).size;
+  const maxBytes = capability?.[`max_${type}_bytes`];
+  if (maxBytes && size > maxBytes) {
+    throw new Error(`参考${type}文件超过 ${(maxBytes / 1024 / 1024).toFixed(0)}MB 限制`);
+  }
+  const base = String(config.base_url || 'https://api.yinziapi.top/v1').replace(/\/$/, '');
+  const form = new FormData();
+  form.append('purpose', 'user_data');
+  form.append('file', new Blob([fs.readFileSync(filePath)], { type: mimeTypeForReference(filePath, type) }), path.basename(filePath));
+  const response = await fetch(`${base}/files`, {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + (config.api_key || '') },
+    body: form,
+    signal: AbortSignal.timeout(120000),
+  });
+  const raw = await response.text();
+  if (!response.ok) {
+    throw new Error(`YinziAPI 参考媒体上传失败: HTTP ${response.status} - ${raw.slice(0, 240)}`);
+  }
+  const data = JSON.parse(raw);
+  const fileId = data.id || data.file_id || data.data?.id || data.data?.file_id;
+  if (!fileId) throw new Error('YinziAPI 参考媒体上传未返回 file_id');
+  log.info('[YinziAPI] Reference file uploaded', { video_gen_id: videoGenId, type, index, bytes: size });
+  return { file_id: String(fileId) };
+}
+
+async function resolveYinziReferenceSource(config, raw, type, capability, opts, log, index) {
+  const value = String(raw || '').trim();
+  if (!value) return null;
+  if (value.startsWith('data:')) {
+    if (type !== 'image' || !value.toLowerCase().startsWith('data:image/')) {
+      throw new Error('YinziAPI 仅允许图片参考使用 data URL；视频和音频请上传文件或使用公网 URL');
+    }
+    return { data_url: value };
+  }
+  if (/^https?:\/\//i.test(value) && !/localhost|127\.0\.0\.1|0\.0\.0\.0/i.test(value)) {
+    return { url: value };
+  }
+  const filePath = localReferencePath(value, opts.storage_local_path);
+  if (!filePath) throw new Error(`本地参考${type}文件不存在或不在媒体目录中`);
+  return uploadYinziReferenceFile(config, filePath, type, capability, log, opts.video_gen_id, index);
+}
+
+async function callYinziVideoApi(db, config, log, opts) {
+  const base = String(config.base_url || 'https://api.yinziapi.top/v1').replace(/\/$/, '');
+  let endpoint = config.endpoint || '/videos';
+  if (!endpoint.startsWith('/')) endpoint = '/' + endpoint;
+  const url = base + endpoint;
+
+  const capability = getYinziVideoCapability(opts.model);
+  const rawReferenceUrls = dedupeReferenceInputs(opts.reference_urls);
+  const rawVideoUrls = dedupeReferenceInputs(opts.reference_video_urls);
+  const rawAudioUrls = dedupeReferenceInputs(opts.reference_audio_urls);
+  const legacyFirst = String(opts.first_frame_url || opts.image_url || '').trim();
+  const rawImageCount = rawReferenceUrls.length || (legacyFirst ? 1 : 0);
+  const countError = validateYinziReferenceCounts(
+    opts.model,
+    { length: rawImageCount },
+    rawVideoUrls,
+    rawAudioUrls
+  );
+  if (countError) return { error: countError };
+
+  if (String(opts.last_frame_url || '').trim() && isYinziAizzzVideoModel(opts.model)) {
+    return { error: '该 YinziAPI Seedance 路由使用通用 reference，不支持 last_frame 角色；已在提交前停止，未创建上游任务。' };
+  }
+
+  const resolvedReferences = [];
+  for (let i = 0; i < rawReferenceUrls.length; i++) {
+    try {
+      resolvedReferences.push(await resolveYinziReferenceSource(
+        config, rawReferenceUrls[i], 'image', capability, opts, log, i
+      ));
+    } catch (error) {
+      return { error: error.message };
+    }
+  }
+  const resolvedVideos = [];
+  for (let i = 0; i < rawVideoUrls.length; i++) {
+    try {
+      resolvedVideos.push(await resolveYinziReferenceSource(
+        config, rawVideoUrls[i], 'video', capability, opts, log, i
+      ));
+    } catch (error) {
+      return { error: error.message };
+    }
+  }
+  const resolvedAudios = [];
+  for (let i = 0; i < rawAudioUrls.length; i++) {
+    try {
+      resolvedAudios.push(await resolveYinziReferenceSource(
+        config, rawAudioUrls[i], 'audio', capability, opts, log, i
+      ));
+    } catch (error) {
+      return { error: error.message };
+    }
+  }
+
+  let first = null;
+  let last = null;
+  if (!rawReferenceUrls.length) {
+    const rawFirst = legacyFirst;
+    const rawLast = String(opts.last_frame_url || '').trim();
+    if (rawFirst) {
+      try {
+        first = await resolveYinziReferenceSource(config, rawFirst, 'image', capability, opts, log, 'first');
+      } catch (error) {
+        return { error: error.message };
+      }
+    }
+    if (rawLast) {
+      try {
+        last = await resolveYinziReferenceSource(config, rawLast, 'image', capability, opts, log, 'last');
+      } catch (error) {
+        return { error: error.message };
+      }
+    }
+  } else if (!resolvedReferences.length) {
+    return { error: 'YinziAPI 参考图无法转换为上游可访问的图片' };
+  }
+
+  const references = buildYinziReferences(opts, {
+    images: resolvedReferences,
+    videos: resolvedVideos,
+    audios: resolvedAudios,
+    first,
+    last,
+  });
+  const body = buildYinziVideoRequest({
+    model: opts.model,
+    prompt: opts.prompt,
+    duration: opts.duration,
+    aspect_ratio: opts.aspect_ratio,
+    resolution: opts.resolution,
+    references,
+  });
+  logVideoPostRequest(log, 'YinziAPI', url, body, opts.video_gen_id, {
+    model: body.model,
+    aspect_ratio: body.aspect_ratio,
+    seconds: body.seconds,
+    reference_summary: references.reduce((summary, item) => {
+      summary[item.type] = (summary[item.type] || 0) + 1;
+      return summary;
+    }, {}),
+    retry_policy: 'never_retry_ambiguous_post',
+  });
+
+  let res;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer ' + (config.api_key || ''),
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(120000),
+    });
+  } catch (error) {
+    return {
+      error: `YinziAPI 视频提交连接中断（${error.message || '网络错误'}）。上游可能已经受理并扣费，本应用不会自动重试；请先到站点任务记录核对。`,
+      ambiguous_submission: true,
+    };
+  }
+
+  const raw = await res.text();
+  log.info('[YinziAPI] Video POST response', {
+    video_gen_id: opts.video_gen_id,
+    status: res.status,
+    body: raw.slice(0, 1200),
+  });
+  if (!res.ok) {
+    let message = `YinziAPI 视频请求失败: HTTP ${res.status}`;
+    try {
+      const data = JSON.parse(raw);
+      const detail = data.error?.message || data.message || data.error;
+      if (detail) message += ' - ' + String(typeof detail === 'string' ? detail : JSON.stringify(detail)).slice(0, 300);
+    } catch (_) {
+      if (raw) message += ' - ' + raw.slice(0, 300);
+    }
+    return { error: message };
+  }
+
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch (error) {
+    return { error: `YinziAPI 视频响应不是有效 JSON: ${error.message}` };
+  }
+  const videoUrl = extractYinziVideoUrl(data);
+  if (videoUrl) return { video_url: videoUrl };
+  const taskId = data.id || data.task_id || data.video_id || data.data?.id || data.data?.task_id;
+  if (taskId) return { task_id: String(taskId), status: data.status || data.data?.status || 'processing' };
+  return { error: 'YinziAPI 未返回任务 ID 或视频地址: ' + JSON.stringify(data).slice(0, 300) };
 }
 
 /**
@@ -3525,6 +3895,8 @@ async function callVideoApi(db, log, opts) {
       first_frame_url: opts.first_frame_url,
       last_frame_url: opts.last_frame_url,
       reference_urls: opts.reference_urls,
+      reference_video_urls: opts.reference_video_urls,
+      reference_audio_urls: opts.reference_audio_urls,
       files_base_url: opts.files_base_url,
       storage_local_path: opts.storage_local_path,
       video_gen_id: opts.video_gen_id,
@@ -3652,6 +4024,23 @@ async function callVideoApi(db, log, opts) {
       aspect_ratio,
       image_url: opts.image_url,
       resolution: opts.resolution,
+      files_base_url: opts.files_base_url,
+      storage_local_path: opts.storage_local_path,
+      video_gen_id: opts.video_gen_id,
+    });
+  }
+
+  if (protocol === 'yinzi') {
+    return callYinziVideoApi(db, config, log, {
+      prompt,
+      model,
+      duration: opts.duration,
+      aspect_ratio,
+      resolution: opts.resolution,
+      image_url: opts.image_url,
+      first_frame_url: opts.first_frame_url,
+      last_frame_url: opts.last_frame_url,
+      reference_urls: opts.reference_urls,
       files_base_url: opts.files_base_url,
       storage_local_path: opts.storage_local_path,
       video_gen_id: opts.video_gen_id,
@@ -3831,6 +4220,7 @@ async function pollVideoTask(db, log, videoGenId, taskId, config, maxAttempts = 
   const isVidu = protocol === 'vidu';
   const isSora = protocol === 'sora';
   const isAgnes = protocol === 'agnes';
+  const isYinzi = protocol === 'yinzi';
   const isKling = protocol === 'kling';
   const isKlingOmni = protocol === 'kling_omni' || (typeof taskId === 'string' && taskId.startsWith('omni:'));
   const isVeo3 = protocol === 'veo3';
@@ -3852,6 +4242,8 @@ async function pollVideoTask(db, log, videoGenId, taskId, config, maxAttempts = 
     return { error: 'Jimeng AI API 为同步返回视频地址，不应进入轮询' };
   }
   let pollTaskId = taskId;
+  let lastPendingStatus = '';
+  let lastPendingProgress = null;
   /** Agnes：completed 后 remixed_from_video_id / metadata.url 偶发迟到，对齐 new-api 继续多查几轮 */
   let agnesCompletedWithoutUrl = 0;
   const AGNES_COMPLETED_URL_GRACE = 12;
@@ -3932,6 +4324,9 @@ async function pollVideoTask(db, log, videoGenId, taskId, config, maxAttempts = 
           http_status: res.status,
           body: bodyLogged.slice(0, 4000),
         });
+        if (isYinzi && (res.status === 401 || res.status === 403)) {
+          return { error: `YinziAPI 视频任务查询鉴权失败: HTTP ${res.status}` };
+        }
         continue;
       }
       let data;
@@ -4034,6 +4429,22 @@ async function pollVideoTask(db, log, videoGenId, taskId, config, maxAttempts = 
           return { error: 'Sora ?????????????????: ' + JSON.stringify(data).slice(0, 300) };
         }
         // queued / processing / running ? ????
+        continue;
+      }
+
+      if (isYinzi) {
+        const status = extractPollTaskStatus(data);
+        lastPendingStatus = status;
+        lastPendingProgress = Number.isFinite(Number(data?.progress)) ? Number(data.progress) : lastPendingProgress;
+        if (isPollTaskFailed(status)) {
+          const message = extractPollFailureMessage(data) || 'YinziAPI 视频任务失败';
+          return { error: String(message).slice(0, 500) };
+        }
+        const videoUrl = extractYinziVideoUrl(data);
+        if (videoUrl) return { video_url: videoUrl };
+        if (status === 'succeeded' || status === 'completed' || status === 'done') {
+          return { content_url: buildYinziContentUrl(config, pollTaskId) };
+        }
         continue;
       }
 
@@ -4165,7 +4576,11 @@ async function pollVideoTask(db, log, videoGenId, taskId, config, maxAttempts = 
       log.warn('Video poll request failed', { attempt, error: e.message });
     }
   }
-  return { error: '??????' };
+  return {
+    pending: true,
+    status: lastPendingStatus || 'processing',
+    progress: lastPendingProgress,
+  };
 }
 
 module.exports = {
@@ -4176,9 +4591,17 @@ module.exports = {
   isPlausibleHttpVideoUrl,
   pickProxyVideoUrl,
   extractAgnesVideoUrl,
+  extractYinziVideoUrl,
   buildAgnesPollUrl,
+  buildYinziPollUrl,
+  buildYinziContentUrl,
   getAgnesApiRoot,
   buildAgnesVideoImagePayload,
+  buildYinziVideoRequest,
+  buildYinziReferences,
+  isYinziAizzzVideoModel,
+  callYinziVideoApi,
+  resolveVideoProtocol,
   formatVideoPostBodyForLog,
   isSeedance2FamilyModel,
   normalizeVolcengineDuration,

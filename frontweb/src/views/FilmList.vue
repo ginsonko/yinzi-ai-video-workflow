@@ -37,6 +37,9 @@
           <el-button class="btn-settings" @click="showAiConfigDialog = true">
             <el-icon><Setting /></el-icon>AI配置
           </el-button>
+          <el-button class="btn-director" title="打开独立 3D 导演台" @click="router.push('/director')">
+            <el-icon><Camera /></el-icon>3D 导演台
+          </el-button>
           <el-button class="btn-import" :loading="importing" @click="triggerImport">
             <el-icon><Upload /></el-icon>导入项目
           </el-button>
@@ -90,6 +93,8 @@
             @click="openProject(d.id)"
           >
             <div class="project-card-actions" @click.stop>
+              <el-button size="small" circle type="primary" :icon="MagicStick" title="打开新手制作向导" @click="router.push(`/workflow/${d.id}`)" />
+              <el-button size="small" circle :icon="Camera" title="打开项目 3D 导演台" @click="router.push(`/director/${d.id}`)" />
               <el-button size="small" circle :icon="Download" title="导出项目" :loading="exportingId === d.id" @click="onExport(d)" />
               <el-button size="small" circle :icon="Edit" title="编辑" @click="openEditDialog(d)" />
               <el-button size="small" type="danger" plain circle :icon="Delete" title="删除" @click="onDelete(d)" />
@@ -356,7 +361,7 @@
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Edit, Delete, Setting, Plus, User, PictureFilled, Box, Sunny, Moon, ChatDotSquare, Download, Upload, QuestionFilled, FolderOpened, MagicStick, Files } from '@element-plus/icons-vue'
+import { Camera, Edit, Delete, Setting, Plus, User, PictureFilled, Box, Sunny, Moon, ChatDotSquare, Download, Upload, QuestionFilled, FolderOpened, MagicStick, Files } from '@element-plus/icons-vue'
 import { useTheme } from '@/composables/useTheme'
 import { dramaAPI } from '@/api/drama'
 import { characterLibraryAPI } from '@/api/characterLibrary'
@@ -983,6 +988,24 @@ html.light .btn-settings {
   --el-button-hover-text-color: #78350f;
   --el-button-active-bg-color: rgba(180, 83, 9, 0.18);
   --el-button-active-border-color: rgba(180, 83, 9, 0.6);
+}
+
+/* 3D 导演台按钮 —— 青绿色，与摄像机工作区一致 */
+.btn-director {
+  --el-button-bg-color: rgba(20, 184, 166, 0.1);
+  --el-button-border-color: rgba(20, 184, 166, 0.32);
+  --el-button-text-color: #5eead4;
+  --el-button-hover-bg-color: rgba(20, 184, 166, 0.2);
+  --el-button-hover-border-color: rgba(20, 184, 166, 0.52);
+  --el-button-hover-text-color: #99f6e4;
+}
+html.light .btn-director {
+  --el-button-bg-color: rgba(13, 148, 136, 0.08);
+  --el-button-border-color: rgba(13, 148, 136, 0.3);
+  --el-button-text-color: #0f766e;
+  --el-button-hover-bg-color: rgba(13, 148, 136, 0.15);
+  --el-button-hover-border-color: rgba(13, 148, 136, 0.5);
+  --el-button-hover-text-color: #115e59;
 }
 
 /* 导入按钮 —— 亮色模式下提升可读性 */

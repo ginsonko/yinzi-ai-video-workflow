@@ -32,5 +32,11 @@ export const aiAPI = {
   },
   bulkUpdateKey(apiKey) {
     return request.put('/ai-configs/bulk-update-key', { api_key: apiKey })
+  },
+  getYinziCatalog() {
+    return request.get('/ai-configs/yinzi/catalog')
+  },
+  setupYinzi(body) {
+    return request.post('/ai-configs/yinzi/setup', body)
   }
 }

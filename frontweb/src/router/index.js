@@ -28,6 +28,18 @@ const router = createRouter({
       meta: { title: '画布模式' }
     },
     {
+      path: '/director/:id?',
+      name: 'director-studio',
+      component: () => import('@/views/DirectorStudio.vue'),
+      meta: { title: '3D 导演台' }
+    },
+    {
+      path: '/workflow/:id',
+      name: 'production-workflow',
+      component: () => import('@/views/ProductionWorkflow.vue'),
+      meta: { title: 'AI 视频制作向导' }
+    },
+    {
       path: '/ai-config',
       name: 'ai-config',
       component: () => import('@/views/AiConfig.vue'),

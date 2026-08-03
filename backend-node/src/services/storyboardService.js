@@ -55,6 +55,47 @@ function syncStoryboardCharacterLinks(db, storyboardId, dramaCharacterIds) {
   }
 }
 
+function parseJsonValue(value, fallback) {
+  if (value == null || value === '') return fallback;
+  if (typeof value === 'object') return value;
+  try {
+    return JSON.parse(String(value));
+  } catch (_) {
+    return fallback;
+  }
+}
+
+function normalizeWorkflowReferences(value) {
+  const input = parseJsonValue(value, {});
+  const limits = { images: 4, videos: 3, audios: 1 };
+  const result = { images: [], videos: [], audios: [] };
+  for (const [type, limit] of Object.entries(limits)) {
+    const list = Array.isArray(input?.[type]) ? input[type] : [];
+    const seen = new Set();
+    for (const item of list) {
+      const source = typeof item === 'string' ? { path: item } : (item || {});
+      const mediaPath = String(source.path || source.local_path || source.url || '').trim();
+      if (!mediaPath || mediaPath.length > 4096 || seen.has(mediaPath)) continue;
+      seen.add(mediaPath);
+      result[type].push({
+        path: mediaPath,
+        label: String(source.label || '').trim().slice(0, 160),
+        source: String(source.source || 'upload').trim().slice(0, 40),
+      });
+      if (result[type].length >= limit) break;
+    }
+  }
+  return result;
+}
+
+function normalizeDirectorScene(value) {
+  const document = parseJsonValue(value, null);
+  if (!document || typeof document !== 'object' || Array.isArray(document)) return null;
+  const serialized = JSON.stringify(document);
+  if (serialized.length > 1024 * 1024) throw new Error('3D director scene exceeds the 1 MB limit');
+  return serialized;
+}
+
 function createStoryboard(db, log, req) {
   const now = new Date().toISOString();
   const episodeId = Number(req.episode_id);
@@ -87,7 +128,7 @@ function createStoryboard(db, log, req) {
 function updateStoryboard(db, log, id, req) {
   const row = db.prepare('SELECT id FROM storyboards WHERE id = ? AND deleted_at IS NULL').get(Number(id));
   if (!row) return null;
-  const allowed = ['title', 'description', 'location', 'time', 'duration', 'dialogue', 'narration', 'action', 'result', 'atmosphere', 'image_prompt', 'polished_prompt', 'video_prompt', 'scene_id', 'characters', 'composed_image', 'image_url', 'local_path', 'main_panel_idx', 'video_url', 'audio_local_path', 'narration_audio_local_path', 'status', 'shot_type', 'angle', 'angle_h', 'angle_v', 'angle_s', 'movement', 'segment_index', 'segment_title', 'creation_mode', 'universal_segment_text', 'layout_description', 'first_frame_image_id', 'last_frame_image_id', 'last_frame_image_url', 'last_frame_local_path'];
+  const allowed = ['title', 'description', 'location', 'time', 'duration', 'dialogue', 'narration', 'action', 'result', 'atmosphere', 'image_prompt', 'polished_prompt', 'video_prompt', 'scene_id', 'characters', 'composed_image', 'image_url', 'local_path', 'main_panel_idx', 'video_url', 'audio_local_path', 'narration_audio_local_path', 'status', 'shot_type', 'angle', 'angle_h', 'angle_v', 'angle_s', 'movement', 'segment_index', 'segment_title', 'creation_mode', 'universal_segment_text', 'layout_description', 'first_frame_image_id', 'last_frame_image_id', 'last_frame_image_url', 'last_frame_local_path', 'workflow_selected', 'workflow_approved_at', 'director_frame_path', 'director_preview_path'];
   const updates = [];
   const params = [];
   // 前端可能传 character_ids，与 characters 统一：存为 JSON 字符串
@@ -104,8 +145,16 @@ function updateStoryboard(db, log, id, req) {
     if (req[key] !== undefined) {
       updates.push(key + ' = ?');
       const val = req[key];
-      params.push(val);
+      params.push(key === 'workflow_selected' ? (val ? 1 : 0) : val);
     }
+  }
+  if (req.workflow_references !== undefined) {
+    updates.push('workflow_references = ?');
+    params.push(JSON.stringify(normalizeWorkflowReferences(req.workflow_references)));
+  }
+  if (req.director_scene_json !== undefined) {
+    updates.push('director_scene_json = ?');
+    params.push(req.director_scene_json == null ? null : normalizeDirectorScene(req.director_scene_json));
   }
   if (updates.length === 0 && req.prop_ids === undefined) return getStoryboardById(db, id);
   if (updates.length > 0) {
@@ -187,6 +236,12 @@ function getStoryboardById(db, id) {
     last_frame_image_id: r.last_frame_image_id ?? null,
     last_frame_image_url: r.last_frame_image_url ?? null,
     last_frame_local_path: r.last_frame_local_path ?? null,
+    workflow_selected: r.workflow_selected == null ? true : Boolean(r.workflow_selected),
+    workflow_references: normalizeWorkflowReferences(r.workflow_references),
+    workflow_approved_at: r.workflow_approved_at ?? null,
+    director_scene_json: parseJsonValue(r.director_scene_json, null),
+    director_frame_path: r.director_frame_path ?? null,
+    director_preview_path: r.director_preview_path ?? null,
     characters,
     prop_ids: propIds,
     composed_image: r.composed_image,
@@ -268,4 +323,6 @@ module.exports = {
   getStoryboardById,
   getFramePrompts,
   saveFramePrompt,
+  normalizeWorkflowReferences,
+  normalizeDirectorScene,
 };

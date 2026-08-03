@@ -45,6 +45,23 @@ const audioUpload = multer({
   },
 });
 
+const referenceMediaLimits = Object.freeze({
+  image: 30 * 1024 * 1024,
+  video: 50 * 1024 * 1024,
+  audio: 15 * 1024 * 1024,
+});
+const referenceMediaUpload = multer({
+  storage: memoryStorage,
+  limits: { fileSize: referenceMediaLimits.video },
+  fileFilter: (req, file, cb) => {
+    const mediaType = String(file.mimetype || '').split('/')[0];
+    if (!referenceMediaLimits[mediaType]) {
+      return cb(new Error('参考媒体仅支持图片、视频或音频文件'));
+    }
+    cb(null, true);
+  },
+});
+
 function routes(cfg, log, db) {
   const singleUpload = upload.single('file');
   return {
@@ -92,6 +109,40 @@ function routes(cfg, log, db) {
         response.internalError(res, err.message || '上传失败');
       }
     },
+    uploadReferenceMedia: (req, res) => {
+      if (!req.file || !req.file.buffer) {
+        return response.badRequest(res, '请选择参考媒体文件');
+      }
+      try {
+        const mediaType = String(req.file.mimetype || '').split('/')[0];
+        const maxBytes = referenceMediaLimits[mediaType];
+        if (!maxBytes || req.file.size > maxBytes) {
+          return response.badRequest(res, `参考${mediaType || '媒体'}文件超出大小限制`);
+        }
+        const rawStorage = cfg?.storage?.local_path || './data/storage';
+        const storagePath = path.isAbsolute(rawStorage) ? rawStorage : path.join(process.cwd(), rawStorage);
+        const result = uploadService.uploadFile(
+          storagePath,
+          cfg?.storage?.base_url || '',
+          log,
+          req.file.buffer,
+          req.file.originalname || 'reference.bin',
+          req.file.mimetype,
+          'references'
+        );
+        response.success(res, {
+          url: result.url,
+          local_path: result.local_path,
+          filename: req.file.originalname,
+          size: req.file.size,
+          mime_type: req.file.mimetype,
+          media_type: mediaType,
+        });
+      } catch (err) {
+        log.error('upload reference media', { error: err.message });
+        response.internalError(res, err.message || '参考媒体上传失败');
+      }
+    },
   };
 }
 
@@ -100,5 +151,6 @@ module.exports = {
   upload,
   multerSingle: upload.single('file'),
   multerAudioSingle: audioUpload.single('file'),
+  multerReferenceMediaSingle: referenceMediaUpload.single('file'),
   MAX_IMAGE_SIZE_MB: MAX_SIZE_MB,
 };

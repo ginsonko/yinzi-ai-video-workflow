@@ -19,6 +19,10 @@
                 导入配置
               </el-button>
               <input ref="importFileRef" type="file" accept=".json" style="display:none" @change="importConfigs" />
+              <el-button type="primary" plain @click="openOneKeyYinzi">
+                <el-icon><MagicStick /></el-icon>
+                配置 YinziAPI
+              </el-button>
               <el-button type="success" plain @click="openOneKeyVolc">
                 <el-icon><MagicStick /></el-icon>
                 一键配置火山
@@ -217,12 +221,12 @@
           <el-descriptions-item label="厂商">{{ form.provider }}</el-descriptions-item>
         </el-descriptions>
         <el-form ref="formRef" :model="form" label-width="100px">
-          <el-form-item prop="api_key" :rules="[{ required: true, message: '请输入 API Key', trigger: 'blur' }]">
+          <el-form-item prop="api_key" :rules="rules.api_key">
             <template #label><span class="form-label-tip">API Key</span></template>
             <el-input
               v-model="form.api_key"
               type="password"
-              :placeholder="form.provider === 'jimeng_ai_api' ? '即梦 Session，多个用英文逗号分隔' : '输入你的 API 密钥'"
+              :placeholder="editingId && list.find((item) => item.id === editingId)?.has_api_key ? '已保存，留空保持不变' : (form.provider === 'jimeng_ai_api' ? '即梦 Session，多个用英文逗号分隔' : '输入你的 API 密钥')"
               show-password
             />
           </el-form-item>
@@ -553,7 +557,7 @@ input_reference = (图片文件，可选)</pre>
           <el-input
             v-model="form.api_key"
             type="password"
-            :placeholder="form.service_type === 'jimeng2_character_auth' ? 'Bearer Token' : (form.provider === 'jimeng_ai_api' ? '即梦 Session，多个用英文逗号分隔' : 'API 密钥')"
+            :placeholder="editingId && list.find((item) => item.id === editingId)?.has_api_key ? '已保存，留空保持不变' : (form.service_type === 'jimeng2_character_auth' ? 'Bearer Token' : (form.provider === 'jimeng_ai_api' ? '即梦 Session，多个用英文逗号分隔' : 'API 密钥'))"
             show-password
           />
         </el-form-item>
@@ -1001,6 +1005,70 @@ input_reference = (图片文件，可选)</pre>
       </template>
     </el-dialog>
 
+    <el-dialog
+      v-model="oneKeyYinziVisible"
+      title="配置 YinziAPI"
+      width="680px"
+      class="yinzi-config-dialog"
+      :close-on-click-modal="false"
+      @closed="resetOneKeyYinzi"
+    >
+      <div class="yinzi-catalog-bar">
+        <div>
+          <strong>公开模型目录</strong>
+          <span v-if="yinziCatalog.pricing_version" class="yinzi-catalog-version">{{ yinziCatalog.pricing_version }}</span>
+          <p>{{ yinziCatalogMessage }}</p>
+        </div>
+        <el-button :icon="Refresh" circle :loading="oneKeyYinziCatalogLoading" title="刷新模型目录" @click="loadYinziCatalog" />
+      </div>
+
+      <el-form label-position="top" class="yinzi-config-form">
+        <el-form-item label="API Base URL" required>
+          <el-input v-model="oneKeyYinziForm.base_url" placeholder="https://api.yinziapi.top/v1" clearable />
+        </el-form-item>
+
+        <div class="yinzi-field-grid">
+          <el-form-item label="文本 API Key" required>
+            <el-input v-model="oneKeyYinziForm.text_api_key" type="password" show-password clearable autocomplete="new-password" />
+          </el-form-item>
+          <el-form-item label="文本模型" required>
+            <el-select v-model="oneKeyYinziForm.text_model" filterable allow-create default-first-option placeholder="选择或输入模型">
+              <el-option v-for="item in yinziCatalog.text" :key="item.model" :label="catalogOptionLabel(item)" :value="item.model" />
+            </el-select>
+          </el-form-item>
+
+          <el-form-item label="生图 API Key" required>
+            <el-input v-model="oneKeyYinziForm.image_api_key" type="password" show-password clearable autocomplete="new-password" />
+          </el-form-item>
+          <el-form-item label="生图模型" required>
+            <el-select v-model="oneKeyYinziForm.image_model" filterable allow-create default-first-option placeholder="选择或输入模型">
+              <el-option v-for="item in yinziCatalog.image" :key="item.model" :label="catalogOptionLabel(item)" :value="item.model" />
+            </el-select>
+          </el-form-item>
+
+          <el-form-item label="视频 API Key" required>
+            <el-input v-model="oneKeyYinziForm.video_api_key" type="password" show-password clearable autocomplete="new-password" />
+          </el-form-item>
+          <el-form-item label="视频模型" required>
+            <el-select v-model="oneKeyYinziForm.video_model" filterable allow-create default-first-option placeholder="选择或输入模型">
+              <el-option v-for="item in yinziCatalog.video" :key="item.model" :label="catalogOptionLabel(item)" :value="item.model" />
+            </el-select>
+          </el-form-item>
+        </div>
+      </el-form>
+
+      <div class="yinzi-local-note">
+        Key 仅提交到本机后端并保存在本地 SQLite，不写入前端缓存、源码或导出截图。视频提交遇到不确定超时不会自动重试。
+      </div>
+
+      <template #footer>
+        <el-button @click="oneKeyYinziVisible = false">取消</el-button>
+        <el-button type="primary" :loading="oneKeyYinziSaving" :disabled="!oneKeyYinziReady" @click="submitOneKeyYinzi">
+          保存并设为默认
+        </el-button>
+      </template>
+    </el-dialog>
+
     <!-- 即梦2角色认证：素材列表 -->
     <el-dialog
       v-model="jimeng2AssetsDialogVisible"
@@ -1096,7 +1164,7 @@ input_reference = (图片文件，可选)</pre>
 <script setup>
 import { ref, computed, onMounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, MagicStick, QuestionFilled, Download, Upload, Delete, ChatDotRound, Picture, Film, VideoCamera, Key, Microphone, Folder } from '@element-plus/icons-vue'
+import { Plus, MagicStick, QuestionFilled, Download, Upload, Delete, ChatDotRound, Picture, Film, VideoCamera, Key, Microphone, Folder, Refresh } from '@element-plus/icons-vue'
 import { aiAPI } from '@/api/ai'
 import { generationSettingsAPI } from '@/api/prompts'
 import PromptEditor from '@/components/PromptEditor.vue'
@@ -1263,6 +1331,10 @@ const rules = computed(() => ({
     {
       validator: (_rule, v, cb) => {
         const st = form.value.service_type
+        const existingHasKey = editingId.value
+          ? !!list.value.find((item) => item.id === editingId.value)?.has_api_key
+          : false
+        if (existingHasKey && (v == null || !String(v).trim())) return cb()
         if (st === 'jimeng2_character_auth') {
           if (v != null && String(v).trim()) return cb()
           return cb(new Error('请填写 Token'))
@@ -1291,10 +1363,41 @@ const oneKeyVolcSaving = ref(false)
 const oneKeyAgnesVisible = ref(false)
 const oneKeyAgnesKey = ref('')
 const oneKeyAgnesSaving = ref(false)
+const oneKeyYinziVisible = ref(false)
+const oneKeyYinziSaving = ref(false)
+const oneKeyYinziCatalogLoading = ref(false)
+const yinziCatalogError = ref('')
+const yinziCatalog = ref({ pricing_version: '', text: [], image: [], video: [] })
+const oneKeyYinziForm = ref({
+  base_url: 'https://api.yinziapi.top/v1',
+  text_api_key: '',
+  image_api_key: '',
+  video_api_key: '',
+  text_model: '',
+  image_model: '',
+  video_model: '',
+})
+
+const oneKeyYinziReady = computed(() => {
+  const form = oneKeyYinziForm.value
+  return [form.base_url, form.text_api_key, form.image_api_key, form.video_api_key, form.text_model, form.image_model, form.video_model]
+    .every((value) => String(value || '').trim())
+})
+
+const yinziCatalogMessage = computed(() => {
+  if (oneKeyYinziCatalogLoading.value) return '正在读取图片和视频模型…'
+  if (yinziCatalogError.value) return yinziCatalogError.value
+  const catalog = yinziCatalog.value
+  if (catalog.image.length || catalog.video.length) {
+    return `${catalog.text.length} 个文本模型，${catalog.image.length} 个生图模型，${catalog.video.length} 个视频模型`
+  }
+  return '尚未加载'
+})
 
 /** 预设厂商与模型（与参考前端一致） */
 const providerConfigs = {
   text: [
+    { id: 'yinzi', name: 'YinziAPI', models: ['gpt-5.4-mini', 'deepseek-v4-flash'] },
     { id: 'openai', name: 'OpenAI', models: ['gpt-4o', 'gpt-4', 'gpt-3.5-turbo'] },
     { id: 'volcengine', name: '火山引擎', models: ['deepseek-v3-2-251201', 'doubao-1-5-pro-32k-250115', 'kimi-k2-thinking-251104'] },
     // { id: 'chatfire', name: 'Chatfire', models: ['gemini-3-flash-preview', 'claude-sonnet-4-5-20250929', 'doubao-seed-1-8-251228'] },
@@ -1304,6 +1407,7 @@ const providerConfigs = {
     { id: 'agnes', name: 'Agnes AI', models: ['agnes-2.0-flash'] }
   ],
   image: [
+    { id: 'yinzi', name: 'YinziAPI', models: ['gpt-image-2'] },
     { id: 'volcengine', name: '火山引擎', models: ['doubao-seedream-4-5-251128', 'doubao-seedream-4-0-250828'] },
     { id: 'kling', name: '可灵 Kling', models: ['kling-image', 'kling-omni-image'] },
     { id: 'nano_banana', name: 'NanoBanana', models: ['nano-banana-2', 'nano-banana-pro', 'nano-banana'] },
@@ -1315,6 +1419,7 @@ const providerConfigs = {
     { id: 'agnes', name: 'Agnes AI', models: ['agnes-image-2.1-flash', 'agnes-image-2.0-flash'] }
   ],
   storyboard_image: [
+    { id: 'yinzi', name: 'YinziAPI', models: ['gpt-image-2'] },
     { id: 'dashscope', name: '通义万象', models: ['wan2.6-image', 'qwen-image-edit-plus-2026-01-09', 'qwen-image-edit-plus', 'qwen-image-edit-max'] },
     { id: 'volcengine', name: '火山引擎', models: ['doubao-seedream-4-5-251128', 'doubao-seedream-4-0-250828'] },
     { id: 'kling', name: '可灵 Kling', models: ['kling-image', 'kling-omni-image'] },
@@ -1325,6 +1430,7 @@ const providerConfigs = {
     { id: 'agnes', name: 'Agnes AI', models: ['agnes-image-2.1-flash', 'agnes-image-2.0-flash'] }
   ],
   video: [
+    { id: 'yinzi', name: 'YinziAPI', models: ['mg-seedance2.0 -480p mini'] },
     { id: 'klingai', name: '可灵官方 Omni (api-beijing.klingai.com)', models: ['kling-video-o1', 'kling-v3-omni'] },
     { id: 'ffir', name: '飞儿API / 可灵 Omni-Video (ffir.cn)', models: ['kling-video-o1', 'kling-v3-omni'] },
     { id: 'kling', name: '可灵 Kling', models: ['kling-omni-video', 'kling-video', 'kling-motion-control'] },
@@ -1382,6 +1488,7 @@ const providerProtocolMap = {
   qwen: 'openai',
   deepseek: 'openai',
   agnes: 'openai',
+  yinzi: 'openai',
   jimeng_ai_api: 'jimeng_ai_api',
   jimeng_material_api: '',
 }
@@ -1407,6 +1514,7 @@ function getBaseUrlForProvider(provider) {
   if (p === 'jimeng_material_api') return 'https://silvamux.tingyutech.com'
   if (p === 'xai' || p === 'grok') return 'https://api.x.ai'
   if (p === 'agnes') return 'https://apihub.agnes-ai.com/v1'
+  if (p === 'yinzi') return 'https://api.yinziapi.top/v1'
   return 'https://api.chatfire.site/v1'
 }
 
@@ -1539,7 +1647,7 @@ const endpointPreviewInfo = computed(() => {
       submitPath = '/ent/v2/img2video'
     } else if (proto === 'sora') {
       submitPath = '/v1/videos'
-    } else if (proto === 'agnes' || p === 'agnes') {
+    } else if (proto === 'agnes' || p === 'agnes' || proto === 'yinzi' || p === 'yinzi') {
       submitPath = '/videos'
     } else if (proto === 'xai') {
       submitPath = '/v1/videos/generations'
@@ -1576,7 +1684,7 @@ const endpointPreviewInfo = computed(() => {
       queryPath = '/ent/v2/tasks/{taskId}/creations'
     } else if (proto === 'sora') {
       queryPath = '/v1/videos/{taskId}'
-    } else if (proto === 'agnes' || p === 'agnes') {
+    } else if (proto === 'agnes' || p === 'agnes' || proto === 'yinzi' || p === 'yinzi') {
       queryPath = '/videos/{taskId}'
     } else if (proto === 'xai') {
       queryPath = '/v1/videos/{taskId}'
@@ -1651,6 +1759,11 @@ function onProviderChange(providerId) {
   }
   if (st === 'video' && providerId === 'agnes') {
     form.value.api_protocol = 'agnes'
+    form.value.endpoint = '/videos'
+    form.value.query_endpoint = '/videos/{taskId}'
+  }
+  if (st === 'video' && providerId === 'yinzi') {
+    form.value.api_protocol = 'yinzi'
     form.value.endpoint = '/videos'
     form.value.query_endpoint = '/videos/{taskId}'
   }
@@ -1789,7 +1902,7 @@ function openEdit(row) {
     provider: row.provider,
     api_protocol: row.api_protocol || '',
     base_url: row.base_url,
-    api_key: row.api_key,
+    api_key: '',
     endpoint: row.endpoint || '',
     query_endpoint: row.query_endpoint || '',
     modelText: modelList.join('\n'),
@@ -1859,7 +1972,6 @@ async function submit() {
       provider: form.value.provider,
       api_protocol: form.value.api_protocol || '',
       base_url: form.value.base_url,
-      api_key: form.value.api_key,
       endpoint: form.value.endpoint || '',
       query_endpoint: form.value.query_endpoint || '',
       model: modelList,
@@ -1867,6 +1979,9 @@ async function submit() {
       priority: form.value.priority,
       is_default: form.value.is_default,
       ...(settings !== undefined ? { settings } : {}),
+    }
+    if (!editingId.value || String(form.value.api_key || '').trim()) {
+      payload.api_key = form.value.api_key
     }
     if (editingId.value) {
       await aiAPI.update(editingId.value, payload)
@@ -2017,6 +2132,80 @@ async function onBatchDelete() {
   selectedRows.value = []
   ElMessage.success(`已删除 ${success} 条${failed ? `，${failed} 条失败` : ''}`)
   await loadList()
+}
+
+function catalogOptionLabel(item) {
+  if (!item) return ''
+  const value = item.cheapest_effective_price
+  if (value == null) return item.model
+  const priced = (item.prices || []).find((price) => price.effective_price === value)
+  const unitMap = {
+    per_second: '秒',
+    per_request: '次',
+    fixed_duration: '固定时长',
+  }
+  const unit = unitMap[priced?.billing_unit] || priced?.billing_unit || '计费单位'
+  return `${item.model}  ·  ${Number(value).toFixed(4).replace(/0+$/, '').replace(/\.$/, '')}/${unit}`
+}
+
+function applyYinziCatalogDefaults() {
+  const form = oneKeyYinziForm.value
+  const catalog = yinziCatalog.value
+  if (!form.text_model && catalog.text.length) form.text_model = catalog.text[0].model
+  if (!form.image_model && catalog.image.length) form.image_model = catalog.image[0].model
+  if (!form.video_model && catalog.video.length) form.video_model = catalog.video[0].model
+}
+
+async function loadYinziCatalog() {
+  oneKeyYinziCatalogLoading.value = true
+  yinziCatalogError.value = ''
+  try {
+    const catalog = await aiAPI.getYinziCatalog()
+    yinziCatalog.value = {
+      pricing_version: catalog?.pricing_version || '',
+      text: Array.isArray(catalog?.text) ? catalog.text : [],
+      image: Array.isArray(catalog?.image) ? catalog.image : [],
+      video: Array.isArray(catalog?.video) ? catalog.video : [],
+    }
+    applyYinziCatalogDefaults()
+  } catch (error) {
+    yinziCatalogError.value = '目录加载失败，可直接输入模型名'
+  } finally {
+    oneKeyYinziCatalogLoading.value = false
+  }
+}
+
+function openOneKeyYinzi() {
+  oneKeyYinziVisible.value = true
+  loadYinziCatalog()
+}
+
+function resetOneKeyYinzi() {
+  oneKeyYinziForm.value.text_api_key = ''
+  oneKeyYinziForm.value.image_api_key = ''
+  oneKeyYinziForm.value.video_api_key = ''
+}
+
+async function submitOneKeyYinzi() {
+  if (!oneKeyYinziReady.value) return
+  oneKeyYinziSaving.value = true
+  try {
+    const form = oneKeyYinziForm.value
+    await aiAPI.setupYinzi({
+      base_url: form.base_url.trim(),
+      text_api_key: form.text_api_key.trim(),
+      image_api_key: form.image_api_key.trim(),
+      video_api_key: form.video_api_key.trim(),
+      text_model: form.text_model,
+      image_model: form.image_model,
+      video_model: form.video_model,
+    })
+    ElMessage.success('YinziAPI 文本、生图、分镜图和视频配置已设为默认')
+    oneKeyYinziVisible.value = false
+    await loadList()
+  } finally {
+    oneKeyYinziSaving.value = false
+  }
 }
 
 function openOneKeyTongyi() {
@@ -2632,5 +2821,59 @@ code {
 .gs-tip-note {
   color: #909399;
   font-size: 12px;
+}
+.yinzi-catalog-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin: -6px 0 18px;
+  padding: 12px 14px;
+  border: 1px solid var(--border-color, #dcdfe6);
+  border-radius: 6px;
+  background: var(--bg-subtle, #f5f7fa);
+}
+.yinzi-catalog-bar strong {
+  font-size: 14px;
+  color: var(--text-primary, #303133);
+}
+.yinzi-catalog-bar p {
+  margin: 4px 0 0;
+  color: var(--text-secondary, #606266);
+  font-size: 12px;
+}
+.yinzi-catalog-version {
+  margin-left: 8px;
+  color: var(--text-tertiary, #909399);
+  font-family: 'Menlo', 'Consolas', monospace;
+  font-size: 11px;
+}
+.yinzi-field-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 0 16px;
+}
+.yinzi-field-grid .el-select {
+  width: 100%;
+}
+.yinzi-local-note {
+  padding: 10px 12px;
+  border-left: 3px solid var(--el-color-primary);
+  background: var(--el-color-primary-light-9);
+  color: var(--text-secondary, #606266);
+  font-size: 12px;
+  line-height: 1.6;
+}
+@media (max-width: 720px) {
+  .yinzi-field-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .yinzi-catalog-version {
+    display: block;
+    margin: 3px 0 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 220px;
+  }
 }
 </style>

@@ -310,6 +310,19 @@ async function generateSceneSinglePromptOnly(db, log, cfg, sceneId, modelName, s
  * Step 2: 图片AI根据描述生成 16:9 四格场景参考图
  * 如果已有 polished_prompt（预生成的完整提示词），直接使用，跳过 Step 1
  */
+function findSceneContinuityReference(db, dramaId, sceneId) {
+  const row = db.prepare(
+    `SELECT id, local_path, image_url
+       FROM scenes
+      WHERE drama_id = ? AND id <> ? AND deleted_at IS NULL
+        AND (COALESCE(local_path, '') <> '' OR COALESCE(image_url, '') <> '')
+      ORDER BY id ASC
+      LIMIT 1`
+  ).get(Number(dramaId), Number(sceneId));
+  if (!row) return null;
+  return row.local_path || row.image_url || null;
+}
+
 async function generateSceneFourViewImage(db, log, cfg, sceneId, modelName, style) {
   const sceneRow = db.prepare(
     'SELECT id, drama_id, location, time, prompt, polished_prompt FROM scenes WHERE id = ? AND deleted_at IS NULL'
@@ -366,14 +379,20 @@ async function generateSceneFourViewImage(db, log, cfg, sceneId, modelName, styl
     log.info('[场景四视图] Step1 完成，开始Step2生图', { scene_id: sceneId });
   }
 
+  const continuityReference = findSceneContinuityReference(db, sceneRow.drama_id, sceneId);
+  const continuityInstruction = continuityReference
+    ? '\n\nThe provided reference image is the canonical location asset. Preserve its architecture, spatial boundaries, structural landmarks, materials, palette, lighting direction, time, and weather. Change only camera coverage and the specific sub-area requested. Do not copy the reference grid layout into an individual panel.'
+    : '';
   const imageGen = imageClient.createAndGenerateImage(db, log, {
     drama_id: sceneRow.drama_id,
     scene_id: sceneId,
-    prompt: imagePrompt,
+    prompt: imagePrompt + continuityInstruction,
     model: modelName || undefined,
     size: '1792x1024',
     quality: 'standard',
     provider: 'openai',
+    reference_image_urls: continuityReference ? [continuityReference] : [],
+    system_prompt: continuityReference ? 'Image 1 is the canonical scene continuity reference.' : undefined,
   });
 
   log.info('[场景四视图] Step2 图片生成任务已提交', { scene_id: sceneId, image_gen_id: imageGen?.id });
@@ -507,5 +526,6 @@ module.exports = {
   generateSceneSingleImage,
   generateScenePromptOnly,
   generateSceneSinglePromptOnly,
+  findSceneContinuityReference,
   extractSceneFromImage,
 };

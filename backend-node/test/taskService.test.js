@@ -20,6 +20,13 @@ function createTestDb() {
       completed_at TEXT,
       deleted_at TEXT
     );
+    CREATE TABLE video_generations (
+      id INTEGER PRIMARY KEY,
+      task_id TEXT,
+      status TEXT,
+      provider_task_id TEXT,
+      deleted_at TEXT
+    );
   `);
   return db;
 }
@@ -67,5 +74,22 @@ describe('taskService.failOrphanedAsyncTasksOnStartup', () => {
     const task = taskService.getTask(db, 'task-active');
     assert.equal(task.status, 'failed');
     assert.equal(task.error, taskService.USER_CANCEL_TASK_MSG);
+  });
+
+  it('preserves a video task that has a persisted provider task id', () => {
+    const db = createTestDb();
+    const now = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO async_tasks (id, type, status, progress, message, resource_id, created_at, updated_at)
+       VALUES (?, 'video_generation', 'processing', 10, '', '42', ?, ?)`
+    ).run('task-video', now, now);
+    db.prepare(
+      `INSERT INTO video_generations (id, task_id, status, provider_task_id)
+       VALUES (1, 'task-video', 'processing', 'upstream-task-1')`
+    ).run();
+
+    const count = taskService.failOrphanedAsyncTasksOnStartup(db, { warn() {}, info() {} });
+    assert.equal(count, 0);
+    assert.equal(taskService.getTask(db, 'task-video').status, 'processing');
   });
 });

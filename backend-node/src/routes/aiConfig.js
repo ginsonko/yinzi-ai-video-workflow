@@ -3,7 +3,7 @@ const response = require('../response');
 
 function list(db) {
   return (req, res) => {
-    const list = aiConfigService.listConfigs(db, req.query.service_type);
+    const list = aiConfigService.listConfigs(db, req.query.service_type).map(aiConfigService.toPublicConfig);
     response.success(res, list);
   };
 }
@@ -14,7 +14,7 @@ function get(db) {
     if (isNaN(id)) return response.badRequest(res, '无效的配置ID');
     const config = aiConfigService.getConfig(db, id);
     if (!config) return response.notFound(res, '配置不存在');
-    response.success(res, config);
+    response.success(res, aiConfigService.toPublicConfig(config));
   };
 }
 
@@ -42,7 +42,7 @@ function create(db, log, cfg) {
         ...body,
         model: body.model ?? [],
       });
-      response.created(res, config);
+      response.created(res, aiConfigService.toPublicConfig(config));
     } catch (err) {
       log.errorw('Create AI config failed', { error: err.message });
       response.internalError(res, '创建失败');
@@ -67,7 +67,7 @@ function update(db, log, cfg) {
 
     const config = aiConfigService.updateConfig(db, log, id, body);
     if (!config) return response.notFound(res, '配置不存在');
-    response.success(res, config);
+    response.success(res, aiConfigService.toPublicConfig(config));
   };
 }
 
@@ -115,6 +115,7 @@ function testConnection(log) {
         api_key: body.api_key,
         model: body.model,
         provider: body.provider,
+        api_protocol: body.api_protocol,
         endpoint: body.endpoint,
         service_type: body.service_type,
         settings: body.settings,
@@ -123,6 +124,33 @@ function testConnection(log) {
     } catch (err) {
       log.error('AI config test connection failed', { error: err.message });
       response.badRequest(res, '连接测试失败: ' + (err.message || '未知错误'));
+    }
+  };
+}
+
+function yinziCatalog(log) {
+  return async (req, res) => {
+    try {
+      const { fetchYinziCatalog } = require('../services/yinziService');
+      response.success(res, await fetchYinziCatalog());
+    } catch (err) {
+      log.error('Load Yinzi catalog failed', { error: err.message });
+      response.error(res, 502, 'YINZI_CATALOG_ERROR', err.message || 'YinziAPI 模型目录加载失败');
+    }
+  };
+}
+
+function setupYinzi(db, log, cfg) {
+  return (req, res) => {
+    if (aiConfigService.getVendorLockStatus(cfg).enabled) {
+      return response.badRequest(res, '厂商锁定模式下不能创建 YinziAPI 配置');
+    }
+    try {
+      const { upsertYinziConfigs } = require('../services/yinziService');
+      response.success(res, upsertYinziConfigs(db, log, req.body || {}));
+    } catch (err) {
+      log.error('Setup Yinzi configs failed', { error: err.message });
+      response.badRequest(res, err.message || 'YinziAPI 配置失败');
     }
   };
 }
@@ -191,6 +219,8 @@ module.exports = function aiConfigRoutes(db, log, cfg) {
     update: update(db, log, cfg),
     delete: remove(db, log, cfg),
     testConnection: testConnection(log),
+    yinziCatalog: yinziCatalog(log),
+    setupYinzi: setupYinzi(db, log, cfg),
     listJimeng2MaterialAssets: listJimeng2MaterialAssets(log),
     modelArkAsset: modelArkAsset(log),
     bulkUpdateKey: bulkUpdateKey(db, log, cfg),

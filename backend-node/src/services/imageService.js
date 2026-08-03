@@ -439,9 +439,10 @@ async function normalizeLocalImageToTargetSize(absPath, sizeStr, log, meta) {
       return;
     }
     const ext = path.extname(absPath).toLowerCase();
+    const fit = meta?.fit === 'cover' ? 'cover' : 'contain';
     const containBg = { r: 0, g: 0, b: 0, alpha: 1 };
     const pipeline = sharpLib(inputBuf).resize(dim.w, dim.h, {
-      fit: 'contain',
+      fit,
       position: 'centre',
       background: containBg,
     });
@@ -495,8 +496,9 @@ async function normalizeSavedImageToTargetPixels(absPath, sizeStr, log, ctx) {
       target: `${tw}x${th}`,
     });
     const fmt = (meta.format || '').toLowerCase();
+    const fit = ctx?.fit === 'cover' ? 'cover' : 'contain';
     let pipeline = sharpLib(absPath).rotate().resize(tw, th, {
-      fit: 'contain',
+      fit,
       position: 'centre',
       background: { r: 0, g: 0, b: 0, alpha: 1 },
     });
@@ -1363,6 +1365,36 @@ async function processImageGeneration(db, log, imageGenId) {
       });
     }
 
+    if (row.storyboard_id) {
+      try {
+        const sbIdentity = db.prepare('SELECT characters FROM storyboards WHERE id = ? AND deleted_at IS NULL').get(Number(row.storyboard_id));
+        const parsed = JSON.parse(sbIdentity?.characters || '[]');
+        const ids = Array.isArray(parsed)
+          ? parsed.map((item) => Number(typeof item === 'object' && item != null ? item.id : item)).filter(Number.isFinite)
+          : [];
+        const locks = [];
+        for (const id of ids.slice(0, 4)) {
+          const character = db.prepare('SELECT name, appearance, identity_anchors FROM characters WHERE id = ? AND deleted_at IS NULL').get(id);
+          if (!character) continue;
+          let uniqueMarks = '';
+          try { uniqueMarks = JSON.parse(character.identity_anchors || '{}')?.unique_marks || ''; } catch (_) {}
+          locks.push(`${character.name || 'Character'}: ${character.appearance || ''}${uniqueMarks ? ` Immutable marks: ${uniqueMarks}` : ''}`);
+        }
+        if (locks.length) {
+          finalPrompt = `CRITICAL CHARACTER IDENTITY LOCK. The character must be the exact same person shown in the character reference image: same face, age, gender, body proportions, hair, outfit colors and construction, helmet or visor, badges, and signature equipment. Do not redesign, recolor, simplify, remove, or replace any identity anchor.\n${locks.join('\n')}\n\n${finalPrompt}`;
+        }
+      } catch (identityErr) {
+        log.warn('[图生] 角色身份锁注入失败（继续）', { id: imageGenId, error: identityErr.message });
+      }
+      try {
+        db.prepare('UPDATE image_generations SET reference_images = ?, updated_at = ? WHERE id = ?').run(
+          reference_image_urls?.length ? JSON.stringify(reference_image_urls) : null,
+          new Date().toISOString(),
+          imageGenId
+        );
+      } catch (_) {}
+    }
+
     const result = await imageClient.callImageApi(db, log, {
       prompt: finalPrompt,
       model: row.model,
@@ -1418,7 +1450,7 @@ async function processImageGeneration(db, log, imageGenId) {
       );
       if (localPath && imageSize) {
         const absImg = path.join(storagePath, localPath);
-        await normalizeLocalImageToTargetSize(absImg, imageSize, log, { id: imageGenId });
+        await normalizeLocalImageToTargetSize(absImg, imageSize, log, { id: imageGenId, fit: row.storyboard_id ? 'cover' : 'contain' });
       }
       log.info('[图生] Step5 保存完成', { id: imageGenId, local_path: localPath, save_ms: Date.now() - tSave, elapsed: elapsed() });
 
@@ -1430,7 +1462,7 @@ async function processImageGeneration(db, log, imageGenId) {
         row.frame_type !== 'nine_grid'
       ) {
         const absNorm = path.join(storagePath, localPath);
-        await normalizeSavedImageToTargetPixels(absNorm, imageSize, log, { id: imageGenId, size: imageSize });
+        await normalizeSavedImageToTargetPixels(absNorm, imageSize, log, { id: imageGenId, size: imageSize, fit: row.storyboard_id ? 'cover' : 'contain' });
       }
     } catch (saveErr) {
       log.warn('[图生] Step5 保存失败（不影响结果）', { id: imageGenId, err: saveErr.message, elapsed: elapsed() });

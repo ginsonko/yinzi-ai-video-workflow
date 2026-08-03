@@ -230,6 +230,18 @@ function fixAgnesImageSize(size) {
   return best;
 }
 
+/** OpenAI GPT Image 支持的三种稳定尺寸；按目标画幅映射，最终仍由 imageService 对齐项目像素。 */
+function fixOpenAIImageSize(size) {
+  if (!size || typeof size !== 'string') return '1024x1024';
+  const match = size.trim().toLowerCase().replace(/\*/g, 'x').match(/^(\d+)\s*x\s*(\d+)$/);
+  if (!match) return '1024x1024';
+  const width = Number(match[1]);
+  const height = Number(match[2]);
+  if (width / height > 1.12) return '1536x1024';
+  if (height / width > 1.12) return '1024x1536';
+  return '1024x1024';
+}
+
 function dashScopeSize(size) {
   if (!size || typeof size !== 'string') return '1280*1280';
   const s = String(size).trim().toLowerCase().replace(/x/g, '*');
@@ -1503,6 +1515,7 @@ async function callImageApi(db, log, opts) {
   const url = buildImageUrl(config);
   const isVolc = protocol === 'volcengine';
   const isAgnes = isAgnesImageConfig(config, model);
+  const isYinziGptImage = provider === 'yinzi' && /^gpt-image/i.test(model);
   // doubao-seedream 系列模型（含通过自定义代理使用的场景）：使用 volcengine 图片 API 规范
   const isSeedream = isVolc || /seedream|doubao/i.test(model);
   // 解析参考图：本地路径/localhost URL → base64，公网 URL → 直接传
@@ -1520,6 +1533,7 @@ async function callImageApi(db, log, opts) {
   let effectiveSize = size;
   if (isSeedream && size) effectiveSize = fixSeedreamSize(size);
   else if (isAgnes && size) effectiveSize = fixAgnesImageSize(size);
+  else if (isYinziGptImage && size) effectiveSize = fixOpenAIImageSize(size);
 
   const body = {
     model,
@@ -1625,6 +1639,8 @@ function createAndGenerateImage(db, log, opts) {
     quality,
     provider,
     user_negative_prompt,
+    reference_image_urls,
+    system_prompt,
   } = opts;
   const negRow = (user_negative_prompt && String(user_negative_prompt).trim()) || null;
   const now = new Date().toISOString();
@@ -1642,8 +1658,8 @@ function createAndGenerateImage(db, log, opts) {
   let imageGenId;
   try {
     const info = db.prepare(
-      `INSERT INTO image_generations (drama_id, character_id, scene_id, provider, prompt, negative_prompt, model, size, quality, status, task_id, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`
+      `INSERT INTO image_generations (drama_id, character_id, scene_id, provider, prompt, negative_prompt, model, size, quality, reference_images, status, task_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`
     ).run(
       dramaIdNum,
       charIdNum,
@@ -1654,6 +1670,7 @@ function createAndGenerateImage(db, log, opts) {
       model || null,
       size || null,
       quality || null,
+      Array.isArray(reference_image_urls) && reference_image_urls.length ? JSON.stringify(reference_image_urls.slice(0, 10)) : null,
       taskId,
       now,
       now
@@ -1684,6 +1701,8 @@ function createAndGenerateImage(db, log, opts) {
         image_type,
         image_gen_id: imageGenId,
         user_negative_prompt: user_negative_prompt || undefined,
+        reference_image_urls: Array.isArray(reference_image_urls) ? reference_image_urls : undefined,
+        system_prompt: system_prompt || undefined,
       });
       const now2 = new Date().toISOString();
       if (result.error) {
@@ -1918,6 +1937,7 @@ module.exports = {
   refListHasCanonical,
   fixAgnesImageSize,
   isAgnesImageConfig,
+  fixOpenAIImageSize,
   /** 图床 URL 缓存（image_proxy_cache），供 SD2 认证等复用 */
   getProxyCache,
   getProxyCacheValidated,

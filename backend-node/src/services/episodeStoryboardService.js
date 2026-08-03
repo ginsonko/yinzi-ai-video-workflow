@@ -7,6 +7,7 @@ const safeJson = require('../utils/safeJson');
 const { safeParseAIJSON, extractJsonCandidate, repairTruncatedJsonArray, extractFirstArray } = safeJson;
 const loadConfig = require('../config').loadConfig;
 const angleService = require('./angleService');
+const { normalizeWorkflowReferences } = require('./storyboardService');
 
 /**
  * 分镜专用 generateText 包装：
@@ -262,6 +263,21 @@ function getStoryboardsForEpisode(db, episodeId) {
       segment_title: r.segment_title ?? null,
       creation_mode: r.creation_mode === 'universal' ? 'universal' : 'classic',
       universal_segment_text: r.universal_segment_text ?? null,
+      workflow_selected: r.workflow_selected == null ? true : Boolean(r.workflow_selected),
+      workflow_references: normalizeWorkflowReferences(r.workflow_references),
+      workflow_approved_at: r.workflow_approved_at ?? null,
+      director_scene_json: (() => {
+        if (!r.director_scene_json) return null;
+        try { return JSON.parse(r.director_scene_json); } catch (_) { return null; }
+      })(),
+      director_frame_path: r.director_frame_path ?? null,
+      director_preview_path: r.director_preview_path ?? null,
+      image_url: r.image_url ?? null,
+      local_path: r.local_path ?? null,
+      first_frame_image_id: r.first_frame_image_id ?? null,
+      last_frame_image_url: r.last_frame_image_url ?? null,
+      last_frame_local_path: r.last_frame_local_path ?? null,
+      last_frame_image_id: r.last_frame_image_id ?? null,
       characters: (() => {
         if (!r.characters) return [];
         if (typeof r.characters !== 'string') return Array.isArray(r.characters) ? r.characters : [];
