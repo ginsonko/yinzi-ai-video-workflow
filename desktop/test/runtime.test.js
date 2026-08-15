@@ -35,13 +35,13 @@ describe('desktop runtime boundary', () => {
   });
 
   it('accepts an absolute acceptance profile only beneath the exact release-acceptance root', () => {
-    const root = path.join('C:', 'workspace', 'desktop', 'release-acceptance');
-    const fallback = path.join('C:', 'Users', 'user', 'AppData', 'Roaming');
+    const root = path.resolve(os.tmpdir(), 'yinzi-workspace', 'desktop', 'release-acceptance');
+    const fallback = path.resolve(os.tmpdir(), 'yinzi-user', 'AppData', 'Roaming');
     const valid = path.join(root, 'fresh-user', 'AppData', 'Roaming');
     assert.equal(resolveAcceptanceAppData({ requested: valid, allowedRoot: root, fallback }), path.resolve(valid));
-    assert.equal(resolveAcceptanceAppData({ requested: '..\\release-acceptance\\fresh', allowedRoot: root, fallback }), fallback);
+    assert.equal(resolveAcceptanceAppData({ requested: path.join('..', 'release-acceptance', 'fresh'), allowedRoot: root, fallback }), fallback);
     assert.equal(resolveAcceptanceAppData({
-      requested: path.join('C:', 'workspace', 'desktop', 'release-acceptance-copy', 'fresh'),
+      requested: path.resolve(os.tmpdir(), 'yinzi-workspace', 'desktop', 'release-acceptance-copy', 'fresh'),
       allowedRoot: root,
       fallback,
     }), fallback);
@@ -53,18 +53,20 @@ describe('desktop runtime boundary', () => {
   });
 
   it('anchors portable acceptance beside the original portable package instead of its temp extraction', () => {
+    const portableDir = path.resolve(os.tmpdir(), 'yinzi-workspace', 'desktop', 'release');
+    const expected = path.resolve(portableDir, '..', 'release-acceptance');
     assert.equal(resolveAcceptanceRoot({
       packaged: true,
-      execPath: 'C:\\Users\\user\\AppData\\Local\\Temp\\portable-build\\银子AI视频工作流.exe',
-      appDir: 'C:\\ignored',
-      portableExecutableDir: 'C:\\workspace\\desktop\\release',
-    }), path.resolve('C:\\workspace\\desktop\\release-acceptance'));
+      execPath: path.resolve(os.tmpdir(), 'portable-build', 'yinzi-video-workflow'),
+      appDir: path.resolve(os.tmpdir(), 'ignored'),
+      portableExecutableDir: portableDir,
+    }), expected);
     assert.equal(resolveAcceptanceRoot({
       packaged: true,
-      execPath: 'C:\\workspace\\desktop\\release\\win-unpacked\\银子AI视频工作流.exe',
-      appDir: 'C:\\ignored',
+      execPath: path.join(portableDir, 'win-unpacked', 'yinzi-video-workflow'),
+      appDir: path.resolve(os.tmpdir(), 'ignored'),
       portableExecutableDir: '',
-    }), path.resolve('C:\\workspace\\desktop\\release-acceptance'));
+    }), expected);
   });
 
   it('copies legacy backend data without removing the source and writes a receipt', () => {

@@ -117,8 +117,8 @@ describe('release packaging contract', () => {
     assert.equal(packageJson.scripts['dist:mac:arm64'], 'node scripts/dist-mac.js arm64');
   });
 
-  it('requires the guided demo videos in the Windows release inputs', () => {
-    const demoDir = path.join(desktopDir, 'frontweb-dist', 'demo');
+  it('requires the guided demo source videos used by every release build', () => {
+    const demoDir = path.join(repositoryDir, 'frontweb', 'public', 'demo');
     for (const name of [
       'director-preview.mp4',
       'test-shot-1.mp4',
@@ -127,7 +127,7 @@ describe('release packaging contract', () => {
       'test-final-film.mp4',
     ]) {
       const file = path.join(demoDir, name);
-      assert.equal(fs.existsSync(file), true, `${name} is missing from desktop/frontweb-dist`);
+      assert.equal(fs.existsSync(file), true, `${name} is missing from frontweb/public/demo`);
       assert.ok(fs.statSync(file).size > 1024, `${name} is unexpectedly empty`);
     }
   });
