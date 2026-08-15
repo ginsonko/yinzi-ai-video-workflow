@@ -69,6 +69,20 @@ function setupDatabase() {
   return db;
 }
 
+function deterministicVideoCatalog() {
+  const group = '特价视频分组(即梦)';
+  return {
+    pricing_version: 'production-e2e-fixture-v1',
+    fetched_at: '2026-08-15T00:00:00.000Z',
+    video: [{
+      model: 'mg-seedance2.0 -480p mini',
+      endpoint_types: ['openai-video'],
+      groups: [group],
+      prices: [{ group, billing_unit: 'per_second', effective_price: 0.2004 }],
+    }],
+  };
+}
+
 it('runs all 11 production stages with real local media, strict merge, manifest, and ZIP', {
   skip: !hasLocalFfmpeg() || !hasLocalFfprobe(),
   timeout: 180000,
@@ -165,6 +179,7 @@ it('runs all 11 production stages with real local media, strict merge, manifest,
         throw new Error(`unexpected text prompt: ${system.slice(0, 80)}`);
       },
       media: {
+        fetchVideoCatalog: async () => deterministicVideoCatalog(),
         createImage: async (request) => {
           const id = ++generationId;
           imageResults.set(id, { id, task_id: `mock-image-${id}`, status: 'completed', local_path: imagePaths[imageIndex++], prompt: request.prompt });
