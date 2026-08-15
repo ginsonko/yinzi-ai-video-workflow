@@ -1312,6 +1312,7 @@ describe('production media executor', () => {
     let plannerCalls = 0;
     let videoStatus = 'processing';
     const service = createProductionMediaService(db, cfg, log, {
+      fetchVideoCatalog: async () => routedCatalog(),
       createVideo: async (request) => {
         creates += 1;
         videoRequests.push(structuredClone(request));
@@ -1791,7 +1792,9 @@ describe('production media executor', () => {
     db.prepare('UPDATE production_artifacts SET media_path = ? WHERE id = ?')
       .run('previews/historical-director.webm', preview.id);
 
-    const service = createProductionMediaService(db, cfg, log);
+    const service = createProductionMediaService(db, cfg, log, {
+      fetchVideoCatalog: async () => routedCatalog(),
+    });
     const result = await service.ensureReferenceBundles(run);
     assert.equal(result.state, 'progressed');
     assert.equal(result.artifact.content.routing_receipt.director_mode, 'off');
