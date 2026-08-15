@@ -2,9 +2,11 @@ const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const yaml = require('js-yaml');
-const { npmExecutable } = require('../scripts/mac-build-utils');
+const { normalizeMacSigningEnvironment, npmExecutable } = require('../scripts/mac-build-utils');
+const { isMaterializedTrackedExecutable, resolveSource } = require('../scripts/prepare-media-tools');
 
 const desktopDir = path.join(__dirname, '..');
 const repositoryDir = path.join(desktopDir, '..');
@@ -14,6 +16,71 @@ describe('release packaging contract', () => {
     assert.equal(npmExecutable('darwin'), 'npm');
     assert.equal(npmExecutable('linux'), 'npm');
     assert.equal(npmExecutable('win32'), 'npm.cmd');
+  });
+
+  it('drops blank Mac signing secrets without mutating the source environment', () => {
+    const source = {
+      KEEP_ME: 'yes',
+      CSC_LINK: '  ',
+      CSC_KEY_PASSWORD: '',
+      CSC_NAME: '\t',
+      APPLE_ID: '',
+      APPLE_APP_SPECIFIC_PASSWORD: ' ',
+      APPLE_TEAM_ID: '\r\n',
+    };
+
+    const normalized = normalizeMacSigningEnvironment(source);
+
+    assert.deepEqual(normalized, {
+      KEEP_ME: 'yes',
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false',
+    });
+    assert.equal(source.CSC_LINK, '  ');
+    assert.equal(source.CSC_KEY_PASSWORD, '');
+  });
+
+  it('preserves configured signing values and explicit discovery policy byte-for-byte', () => {
+    const automatic = normalizeMacSigningEnvironment({
+      CSC_LINK: 'file:///tmp/yinzi-signing.p12',
+      CSC_KEY_PASSWORD: ' passphrase with spaces ',
+    });
+    const explicit = normalizeMacSigningEnvironment({
+      CSC_NAME: 'Developer ID Application: Yinzi',
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false',
+    });
+
+    assert.equal(automatic.CSC_LINK, 'file:///tmp/yinzi-signing.p12');
+    assert.equal(automatic.CSC_KEY_PASSWORD, ' passphrase with spaces ');
+    assert.equal(automatic.CSC_IDENTITY_AUTO_DISCOVERY, 'true');
+    assert.equal(explicit.CSC_NAME, 'Developer ID Application: Yinzi');
+    assert.equal(explicit.CSC_IDENTITY_AUTO_DISCOVERY, 'false');
+  });
+
+  it('uses materialized tracked Windows media and rejects Git LFS pointers', () => {
+    const ffmpeg = path.join(repositoryDir, 'backend-node', 'tools', 'ffmpeg', 'ffmpeg.exe');
+    const ffprobe = path.join(repositoryDir, 'backend-node', 'tools', 'ffmpeg', 'ffprobe.exe');
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'yinzi-lfs-pointer-'));
+    try {
+      const pointer = path.join(temporary, 'ffmpeg.exe');
+      const placeholder = path.join(temporary, 'ffprobe.exe');
+      fs.writeFileSync(pointer, [
+        'version https://git-lfs.github.com/spec/v1',
+        'oid sha256:b69bcdcaeacc686c7fde374874343ef42cfb5b9e343688372093117e7198a2b2',
+        'size 83672576',
+        '',
+      ].join('\n'));
+      fs.appendFileSync(pointer, Buffer.alloc(1024 * 1024));
+      fs.writeFileSync(placeholder, 'not a release executable');
+
+      assert.equal(resolveSource('ffmpeg.exe', {}), ffmpeg);
+      assert.equal(resolveSource('ffprobe.exe', {}), ffprobe);
+      assert.equal(isMaterializedTrackedExecutable(ffmpeg), true);
+      assert.equal(isMaterializedTrackedExecutable(ffprobe), true);
+      assert.equal(isMaterializedTrackedExecutable(pointer), false);
+      assert.equal(isMaterializedTrackedExecutable(placeholder), false);
+    } finally {
+      fs.rmSync(temporary, { recursive: true, force: true });
+    }
   });
 
   it('uses native matching-architecture macOS runners for DMG and ZIP builds', () => {

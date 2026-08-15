@@ -10,6 +10,8 @@ const repoRoot = path.join(__dirname, '..', '..');
 const targetDir = path.join(repoRoot, 'backend-node', 'tools', 'ffmpeg');
 const targetFfmpeg = path.join(targetDir, 'ffmpeg.exe');
 const targetFfprobe = path.join(targetDir, 'ffprobe.exe');
+const LFS_POINTER_PREFIX = 'version https://git-lfs.github.com/spec/v1';
+const MIN_TRACKED_EXECUTABLE_BYTES = 1024 * 1024;
 
 function run(file, args, label) {
   const result = spawnSync(file, args, {
@@ -24,9 +26,28 @@ function run(file, args, label) {
   return `${result.stdout || ''}\n${result.stderr || ''}`;
 }
 
-function resolveSource(name) {
-  const explicit = process.env[name === 'ffmpeg.exe' ? 'YINZI_FFMPEG_SOURCE' : 'YINZI_FFPROBE_SOURCE'];
-  if (explicit) return path.resolve(explicit);
+function isMaterializedTrackedExecutable(filePath) {
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile() || stat.size < MIN_TRACKED_EXECUTABLE_BYTES) return false;
+    const descriptor = fs.openSync(filePath, 'r');
+    try {
+      const header = Buffer.alloc(LFS_POINTER_PREFIX.length);
+      const bytes = fs.readSync(descriptor, header, 0, header.length, 0);
+      return header.subarray(0, bytes).toString('utf8') !== LFS_POINTER_PREFIX;
+    } finally {
+      fs.closeSync(descriptor);
+    }
+  } catch {
+    return false;
+  }
+}
+
+function resolveSource(name, environment = process.env) {
+  const explicit = environment[name === 'ffmpeg.exe' ? 'YINZI_FFMPEG_SOURCE' : 'YINZI_FFPROBE_SOURCE'];
+  if (typeof explicit === 'string' && explicit.trim()) return path.resolve(explicit.trim());
+  const tracked = path.join(targetDir, name);
+  if (isMaterializedTrackedExecutable(tracked)) return tracked;
   const candidates = [
     path.join('C:\\Program Files', 'ffmpeg-2025-03-20-git-76f09ab647-essentials_build', 'bin', name),
   ];
@@ -61,28 +82,53 @@ function verifyCapabilities() {
   }
 }
 
-if (process.platform !== 'win32' || process.arch !== 'x64') {
-  throw new Error('本发布脚本仅支持 Windows x64');
+function prepareMediaTools(environment = process.env) {
+  if (process.platform !== 'win32' || process.arch !== 'x64') {
+    throw new Error('本发布脚本仅支持 Windows x64');
+  }
+
+  const inputs = [
+    { source: resolveSource('ffmpeg.exe', environment), destination: targetFfmpeg },
+    { source: resolveSource('ffprobe.exe', environment), destination: targetFfprobe },
+  ];
+  if (inputs.some((item) => !item.source)) {
+    throw new Error('未找到发布用 FFmpeg/FFprobe。请设置 YINZI_FFMPEG_SOURCE 与 YINZI_FFPROBE_SOURCE。');
+  }
+
+  for (const item of inputs) {
+    if (path.resolve(item.source) !== path.resolve(item.destination)) {
+      copyAtomic(item.source, item.destination);
+    }
+  }
+
+  const externalInput = inputs.find((item) => path.resolve(item.source) !== path.resolve(item.destination));
+  if (externalInput) {
+    const sourceRoot = path.resolve(path.dirname(externalInput.source), '..');
+    for (const [sourceName, targetName] of [
+      ['LICENSE', 'LICENSE-FFMPEG-GPLv3.txt'],
+      ['README.txt', 'README-FFMPEG-BUILD.txt'],
+    ]) {
+      const source = path.join(sourceRoot, sourceName);
+      if (!fs.existsSync(source)) throw new Error(`FFmpeg 分发缺少 ${sourceName}`);
+      fs.copyFileSync(source, path.join(targetDir, targetName));
+    }
+  }
+
+  for (const name of ['LICENSE-FFMPEG-GPLv3.txt', 'README-FFMPEG-BUILD.txt']) {
+    const notice = path.join(targetDir, name);
+    if (!fs.existsSync(notice) || fs.statSync(notice).size === 0) {
+      throw new Error(`FFmpeg 发布说明缺失或为空：${notice}`);
+    }
+  }
+
+  verifyCapabilities();
+  console.log('[media] FFmpeg/FFprobe 已就绪并通过版本、编码、字幕与混音能力探针。');
 }
 
-const sourceFfmpeg = resolveSource('ffmpeg.exe');
-const sourceFfprobe = resolveSource('ffprobe.exe');
-if (!sourceFfmpeg || !sourceFfprobe) {
-  throw new Error('未找到发布用 FFmpeg/FFprobe。请设置 YINZI_FFMPEG_SOURCE 与 YINZI_FFPROBE_SOURCE。');
-}
+if (require.main === module) prepareMediaTools();
 
-copyAtomic(sourceFfmpeg, targetFfmpeg);
-copyAtomic(sourceFfprobe, targetFfprobe);
-
-const sourceRoot = path.resolve(path.dirname(sourceFfmpeg), '..');
-for (const [sourceName, targetName] of [
-  ['LICENSE', 'LICENSE-FFMPEG-GPLv3.txt'],
-  ['README.txt', 'README-FFMPEG-BUILD.txt'],
-]) {
-  const source = path.join(sourceRoot, sourceName);
-  if (!fs.existsSync(source)) throw new Error(`FFmpeg 分发缺少 ${sourceName}`);
-  fs.copyFileSync(source, path.join(targetDir, targetName));
-}
-
-verifyCapabilities();
-console.log('[media] FFmpeg/FFprobe 已复制并通过版本、编码、字幕与混音能力探针。');
+module.exports = {
+  isMaterializedTrackedExecutable,
+  prepareMediaTools,
+  resolveSource,
+};
