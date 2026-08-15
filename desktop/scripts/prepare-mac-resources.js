@@ -26,7 +26,7 @@ const workDir = path.join(desktopDir, 'mac-build-work', 'resource-extract');
 const outputDir = path.join(desktopDir, 'mac-resources');
 const ffmpegLicense = path.join(desktopDir, '..', 'backend-node', 'tools', 'ffmpeg', 'LICENSE-FFMPEG-GPLv3.txt');
 const releaseVersion = JSON.parse(fs.readFileSync(path.join(desktopDir, 'package.json'), 'utf8')).version;
-const lgplLicense = path.join(cacheDir, 'LICENSE-LGPL-2.1.txt');
+const lgplLicense = path.join(desktopDir, 'licenses', 'LICENSE-LGPL-2.1.txt');
 
 const packages = {
   x64: {

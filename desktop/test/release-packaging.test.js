@@ -1,5 +1,6 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('fs');
 const path = require('path');
 const yaml = require('js-yaml');
@@ -30,6 +31,62 @@ describe('release packaging contract', () => {
     assert.match(workflowText, /npm run dist:mac:\$\{\{ matrix\.arch \}\}/);
     assert.match(workflowText, /darwin-\$\{\{ matrix\.arch \}\}\.node/);
     assert.match(workflowText, /-name 'better_sqlite3\.node'/);
+  });
+
+  it('pins a supported Windows native toolchain and stops before tests when install fails', () => {
+    const workflowPath = path.join(repositoryDir, '.github', 'workflows', 'release.yml');
+    const workflow = yaml.load(fs.readFileSync(workflowPath, 'utf8'));
+    const job = workflow.jobs['build-windows'];
+    const stepNames = job.steps.map((step) => step.name);
+
+    assert.equal(job['runs-on'], 'windows-2022');
+    assert.equal(job.env?.npm_config_msvs_version, '2022');
+    const setupPython = job.steps.find((step) => step.uses === 'actions/setup-python@v5');
+    assert.equal(setupPython?.with?.['python-version'], '3.12');
+
+    for (const component of ['backend', 'frontend', 'desktop']) {
+      const installName = `Install ${component} dependencies`;
+      const testName = `Test ${component}`;
+      const install = job.steps.find((step) => step.name === installName);
+      const test = job.steps.find((step) => step.name === testName);
+      assert.equal(install?.run, 'npm ci', `${installName} must contain only npm ci`);
+      assert.ok(test, `${testName} is missing`);
+      assert.ok(stepNames.indexOf(installName) < stepNames.indexOf(testName));
+    }
+  });
+
+  it('prepares matching macOS media tools before backend tests and reuses desktop dependencies', () => {
+    const workflowPath = path.join(repositoryDir, '.github', 'workflows', 'release.yml');
+    const workflowText = fs.readFileSync(workflowPath, 'utf8');
+    const workflow = yaml.load(workflowText);
+    const job = workflow.jobs['build-macos'];
+    const stepNames = job.steps.map((step) => step.name);
+    const desktopInstalls = job.steps.filter((step) => (
+      step['working-directory'] === 'desktop' && step.run === 'npm ci'
+    ));
+    const prepare = job.steps.find((step) => step.name === 'Prepare native media tools');
+    const desktopTest = job.steps.find((step) => step.name === 'Test desktop');
+
+    assert.equal(desktopInstalls.length, 1);
+    assert.ok(stepNames.indexOf('Install desktop dependencies') < stepNames.indexOf('Prepare native media tools'));
+    assert.ok(stepNames.indexOf('Prepare native media tools') < stepNames.indexOf('Test backend'));
+    assert.equal(desktopTest?.run, 'npm test');
+    assert.match(prepare?.run || '', /prepare-mac-resources\.js "\$\{\{ matrix\.arch \}\}"/);
+    assert.match(prepare?.run || '', /GITHUB_PATH/);
+    assert.match(prepare?.run || '', /FFMPEG_PATH=/);
+    assert.match(prepare?.run || '', /FFPROBE_PATH=/);
+    assert.match(workflowText, /mac-resources\/\$\{\{ matrix\.arch \}\}\/ffmpeg/);
+  });
+
+  it('ships the LGPL license required by a fresh arm64 runner outside ignored caches', () => {
+    const licensePath = path.join(desktopDir, 'licenses', 'LICENSE-LGPL-2.1.txt');
+    const script = fs.readFileSync(path.join(desktopDir, 'scripts', 'prepare-mac-resources.js'), 'utf8');
+    const licenseText = fs.readFileSync(licensePath, 'utf8').replace(/\r\n/g, '\n');
+    const hash = crypto.createHash('sha256').update(licenseText, 'utf8').digest('hex');
+
+    assert.equal(hash, '20e50fe7aae3e56378ebf0417d9de904f55a0e61e4df315333e632a4d3555d95');
+    assert.match(script, /path\.join\(desktopDir, 'licenses', 'LICENSE-LGPL-2\.1\.txt'\)/);
+    assert.doesNotMatch(script, /path\.join\(cacheDir, 'LICENSE-LGPL-2\.1\.txt'\)/);
   });
 
   it('checks out required LFS media on every platform build', () => {

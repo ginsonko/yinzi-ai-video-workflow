@@ -12,7 +12,9 @@ permissions:
 jobs:
   build-windows:
     name: Windows x64
-    runs-on: windows-latest
+    runs-on: windows-2022
+    env:
+      npm_config_msvs_version: '2022'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -29,24 +31,38 @@ jobs:
             frontweb/package-lock.json
             desktop/package-lock.json
 
-      - name: Install and test backend
+      - name: Setup Python for native modules
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install backend dependencies
         working-directory: backend-node
-        run: |
-          npm ci
-          npm test
+        run: npm ci
 
-      - name: Install and test frontend
+      - name: Test backend
+        working-directory: backend-node
+        run: npm test
+
+      - name: Install frontend dependencies
         working-directory: frontweb
-        run: |
-          npm ci
-          node --test test/*.test.js
-          npm run build
+        run: npm ci
 
-      - name: Install and test desktop
+      - name: Test frontend
+        working-directory: frontweb
+        run: node --test test/*.test.js
+
+      - name: Build frontend
+        working-directory: frontweb
+        run: npm run build
+
+      - name: Install desktop dependencies
         working-directory: desktop
-        run: |
-          npm ci
-          npm test
+        run: npm ci
+
+      - name: Test desktop
+        working-directory: desktop
+        run: npm test
 
       - name: Build Windows installer and portable package
         working-directory: desktop
@@ -100,23 +116,42 @@ jobs:
             frontweb/package-lock.json
             desktop/package-lock.json
 
-      - name: Install and test backend
-        working-directory: backend-node
-        run: |
-          npm ci
-          npm test
-
-      - name: Install and test frontend
-        working-directory: frontweb
-        run: |
-          npm ci
-          node --test test/*.test.js
-
-      - name: Install and test desktop
+      - name: Install desktop dependencies
         working-directory: desktop
+        run: npm ci
+
+      - name: Prepare native media tools
+        working-directory: desktop
+        shell: bash
         run: |
-          npm ci
-          npm test
+          set -euo pipefail
+          node scripts/prepare-mac-resources.js "${{ matrix.arch }}"
+          MEDIA_DIR="$PWD/mac-resources/${{ matrix.arch }}/ffmpeg"
+          test -x "$MEDIA_DIR/ffmpeg"
+          test -x "$MEDIA_DIR/ffprobe"
+          echo "$MEDIA_DIR" >> "$GITHUB_PATH"
+          echo "FFMPEG_PATH=$MEDIA_DIR/ffmpeg" >> "$GITHUB_ENV"
+          echo "FFPROBE_PATH=$MEDIA_DIR/ffprobe" >> "$GITHUB_ENV"
+
+      - name: Install backend dependencies
+        working-directory: backend-node
+        run: npm ci
+
+      - name: Test backend
+        working-directory: backend-node
+        run: npm test
+
+      - name: Install frontend dependencies
+        working-directory: frontweb
+        run: npm ci
+
+      - name: Test frontend
+        working-directory: frontweb
+        run: node --test test/*.test.js
+
+      - name: Test desktop
+        working-directory: desktop
+        run: npm test
 
       - name: Build native DMG and ZIP
         working-directory: desktop
