@@ -100,6 +100,19 @@ describe('release packaging contract', () => {
     assert.match(workflowText, /-name 'better_sqlite3\.node'/);
   });
 
+  it('hashes only the uploaded Mac release files instead of staging directories', () => {
+    const workflowPath = path.join(repositoryDir, '.github', 'workflows', 'release.yml');
+    const workflow = yaml.load(fs.readFileSync(workflowPath, 'utf8'));
+    const manifest = workflow.jobs['build-macos'].steps.find((step) => (
+      step.name === 'Write SHA-256 manifest'
+    ));
+
+    assert.ok(manifest);
+    assert.doesNotMatch(manifest.run, /shasum -a 256 \*/);
+    assert.match(manifest.run, /shasum -a 256 "\$DMG" "\$ZIP" "\$RECEIPT"/);
+    assert.match(manifest.run, /native-mac-build-\$\{ARCH\}\.json/);
+  });
+
   it('pins a supported Windows native toolchain and stops before tests when install fails', () => {
     const workflowPath = path.join(repositoryDir, '.github', 'workflows', 'release.yml');
     const workflow = yaml.load(fs.readFileSync(workflowPath, 'utf8'));
@@ -176,12 +189,15 @@ describe('release packaging contract', () => {
 
     assert.equal(packageJson.version, '0.1.2-beta.1');
     assert.equal(packageJson.build.directories.output, 'release');
+    assert.equal(packageJson.build.electronVersion, packageJson.devDependencies.electron);
+    assert.equal(Object.hasOwn(packageJson.build, 'electronDist'), false);
     assert.deepEqual(packageJson.build.nsis.preCompressedFileExtensions, []);
     assert.equal(macConfig.directories.output, 'release-mac');
     assert.equal(Object.hasOwn(macConfig.mac, 'identity'), false);
     assert.deepEqual(macConfig.mac.target, ['dmg', 'zip']);
     assert.equal(packageJson.scripts['dist:mac:x64'], 'node scripts/dist-mac.js x64');
     assert.equal(packageJson.scripts['dist:mac:arm64'], 'node scripts/dist-mac.js arm64');
+    assert.match(packageJson.scripts.dist, /electron-builder --win --x64 --publish never$/);
   });
 
   it('requires the guided demo source videos used by every release build', () => {
