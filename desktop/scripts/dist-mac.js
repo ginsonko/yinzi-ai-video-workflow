@@ -4,23 +4,16 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
-const { assertArch, ensureDirectory } = require('./mac-build-utils');
+const { assertArch, ensureDirectory, normalizeMacSigningEnvironment } = require('./mac-build-utils');
 
 const desktopDir = path.join(__dirname, '..');
 const releaseDir = path.join(desktopDir, 'release-mac');
 const packageJson = JSON.parse(fs.readFileSync(path.join(desktopDir, 'package.json'), 'utf8'));
 
 function run(command, args, options = {}) {
-  const hasSigningIdentity = Boolean(process.env.CSC_LINK || process.env.CSC_NAME);
   const result = spawnSync(command, args, {
     cwd: options.cwd || desktopDir,
-    env: {
-      ...process.env,
-      CSC_IDENTITY_AUTO_DISCOVERY: hasSigningIdentity
-        ? (process.env.CSC_IDENTITY_AUTO_DISCOVERY || 'true')
-        : 'false',
-      ...options.env,
-    },
+    env: normalizeMacSigningEnvironment({ ...process.env, ...options.env }),
     stdio: 'inherit',
     timeout: options.timeout || 45 * 60 * 1000,
   });
