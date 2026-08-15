@@ -8,6 +8,7 @@
 源码打包要求 Node.js 22 或更新版本：
 
 ```powershell
+git lfs pull
 $env:ELECTRON_MIRROR='https://npmmirror.com/mirrors/electron/'
 npm install
 npm test
@@ -32,6 +33,7 @@ npm run dist
 macOS 正式构建入口只允许在与目标架构一致的真实 Mac 或 GitHub macOS runner 上运行：
 
 ```bash
+git lfs pull
 npm ci
 npm run dist:mac:x64     # Intel Mac / macos-15-intel
 npm run dist:mac:arm64   # Apple Silicon / macos-15

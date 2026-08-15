@@ -70,6 +70,8 @@ Windows x64 用户使用 Release 中的任一版本：
 ```powershell
 git clone https://github.com/ginsonko/yinzi-ai-video-workflow.git
 cd yinzi-ai-video-workflow
+git lfs install
+git lfs pull
 
 cd backend-node
 npm install
@@ -101,6 +103,7 @@ macOS 包必须在对应架构的真实 Mac 上原生构建。正式发行工作
 在真实 Mac 源码构建时执行：
 
 ```bash
+git lfs pull
 cd desktop
 npm ci
 npm run dist:mac:x64     # 仅 Intel Mac

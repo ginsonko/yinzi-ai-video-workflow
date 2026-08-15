@@ -32,6 +32,17 @@ describe('release packaging contract', () => {
     assert.match(workflowText, /-name 'better_sqlite3\.node'/);
   });
 
+  it('checks out required LFS media on every platform build', () => {
+    const workflowPath = path.join(repositoryDir, '.github', 'workflows', 'release.yml');
+    const workflow = yaml.load(fs.readFileSync(workflowPath, 'utf8'));
+
+    for (const jobName of ['build-windows', 'build-macos']) {
+      const checkout = workflow.jobs[jobName].steps.find((step) => step.uses === 'actions/checkout@v4');
+      assert.ok(checkout, `${jobName} is missing actions/checkout`);
+      assert.equal(checkout.with?.lfs, true, `${jobName} must materialize Git LFS media`);
+    }
+  });
+
   it('keeps Windows and native macOS outputs isolated', () => {
     const packageJson = JSON.parse(fs.readFileSync(path.join(desktopDir, 'package.json'), 'utf8'));
     const macConfig = JSON.parse(fs.readFileSync(
