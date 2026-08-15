@@ -1,278 +1,307 @@
-const { app, BrowserWindow, Menu } = require('electron');
-const path = require('path');
+'use strict';
+
+const { app, BrowserWindow, Menu, dialog, shell } = require('electron');
 const fs = require('fs');
+const path = require('path');
+const {
+  PRODUCT_NAME,
+  USER_DATA_DIR_NAME,
+  buildMacApplicationMenuTemplate,
+  closeRuntimeResources,
+  copyVerifiedExecutable,
+  isSafeExternalUrl,
+  isMachOExecutableForArch,
+  migrateLegacyUserData,
+  normalizeLocalOrigin,
+  reserveLocalHttpServer,
+  resolveAcceptanceAppData,
+  resolveAcceptanceRoot,
+} = require('./runtime');
 
-// 显式固定 userData 目录，使开发模式与打包 exe 路径完全一致，防止 productName 变更导致路径漂移
-const USERDATA_DIR = path.join(app.getPath('appData'), 'localminidrama-desktop');
-app.setPath('userData', USERDATA_DIR);
+const defaultAppDataRoot = app.getPath('appData');
+const acceptanceRoot = resolveAcceptanceRoot({
+  packaged: app.isPackaged,
+  execPath: process.execPath,
+  appDir: __dirname,
+  portableExecutableDir: process.env.PORTABLE_EXECUTABLE_DIR,
+});
+const appDataRoot = resolveAcceptanceAppData({
+  requested: process.env.YINZI_ACCEPTANCE_APPDATA,
+  allowedRoot: acceptanceRoot,
+  fallback: defaultAppDataRoot,
+});
+const userDataDir = path.join(appDataRoot, USER_DATA_DIR_NAME);
+app.setName(PRODUCT_NAME);
+app.setPath('userData', userDataDir);
 
-const MAIN_STARTUP_LOG = path.join(USERDATA_DIR, 'main-startup.log');
-function writeMainLog(msg) {
-  const line = `${new Date().toISOString()} ${msg}\n`;
+const startupLog = path.join(userDataDir, 'logs', 'desktop-startup.log');
+const defaultPort = 5679;
+const backendAppPath = path.join(__dirname, 'backend-app');
+const backendNodePath = path.join(__dirname, '..', 'backend-node');
+let mainWindow = null;
+let serverInstance = null;
+let productionAutonomyRunner = null;
+let closeDatabase = null;
+let quitting = false;
+let runtimeOrigin = null;
+
+function writeMainLog(message) {
+  const line = `${new Date().toISOString()} ${message}\n`;
   try {
-    if (!fs.existsSync(USERDATA_DIR)) fs.mkdirSync(USERDATA_DIR, { recursive: true });
-    fs.appendFileSync(MAIN_STARTUP_LOG, line);
+    fs.mkdirSync(path.dirname(startupLog), { recursive: true });
+    fs.appendFileSync(startupLog, line, 'utf8');
   } catch (_) {}
 }
 
-process.on('uncaughtException', (err) => {
-  writeMainLog(`uncaughtException: ${err && err.stack ? err.stack : err}`);
-});
-process.on('unhandledRejection', (reason) => {
-  const text = reason instanceof Error ? reason.stack : String(reason);
-  writeMainLog(`unhandledRejection: ${text}`);
-});
+function formatError(error) {
+  return error?.stack || error?.message || String(error || '未知错误');
+}
 
-writeMainLog(`main.js loaded packaged=${app.isPackaged} exec=${process.execPath}`);
+process.on('uncaughtException', (error) => writeMainLog(`uncaughtException: ${formatError(error)}`));
+process.on('unhandledRejection', (error) => writeMainLog(`unhandledRejection: ${formatError(error)}`));
 
-// 兼容迁移：若旧路径 LocalMiniDrama 有数据而新路径为空，自动迁移
-;(function migrateOldUserData() {
-  const oldPath = path.join(app.getPath('appData'), 'LocalMiniDrama');
-  if (fs.existsSync(oldPath) && !fs.existsSync(USERDATA_DIR)) {
-    try {
-      fs.renameSync(oldPath, USERDATA_DIR);
-    } catch (e) {
-      // rename 跨驱动器时会失败，此时静默忽略，用户数据仍可手动迁移
-    }
-  }
-})();
+writeMainLog(`main loaded packaged=${app.isPackaged} exec=${process.execPath}`);
 
-const BACKEND_APP_PATH = path.join(__dirname, 'backend-app');
-const BACKEND_NODE_PATH = path.join(__dirname, '..', 'backend-node');
-const DEFAULT_PORT = 5679;
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  });
+}
 
-let serverInstance = null;
-
-/** 开发模式用 backend-node（改代码即生效）；打包后用 backend-app */
 function getBackendModulePath() {
-  if (app.isPackaged) return BACKEND_APP_PATH;
-  // Electron 开发模式必须用 backend-app：require 会向上解析到 desktop/node_modules，
-  // 其中 better-sqlite3 已由 postinstall 的 electron-builder install-app-deps 对准当前 Electron ABI。
-  // 若直接用 backend-node，则会加载 backend-node/node_modules（多为本机 Node 编的 ABI，必炸）。
-  if (process.versions.electron && fs.existsSync(path.join(BACKEND_APP_PATH, 'src', 'app.js'))) {
-    return BACKEND_APP_PATH;
-  }
-  return fs.existsSync(BACKEND_NODE_PATH) ? BACKEND_NODE_PATH : BACKEND_APP_PATH;
+  if (app.isPackaged) return backendAppPath;
+  if (process.versions.electron && fs.existsSync(path.join(backendAppPath, 'src', 'app.js'))) return backendAppPath;
+  return fs.existsSync(backendNodePath) ? backendNodePath : backendAppPath;
 }
 
 function getBackendCwd() {
-  if (app.isPackaged) {
-    return path.join(app.getPath('userData'), 'backend');
-  }
-  return getBackendModulePath();
+  return app.isPackaged ? path.join(userDataDir, 'backend') : getBackendModulePath();
+}
+
+function migrateLegacyData() {
+  const result = migrateLegacyUserData({
+    targetDir: userDataDir,
+    legacyDirs: [
+      path.join(appDataRoot, 'localminidrama-desktop'),
+      path.join(appDataRoot, 'LocalMiniDrama'),
+    ],
+  });
+  writeMainLog(`legacy migration status=${result.status} reason=${result.reason || '-'} source=${result.source || '-'}`);
 }
 
 function ensureBackendCwd(backendCwd) {
-  if (!fs.existsSync(backendCwd)) {
-    fs.mkdirSync(backendCwd, { recursive: true });
-  }
   const configsDir = path.join(backendCwd, 'configs');
   const dataDir = path.join(backendCwd, 'data');
   const logsDir = path.join(backendCwd, 'logs');
+  fs.mkdirSync(configsDir, { recursive: true });
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.mkdirSync(logsDir, { recursive: true });
+
   const configPath = path.join(configsDir, 'config.yaml');
-
-  if (!fs.existsSync(configsDir)) fs.mkdirSync(configsDir, { recursive: true });
-  if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
-  if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
-
-  // 首次安装时，从打包内置的 config.yaml 复制到用户数据目录
   const bundledConfig = path.join(getBackendModulePath(), 'configs', 'config.yaml');
-  if (!fs.existsSync(configPath) && fs.existsSync(bundledConfig)) {
-    fs.copyFileSync(bundledConfig, configPath);
-  }
+  if (!fs.existsSync(configPath)) fs.copyFileSync(bundledConfig, configPath);
 
-  // 每次启动时，将内置 config.yaml 中的 vendor_lock 节强制同步到用户 config.yaml，
-  // 确保打包时配置的锁定策略对所有用户生效，不受首次安装后遗留旧配置影响。
-  if (fs.existsSync(bundledConfig) && fs.existsSync(configPath)) {
-    try {
-      const yaml = require('js-yaml');
-      const userCfg = yaml.load(fs.readFileSync(configPath, 'utf8')) || {};
-      const bundledCfg = yaml.load(fs.readFileSync(bundledConfig, 'utf8')) || {};
-      if (bundledCfg.vendor_lock !== undefined) {
-        userCfg.vendor_lock = bundledCfg.vendor_lock;
-        fs.writeFileSync(configPath, yaml.dump(userCfg, { lineWidth: -1 }), 'utf8');
-      }
-    } catch (e) {
-      console.warn('[config] Failed to sync vendor_lock from bundled config:', e.message);
-    }
+  try {
+    const yaml = require('js-yaml');
+    const userConfig = yaml.load(fs.readFileSync(configPath, 'utf8')) || {};
+    const bundled = yaml.load(fs.readFileSync(bundledConfig, 'utf8')) || {};
+    if (bundled.vendor_lock !== undefined) userConfig.vendor_lock = bundled.vendor_lock;
+    fs.writeFileSync(configPath, yaml.dump(userConfig, { lineWidth: -1 }), 'utf8');
+  } catch (error) {
+    throw new Error(`初始化本地配置失败：${error.message}`);
   }
 }
 
-/**
- * 首次启动时，将打包内置的 ffmpeg 自动复制到 userData/backend/tools/ffmpeg/。
- * 来源：process.resourcesPath/ffmpeg/（由 electron-builder extraResources 写入）。
- * 已存在则跳过，不会重复覆盖，也不影响用户手动替换版本。
- */
-function ensureFfmpeg(backendCwd) {
+function ensureBundledMediaTools(backendCwd) {
   if (!app.isPackaged) return;
-  const isWin = process.platform === 'win32';
-  const ffmpegName = isWin ? 'ffmpeg.exe' : 'ffmpeg';
-  const ffprobeName = isWin ? 'ffprobe.exe' : 'ffprobe';
-
-  const destDir = path.join(backendCwd, 'tools', 'ffmpeg');
-  const destFfmpeg = path.join(destDir, ffmpegName);
-
-  // 已存在则跳过（支持用户手动替换）
-  if (fs.existsSync(destFfmpeg)) {
-    console.log('[ffmpeg] Already exists at', destFfmpeg);
-    return;
-  }
-
-  const srcDir = path.join(process.resourcesPath, 'ffmpeg');
-  const srcFfmpeg = path.join(srcDir, ffmpegName);
-  if (!fs.existsSync(srcFfmpeg)) {
-    console.warn(
-      '[ffmpeg] Bundled ffmpeg not found, skipping auto-extract. Expected:',
-      srcFfmpeg,
-      '(打包前请将 ffmpeg.exe 放入 backend-node/tools/ffmpeg，并确保 package.json 的 extraResources 包含该目录)'
-    );
-    return;
-  }
-
-  try {
-    if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
-    fs.copyFileSync(srcFfmpeg, destFfmpeg);
-    if (!isWin) fs.chmodSync(destFfmpeg, 0o755);
-
-    const srcFfprobe = path.join(srcDir, ffprobeName);
-    if (fs.existsSync(srcFfprobe)) {
-      const destFfprobe = path.join(destDir, ffprobeName);
-      fs.copyFileSync(srcFfprobe, destFfprobe);
-      if (!isWin) fs.chmodSync(destFfprobe, 0o755);
-    }
-    console.log('[ffmpeg] Auto-extracted to', destDir);
-  } catch (e) {
-    console.warn('[ffmpeg] Auto-extract failed:', e.message);
+  const names = process.platform === 'win32'
+    ? ['ffmpeg.exe', 'ffprobe.exe']
+    : ['ffmpeg', 'ffprobe'];
+  const sourceDir = path.join(process.resourcesPath, 'ffmpeg');
+  const targetDir = path.join(backendCwd, 'tools', 'ffmpeg');
+  for (const name of names) {
+    const darwinOptions = process.platform === 'darwin'
+      ? {
+          sourceValidator: (filePath) => isMachOExecutableForArch(filePath, process.arch),
+          prepareCopy: (filePath) => fs.chmodSync(filePath, 0o755),
+        }
+      : {};
+    const result = copyVerifiedExecutable({
+      source: path.join(sourceDir, name),
+      destination: path.join(targetDir, name),
+      ...darwinOptions,
+    });
+    writeMainLog(`${name} ${result.status} path=${result.path}`);
   }
 }
 
 function getWebDistPath() {
-  if (app.isPackaged) {
-    return path.join(process.resourcesPath, 'frontweb', 'dist');
-  }
-  return path.join(__dirname, '..', 'frontweb', 'dist');
+  return app.isPackaged
+    ? path.join(process.resourcesPath, 'frontweb', 'dist')
+    : path.join(__dirname, '..', 'frontweb', 'dist');
 }
 
-/**
- * 探测端口是否空闲：优先使用 preferredPort，被占用时让 OS 分配一个随机空闲端口。
- * 返回最终可用的端口号。
- */
-function findFreePort(preferredPort) {
-  const net = require('net');
-  return new Promise((resolve) => {
-    const probe = net.createServer();
-    probe.once('error', () => {
-      // 首选端口被占，让 OS 随机分配
-      const fallback = net.createServer();
-      fallback.listen(0, '127.0.0.1', () => {
-        const port = fallback.address().port;
-        fallback.close(() => resolve(port));
-      });
-    });
-    probe.listen(preferredPort, '127.0.0.1', () => {
-      probe.close(() => resolve(preferredPort));
-    });
-  });
-}
-
-function createWindow(port) {
-  Menu.setApplicationMenu(null);
-  const win = new BrowserWindow({
-    width: 1280,
-    height: 800,
-    webPreferences: { nodeIntegration: false, contextIsolation: true },
-    show: false,
-  });
-  win.once('ready-to-show', () => {
-    win.show();
-    writeMainLog('window ready-to-show');
-  });
-  // 若页面长期不触发 ready-to-show，避免用户误以为“点了没反应”
-  setTimeout(() => {
-    if (!win.isDestroyed() && !win.isVisible()) {
-      win.show();
-      writeMainLog('window shown (fallback timeout, check page load)');
-    }
-  }, 8000);
-  win.webContents.on('did-fail-load', (_e, code, desc, url) => {
-    writeMainLog(`did-fail-load code=${code} desc=${desc} url=${url}`);
-  });
-  writeMainLog(`createWindow loadURL http://127.0.0.1:${port}`);
-  win.loadURL(`http://127.0.0.1:${port}`);
-  win.on('closed', () => app.quit());
-  if (process.env.LOCALMINIDRAMA_DEVTOOLS === '1') {
-    win.webContents.openDevTools();
-  }
-}
-
-/** 后端始终在主进程内运行（打包用子进程会重复启动 exe 导致大量进程，故取消） */
 async function startBackend() {
+  migrateLegacyData();
   const backendCwd = getBackendCwd();
   ensureBackendCwd(backendCwd);
-  ensureFfmpeg(backendCwd);
+  ensureBundledMediaTools(backendCwd);
+
   process.env.WEB_DIST_PATH = getWebDistPath();
-  if (app.isPackaged) {
-    process.env.LOG_FILE = path.join(backendCwd, 'logs', 'app.log');
-    process.env.EXAMPLE_DRAMA_PATH = path.join(process.resourcesPath, 'example_drama');
-  } else {
-    process.env.EXAMPLE_DRAMA_PATH = path.join(__dirname, '..', 'example_drama');
-  }
+  process.env.EXAMPLE_DRAMA_PATH = app.isPackaged
+    ? path.join(process.resourcesPath, 'example_drama')
+    : path.join(__dirname, '..', 'example_drama');
+  process.env.LOG_FILE = path.join(backendCwd, 'logs', 'app.log');
   process.chdir(backendCwd);
 
   const backendModulePath = getBackendModulePath();
+  const config = require(path.join(backendModulePath, 'src', 'config', 'index.js')).loadConfig();
+  const reservedServer = await reserveLocalHttpServer(Number(config.server?.port) || defaultPort);
+  const address = reservedServer.address();
+  const port = Number(address?.port);
+  const localOrigin = normalizeLocalOrigin(`http://127.0.0.1:${port}`);
+  if (!localOrigin) {
+    reservedServer.close();
+    throw new Error('无法建立安全的本地服务地址');
+  }
+
   try {
-    require(path.join(backendModulePath, 'src', 'db', 'migrate.js'));
-  } catch (err) {
-    console.warn('Migration warning:', err.message);
+    const created = require(path.join(backendModulePath, 'src', 'app.js')).createApp({ localOrigin });
+    serverInstance = reservedServer;
+    productionAutonomyRunner = created.productionAutonomyRunner;
+    closeDatabase = require(path.join(backendModulePath, 'src', 'db', 'index.js')).closeDb;
+    serverInstance.on('request', created.app);
+    writeMainLog(`backend ready origin=${localOrigin}`);
+    return localOrigin;
+  } catch (error) {
+    reservedServer.close();
+    throw error;
   }
+}
 
-  const { createApp } = require(path.join(backendModulePath, 'src', 'app.js'));
-  const { createServer } = require('http');
-  const { app: expressApp, config } = createApp();
-  const preferredPort = config.server?.port || DEFAULT_PORT;
-
-  // 自动探测空闲端口：优先默认端口，被占时由 OS 分配，支持多实例同时运行
-  const port = await findFreePort(preferredPort);
-  if (port !== preferredPort) {
-    console.log(`Port ${preferredPort} in use, using ${port}`);
+function isInternalNavigation(target, localOrigin) {
+  try {
+    return new URL(target).origin === localOrigin;
+  } catch (_) {
+    return false;
   }
+}
 
-  return new Promise((resolve, reject) => {
-    const server = createServer(expressApp);
-    serverInstance = server;
-    server.on('error', reject);
-    server.listen(port, '127.0.0.1', () => {
-      console.log('Backend listening on', port);
-      resolve(port);
-    });
+function openExternal(target) {
+  if (!isSafeExternalUrl(target)) return;
+  shell.openExternal(target).catch((error) => writeMainLog(`openExternal failed: ${formatError(error)}`));
+}
+
+function configureApplicationMenu() {
+  if (process.platform !== 'darwin') {
+    Menu.setApplicationMenu(null);
+    return;
+  }
+  const template = buildMacApplicationMenuTemplate({ openExternal });
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
+function createWindow(localOrigin) {
+  const win = new BrowserWindow({
+    width: 1360,
+    height: 880,
+    minWidth: 980,
+    minHeight: 680,
+    title: PRODUCT_NAME,
+    backgroundColor: '#f3f6f4',
+    show: false,
+    autoHideMenuBar: process.platform !== 'darwin',
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+    },
   });
+  mainWindow = win;
+
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (isInternalNavigation(url, localOrigin)) return { action: 'allow' };
+    openExternal(url);
+    return { action: 'deny' };
+  });
+  win.webContents.on('will-navigate', (event, url) => {
+    if (isInternalNavigation(url, localOrigin)) return;
+    event.preventDefault();
+    openExternal(url);
+  });
+  win.webContents.on('did-fail-load', (_event, code, description, url) => {
+    writeMainLog(`did-fail-load code=${code} description=${description} url=${url}`);
+  });
+  win.once('ready-to-show', () => win.show());
+  const showFallback = setTimeout(() => {
+    if (!win.isDestroyed() && !win.isVisible()) win.show();
+  }, 8000);
+  showFallback.unref?.();
+
+  win.loadURL(localOrigin).catch((error) => writeMainLog(`loadURL failed: ${formatError(error)}`));
+  win.on('closed', () => {
+    clearTimeout(showFallback);
+    mainWindow = null;
+    if (!quitting) app.quit();
+  });
+  if (process.env.YINZI_AI_DEVTOOLS === '1') win.webContents.openDevTools();
+}
+
+async function showStartupFailure(error) {
+  const detail = formatError(error);
+  writeMainLog(`startup failed: ${detail}`);
+  const result = await dialog.showMessageBox({
+    type: 'error',
+    title: `${PRODUCT_NAME}启动失败`,
+    message: '本地服务未能启动，作品和配置没有被删除。',
+    detail: `${detail}\n\n启动日志：${startupLog}`,
+    buttons: ['打开数据目录', '退出'],
+    defaultId: 0,
+    cancelId: 1,
+    noLink: true,
+  });
+  if (result.response === 0) await shell.openPath(userDataDir);
+}
+
+async function shutdownRuntime() {
+  if (quitting) return;
+  quitting = true;
+  await closeRuntimeResources({
+    server: serverInstance,
+    productionAutonomyRunner,
+    closeDatabase,
+  });
+  serverInstance = null;
+  productionAutonomyRunner = null;
+  closeDatabase = null;
 }
 
 app.whenReady().then(async () => {
-  writeMainLog('app.whenReady');
-  let port;
+  if (!hasSingleInstanceLock) return;
   try {
-    port = await startBackend();
-    writeMainLog(`startBackend ok port=${port}`);
-  } catch (err) {
-    const stack = err && err.stack ? err.stack : String(err);
-    writeMainLog(`Failed to start backend\n${stack}`);
-    console.error('Failed to start backend', err);
-    const { dialog } = require('electron');
-    dialog.showErrorBox(
-      '本地短剧助手启动失败',
-      `后端服务未能启动，请查看日志：\n${MAIN_STARTUP_LOG}\n\n${stack}`
-    );
+    runtimeOrigin = await startBackend();
+    configureApplicationMenu();
+    createWindow(runtimeOrigin);
+  } catch (error) {
+    await showStartupFailure(error);
     app.quit();
-    return;
   }
-  // startBackend 的 Promise 在 listen 回调中 resolve，服务器此时已就绪，直接建窗口
-  createWindow(port);
 });
 
-app.on('before-quit', () => {
-  if (serverInstance) {
-    serverInstance.close();
-    serverInstance = null;
-  }
+app.on('activate', () => {
+  if (process.platform === 'darwin' && runtimeOrigin && !mainWindow) createWindow(runtimeOrigin);
+});
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') app.quit();
+});
+app.on('before-quit', (event) => {
+  if (quitting) return;
+  event.preventDefault();
+  shutdownRuntime().finally(() => app.quit());
 });

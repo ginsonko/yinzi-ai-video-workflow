@@ -2,125 +2,258 @@
   <div class="film-list">
     <header class="header">
       <div class="header-inner">
-        <h1 class="logo">
-          <span class="logo-main">本地短剧助手</span>
-          <span class="logo-sub">LocalMiniDrama</span>
-        </h1>
-        <!-- 公共资源库（左侧，靛紫调） -->
-        <div class="header-library">
-          <el-button class="btn-library" @click="showCharLibrary = true">
-            <el-icon><User /></el-icon>素材角色
-          </el-button>
-          <el-button class="btn-library" @click="showSceneLibrary = true">
-            <el-icon><PictureFilled /></el-icon>素材场景
-          </el-button>
-          <el-button class="btn-library" @click="showPropLibrary = true">
-            <el-icon><Box /></el-icon>素材道具
-          </el-button>
-        </div>
-        <!-- 右侧操作区 -->
+        <button class="brand" type="button" aria-label="返回项目工作台" @click="router.push('/')">
+          <span class="brand-mark"><el-icon><VideoCamera /></el-icon></span>
+          <span class="brand-copy">
+            <strong>银子AI视频工作流</strong>
+            <small>Yinzi AI Video Studio</small>
+          </span>
+        </button>
+
+        <nav class="primary-nav" aria-label="主导航">
+          <button type="button" class="nav-link is-active" @click="scrollToProjects">项目</button>
+          <button type="button" class="nav-link" @click="router.push('/media-library')">素材库</button>
+          <button type="button" class="nav-link" @click="router.push('/director')">3D 导演台</button>
+          <button type="button" class="nav-link" @click="router.push('/help')">使用指南</button>
+          <button type="button" class="nav-link" @click="router.push('/advanced-settings')">高级设置</button>
+          <el-dropdown trigger="click" @command="openResourceCenter">
+            <button type="button" class="nav-link resource-trigger">
+              资源中心<el-icon><ArrowDown /></el-icon>
+            </button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item command="characters" :icon="User">角色素材</el-dropdown-item>
+                <el-dropdown-item command="scenes" :icon="PictureFilled">场景素材</el-dropdown-item>
+                <el-dropdown-item command="props" :icon="Box">道具素材</el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
+        </nav>
+
         <div class="header-actions">
-          <!-- 暂时隐藏，功能待完善 -->
-          <!-- <el-button class="btn-library" title="自由创作" @click="$router.push('/free-create')">
-            <el-icon><MagicStick /></el-icon>自由创作
+          <a class="yinzi-link" href="https://www.yinziapi.top" target="_blank" rel="noopener noreferrer">
+            银子API<el-icon><TopRight /></el-icon>
+          </a>
+          <el-tooltip :content="isDark ? '切换到浅色模式' : '切换到暗色模式'">
+            <el-button class="icon-action" circle :aria-label="isDark ? '切换到浅色模式' : '切换到暗色模式'" @click="toggleTheme">
+              <el-icon><Sunny v-if="isDark" /><Moon v-else /></el-icon>
+            </el-button>
+          </el-tooltip>
+          <el-button :class="['config-status-button', { ready: configReadiness.isReady }]" @click="openConfigDialog()">
+            <el-icon><CircleCheckFilled v-if="configReadiness.isReady" /><WarningFilled v-else /></el-icon>
+            {{ configLoading ? '检查配置' : configReadiness.isReady ? '配置完整' : `缺 ${configReadiness.missing.length} 项配置` }}
           </el-button>
-          <el-button class="btn-library" title="媒体素材库" @click="$router.push('/media-library')">
-            <el-icon><Files /></el-icon>素材库
-          </el-button> -->
-          <el-button v-if="!vendorLockEnabled" class="btn-wechat" title="扫码联系作者" @click="showWechat = true">
-            <el-icon><ChatDotSquare /></el-icon>微信我
-          </el-button>
-          <el-button class="btn-theme" :title="isDark ? '切换到浅色模式' : '切换到暗色模式'" @click="toggleTheme">
-            <el-icon><Sunny v-if="isDark" /><Moon v-else /></el-icon>
-            {{ isDark ? '浅色' : '暗色' }}
-          </el-button>
-          <el-button class="btn-settings" @click="showAiConfigDialog = true">
-            <el-icon><Setting /></el-icon>AI配置
-          </el-button>
-          <el-button class="btn-director" title="打开独立 3D 导演台" @click="router.push('/director')">
-            <el-icon><Camera /></el-icon>3D 导演台
-          </el-button>
-          <el-button class="btn-import" :loading="importing" @click="triggerImport">
-            <el-icon><Upload /></el-icon>导入项目
-          </el-button>
-          <input ref="importFileInput" type="file" accept=".zip" style="display:none" @change="onImportFile" />
           <el-button type="primary" class="btn-new" @click="goNewProject">
             <el-icon><Plus /></el-icon>新建项目
           </el-button>
         </div>
+        <input ref="importFileInput" type="file" accept=".zip" hidden @change="onImportFile" />
       </div>
     </header>
 
     <main class="main">
-      <div v-loading="loading" class="projects-wrap">
-        <div class="project-grid">
-          <!-- 操作卡片：始终作为第一个格子 -->
-          <div class="project-card action-card">
-            <div class="action-card-inner">
-              <h3 class="action-card-title">快速开始</h3>
-              <div class="action-card-buttons">
-                <el-button type="primary" size="large" class="action-btn action-btn-new" @click="goNewProject">
-                  <el-icon><Plus /></el-icon>新建短剧项目
-                </el-button>
-                <el-button size="large" class="action-btn action-btn-import" :loading="importing" @click="triggerImport">
-                  <el-icon><Upload /></el-icon>导入短剧项目
-                </el-button>
-              </div>
-              <div v-if="exampleList.length > 0" class="action-card-example">
-                <div class="example-hint">
-                  <el-icon class="example-hint-icon"><QuestionFilled /></el-icon>
-                  <span class="example-hint-text">新手？试试导入示例项目快速体验</span>
-                </div>
-                <div class="example-list">
-                  <el-button
-                    v-for="ex in exampleList"
-                    :key="ex.filename"
-                    size="small"
-                    class="example-btn"
-                    :loading="importingExample === ex.filename"
-                    @click="onImportExample(ex)"
-                  >
-                    <el-icon><FolderOpened /></el-icon>{{ ex.name }}
-                  </el-button>
-                </div>
-              </div>
-            </div>
+      <section class="start-panel" aria-labelledby="workspace-title">
+        <div class="start-copy">
+          <p class="section-kicker">从故事到成片</p>
+          <h1 id="workspace-title">制作工作台</h1>
+          <p class="start-description">人工模式可逐项打磨；AI 审批会自己打回、修改和复审；全自动模式从故事一路运行到旁白、字幕与最终成片。</p>
+          <div class="primary-actions">
+            <el-button type="primary" size="large" @click="goNewProject">
+              <el-icon><Plus /></el-icon>开始真实制作
+            </el-button>
+            <el-button size="large" @click="router.push('/guided-demo')">
+              <el-icon><VideoPlay /></el-icon>零成本模拟
+            </el-button>
+            <el-button size="large" :loading="importing" @click="triggerImport">
+              <el-icon><Upload /></el-icon>导入项目
+            </el-button>
           </div>
-          <div
-            v-for="d in dramas"
-            :key="d.id"
-            class="project-card"
-            @click="openProject(d.id)"
-          >
-            <div class="project-card-actions" @click.stop>
-              <el-button size="small" circle type="primary" :icon="MagicStick" title="打开新手制作向导" @click="router.push(`/workflow/${d.id}`)" />
-              <el-button size="small" circle :icon="Camera" title="打开项目 3D 导演台" @click="router.push(`/director/${d.id}`)" />
-              <el-button size="small" circle :icon="Download" title="导出项目" :loading="exportingId === d.id" @click="onExport(d)" />
-              <el-button size="small" circle :icon="Edit" title="编辑" @click="openEditDialog(d)" />
-              <el-button size="small" type="danger" plain circle :icon="Delete" title="删除" @click="onDelete(d)" />
+          <div class="mode-summary" aria-label="三种制作模式">
+            <article v-for="mode in modeHighlights" :key="mode.key">
+              <strong>{{ mode.label }}</strong>
+              <small>{{ mode.description }}</small>
+            </article>
+          </div>
+          <ol class="workflow-strip" aria-label="制作流程">
+            <li v-for="(stage, index) in workflowStages" :key="stage">
+              <span>{{ index + 1 }}</span>{{ stage }}
+            </li>
+          </ol>
+        </div>
+
+        <aside class="readiness-panel" aria-label="模型配置准备度">
+          <div class="readiness-heading">
+            <div>
+              <span>真实制作准备度</span>
+              <strong>{{ configReadiness.readyCount }}/{{ configReadiness.total }}</strong>
             </div>
-            <div class="project-card-body">
-              <h3 class="project-title">{{ d.title || '未命名项目' }}</h3>
-              <p class="project-desc">{{ d.description || '暂无描述' }}</p>
-              <div class="project-badges">
-                <span class="badge badge-status" :class="'badge-status--' + (d.status || 'draft')">{{ formatStatus(d.status) }}</span>
-                <span v-if="d.episodes?.length" class="badge badge-episodes">{{ d.episodes.length }} 集</span>
-                <span v-if="totalStoryboards(d) > 0" class="badge badge-storyboards">{{ totalStoryboards(d) }} 分镜</span>
-                <span v-if="d.metadata?.aspect_ratio" class="badge badge-ratio">{{ d.metadata.aspect_ratio }}</span>
-                <span v-if="d.style" class="badge badge-style">{{ formatStyle(d.style) }}</span>
-                <span v-if="d.genre" class="badge badge-genre">{{ formatGenre(d.genre) }}</span>
+            <el-progress
+              type="circle"
+              :percentage="configProgress"
+              :width="54"
+              :stroke-width="6"
+              :show-text="false"
+              :status="configReadiness.isReady ? 'success' : undefined"
+            />
+          </div>
+          <div v-if="configError" class="config-load-error" role="status">
+            <span>暂时无法读取配置，真实新建会保持锁定。</span>
+            <el-button link type="primary" @click="loadConfigReadiness">重试</el-button>
+          </div>
+          <div v-else v-loading="configLoading" class="readiness-list">
+            <button
+              v-for="item in configReadiness.required"
+              :key="item.type"
+              type="button"
+              :class="['readiness-item', { ready: item.ready }]"
+              @click="openConfigDialog(item.type)"
+            >
+              <el-icon><CircleCheckFilled v-if="item.ready" /><WarningFilled v-else /></el-icon>
+              <span><strong>{{ item.label }}</strong><small>{{ item.reason }}</small></span>
+              <el-icon class="readiness-arrow"><ArrowRight /></el-icon>
+            </button>
+          </div>
+          <p class="readiness-note">“已配置”仅检查已保存的默认配置，不会自动测试 Key，也不会产生模型费用。</p>
+          <div class="readiness-actions">
+            <el-button type="primary" plain @click="openConfigDialog('yinzi')">一键配置银子API</el-button>
+            <el-button text @click="router.push('/help#configuration')">查看配置方法</el-button>
+          </div>
+        </aside>
+      </section>
+
+      <section id="projects" class="projects-section" aria-labelledby="projects-title">
+        <div class="section-toolbar">
+          <div>
+            <p class="section-kicker">本地项目</p>
+            <h2 id="projects-title">{{ archiveState === 'archived' ? '已归档项目' : '正在制作' }}</h2>
+          </div>
+          <div class="project-filters">
+            <el-radio-group v-model="archiveState" size="large" @change="changeArchiveState">
+              <el-radio-button value="active">进行中</el-radio-button>
+              <el-radio-button value="archived">已归档</el-radio-button>
+            </el-radio-group>
+            <el-input v-model="projectKeyword" class="project-search" clearable placeholder="搜索项目名称或描述" @input="onProjectSearch">
+              <template #prefix><el-icon><Search /></el-icon></template>
+            </el-input>
+            <el-tooltip content="刷新项目">
+              <el-button circle :icon="Refresh" aria-label="刷新项目" :loading="loading" @click="loadList" />
+            </el-tooltip>
+          </div>
+        </div>
+
+        <div v-if="listError" class="list-error" role="status">
+          <span>{{ listError }}</span>
+          <el-button link type="primary" @click="loadList">重新加载</el-button>
+        </div>
+
+        <div v-loading="loading" class="projects-wrap" aria-live="polite">
+          <div v-if="dramas.length" class="project-grid">
+            <article
+              v-for="d in dramas"
+              :key="d.id"
+              :class="['project-card', { 'has-final': projectFinal(d) }]"
+              @click="openProject(d.id)"
+            >
+              <div class="project-card-menu" @click.stop>
+                <el-dropdown trigger="click" @command="(command) => handleProjectCommand(command, d)">
+                  <el-button circle :icon="MoreFilled" aria-label="项目更多操作" />
+                  <template #dropdown>
+                    <el-dropdown-menu>
+                      <el-dropdown-item command="director" :icon="Camera">打开 3D 导演台</el-dropdown-item>
+                      <el-dropdown-item command="media" :icon="Files">查看项目素材</el-dropdown-item>
+                      <el-dropdown-item command="export" :icon="Download">导出项目</el-dropdown-item>
+                      <el-dropdown-item command="edit" :icon="EditPen">编辑资料</el-dropdown-item>
+                      <el-dropdown-item divided :command="archiveState === 'archived' ? 'restore' : 'archive'" :icon="archiveState === 'archived' ? RefreshLeft : Folder">
+                        {{ archiveState === 'archived' ? '恢复项目' : '归档项目' }}
+                      </el-dropdown-item>
+                      <el-dropdown-item command="delete" :icon="Delete">删除项目</el-dropdown-item>
+                    </el-dropdown-menu>
+                  </template>
+                </el-dropdown>
               </div>
-              <p class="project-meta">{{ formatDate(d.updated_at) }}</p>
+
+              <button
+                v-if="projectFinal(d)"
+                type="button"
+                class="project-final-preview"
+                :class="{ 'is-unavailable': projectFinal(d).available === false }"
+                :aria-label="projectFinal(d).available === false ? '成片文件暂不可用' : `播放${d.title || '项目'}成片`"
+                @click.stop="openFinalPreview(d)"
+              >
+                <video v-if="projectFinalUrl(d)" :src="`${projectFinalUrl(d)}#t=0.1`" muted playsinline preload="metadata" />
+                <span v-else class="project-final-placeholder"><VideoPlay /></span>
+                <span class="project-final-shade"></span>
+                <span class="project-final-state">
+                  <el-icon><CircleCheckFilled /></el-icon>
+                  {{ projectFinal(d).available === false ? '成片已批准 · 文件待恢复' : '成片已完成' }}
+                </span>
+                <span v-if="projectFinal(d).available !== false" class="project-final-play"><VideoPlay /></span>
+                <span class="project-final-meta">{{ formatDuration(projectFinal(d).duration_seconds) || formatDate(projectFinal(d).approved_at || projectFinal(d).updated_at) }}</span>
+              </button>
+              <div v-else class="project-progress-cover">
+                <el-icon><MagicStick /></el-icon>
+                <span>{{ formatStatus(d.status) }}</span>
+              </div>
+
+              <div class="project-card-body">
+                <h3 class="project-title">{{ d.title || '未命名项目' }}</h3>
+                <p class="project-desc">{{ d.description || '还没有故事简介' }}</p>
+                <div class="project-badges">
+                  <span v-if="d.archived_at" class="badge badge-archived"><el-icon><Folder /></el-icon>已归档</span>
+                  <span v-if="projectFinal(d)" class="badge badge-final"><el-icon><CircleCheckFilled /></el-icon>成片已完成</span>
+                  <span v-else class="badge badge-status" :class="'badge-status--' + (d.status || 'draft')">{{ formatStatus(d.status) }}</span>
+                  <span v-if="d.episodes?.length" class="badge badge-episodes">{{ d.episodes.length }} 集</span>
+                  <span v-if="totalStoryboards(d) > 0" class="badge badge-storyboards">{{ totalStoryboards(d) }} 分镜</span>
+                  <span v-if="d.metadata?.aspect_ratio" class="badge badge-ratio">{{ d.metadata.aspect_ratio }}</span>
+                </div>
+                <div class="project-card-footer">
+                  <span>更新于 {{ formatDate(d.updated_at) }}</span>
+                  <el-button type="primary" link @click.stop="openProject(d.id)">{{ d.archived_at ? '查看项目' : '继续制作' }}<el-icon><ArrowRight /></el-icon></el-button>
+                </div>
+              </div>
+            </article>
+          </div>
+
+          <div v-else-if="!loading" class="project-empty">
+            <el-icon><FolderOpened /></el-icon>
+            <h3>{{ projectKeyword ? '没有匹配的项目' : archiveState === 'archived' ? '还没有归档项目' : '开始第一个视频项目' }}</h3>
+            <p>{{ projectKeyword ? '换一个关键词，或清空搜索条件。' : archiveState === 'archived' ? '暂时不处理的项目可以从项目菜单归档到这里。' : '可以先运行零成本模拟，理解流程后再开始真实制作。' }}</p>
+            <div>
+              <el-button v-if="projectKeyword" @click="clearProjectSearch">清空搜索</el-button>
+              <el-button v-else-if="archiveState === 'active'" type="primary" @click="goNewProject">新建项目</el-button>
+              <el-button v-if="archiveState === 'active'" @click="router.push('/guided-demo')">零成本模拟</el-button>
             </div>
           </div>
         </div>
-      </div>
+
+        <div v-if="total > 0" class="project-pagination">
+          <span>共 {{ total }} 个项目</span>
+          <el-pagination
+            v-model:current-page="projectPage"
+            v-model:page-size="projectPageSize"
+            :total="total"
+            :page-sizes="[12, 24, 48]"
+            layout="sizes, prev, pager, next"
+            @current-change="changeProjectPage"
+            @size-change="changeProjectPageSize"
+          />
+        </div>
+      </section>
+
+      <footer class="home-footer">
+        <div><strong>银子AI视频工作流</strong><span>作者：银子 · QQ：474764004</span></div>
+        <div>
+          <a href="https://github.com/ginsonko" target="_blank" rel="noopener noreferrer">GitHub · ginsonko</a>
+          <a href="https://www.yinziapi.top" target="_blank" rel="noopener noreferrer">银子API</a>
+          <button type="button" @click="router.push('/help')">说明书</button>
+        </div>
+      </footer>
     </main>
 
     <!-- 新建项目：先填标题和描述 -->
     <el-dialog
       v-model="showNewDialog"
-      title="新建项目"
+      title="新建真实制作"
       width="480px"
       :close-on-click-modal="false"
       @closed="resetNewForm"
@@ -150,9 +283,28 @@
       </template>
     </el-dialog>
 
+    <el-dialog v-model="showConfigGuide" title="完成核心配置后开始制作" width="min(520px, 92vw)" :close-on-click-modal="false">
+      <p class="config-guide-intro">真实制作需要文本、资源生图、分镜生图和视频四项默认配置。这里仅检查是否已保存，不会主动测试或产生费用。</p>
+      <div v-if="configError" class="config-guide-error">
+        <el-icon><WarningFilled /></el-icon>
+        <span>当前无法读取配置，请先重试；零成本模拟和历史项目仍可使用。</span>
+      </div>
+      <div v-else class="config-guide-list">
+        <div v-for="item in configReadiness.required" :key="item.type" :class="['config-guide-item', { ready: item.ready }]">
+          <el-icon><CircleCheckFilled v-if="item.ready" /><WarningFilled v-else /></el-icon>
+          <span><strong>{{ item.label }}</strong><small>{{ item.reason }} · {{ item.purpose }}</small></span>
+        </div>
+      </div>
+      <template #footer>
+        <el-button @click="router.push('/guided-demo'); showConfigGuide = false">先体验零成本模拟</el-button>
+        <el-button @click="router.push('/help#configuration'); showConfigGuide = false">查看配置方法</el-button>
+        <el-button type="primary" @click="showConfigGuide = false; openConfigDialog('yinzi')">一键去配置</el-button>
+      </template>
+    </el-dialog>
+
     <!-- AI 配置弹窗 -->
-    <el-dialog v-model="showAiConfigDialog" title="AI 配置" width="90%" destroy-on-close>
-      <AIConfigContent v-if="showAiConfigDialog" />
+    <el-dialog v-model="showAiConfigDialog" title="模型与 Key" width="min(1120px, 94vw)" destroy-on-close @closed="loadConfigReadiness">
+      <AIConfigContent v-if="showAiConfigDialog" :initial-action="configInitialAction" />
     </el-dialog>
 
     <!-- 公共角色库 -->
@@ -318,20 +470,46 @@
       </template>
     </el-dialog>
 
-    <!-- 微信二维码 -->
-    <el-dialog v-if="!vendorLockEnabled" v-model="showWechat" title="微信联系作者" width="320px" align-center>
-      <div style="text-align:center;padding:8px 0 4px">
-        <img src="/wx.jpg" alt="微信二维码" style="width:240px;height:240px;object-fit:contain;border-radius:8px;" />
-        <p style="margin:12px 0 0;font-size:13px;color:var(--text-secondary,#a1a1aa);">扫码添加微信，欢迎交流</p>
-      </div>
-    </el-dialog>
-
     <!-- 图片放大预览 -->
     <Teleport to="body">
       <div v-if="previewImageUrl" class="image-preview-overlay" @click="previewImageUrl = null">
         <img :src="previewImageUrl" alt="" class="image-preview-img" @click.stop="previewImageUrl = null" />
       </div>
     </Teleport>
+
+    <el-dialog
+      v-model="showFinalPreview"
+      :title="previewFinal?.drama_title ? `${previewFinal.drama_title} · 最终成片` : '最终成片'"
+      width="min(960px, 94vw)"
+      destroy-on-close
+      @closed="previewFinal = null"
+    >
+      <div class="final-player-shell">
+        <video
+          v-if="previewFinalUrl"
+          :src="previewFinalUrl"
+          controls
+          autoplay
+          playsinline
+          preload="metadata"
+          class="final-player"
+        />
+        <div v-else class="final-player-unavailable">
+          <el-icon><VideoPlay /></el-icon>
+          <strong>成片记录已批准，但源文件当前不可用</strong>
+          <span>可进入制作向导查看产物来源和恢复状态。</span>
+        </div>
+      </div>
+      <div v-if="previewFinal" class="final-player-info">
+        <span>{{ previewFinal.title || '最终成片' }}</span>
+        <span>{{ formatDuration(previewFinal.duration_seconds) || '时长由播放器读取' }}</span>
+        <span>批准于 {{ formatDate(previewFinal.approved_at || previewFinal.updated_at) }}</span>
+      </div>
+      <template #footer>
+        <el-button @click="router.push({ path: `/workflow/${previewFinal?.drama_id}`, query: { run: previewFinal?.run_id } })">查看制作流程</el-button>
+        <el-button type="primary" :icon="Download" :disabled="!previewFinalUrl" @click="downloadFinal(previewFinal)">下载成片</el-button>
+      </template>
+    </el-dialog>
 
     <!-- 编辑项目：修改标题和故事 -->
     <el-dialog
@@ -358,10 +536,37 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { computed, ref, onMounted } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Camera, Edit, Delete, Setting, Plus, User, PictureFilled, Box, Sunny, Moon, ChatDotSquare, Download, Upload, QuestionFilled, FolderOpened, MagicStick, Files } from '@element-plus/icons-vue'
+import {
+  ArrowDown,
+  ArrowRight,
+  Box,
+  Camera,
+  CircleCheckFilled,
+  Delete,
+  Download,
+  EditPen,
+  Files,
+  Folder,
+  FolderOpened,
+  MagicStick,
+  Moon,
+  MoreFilled,
+  PictureFilled,
+  Plus,
+  Refresh,
+  RefreshLeft,
+  Search,
+  Sunny,
+  TopRight,
+  Upload,
+  User,
+  VideoCamera,
+  VideoPlay,
+  WarningFilled,
+} from '@element-plus/icons-vue'
 import { useTheme } from '@/composables/useTheme'
 import { dramaAPI } from '@/api/drama'
 import { characterLibraryAPI } from '@/api/characterLibrary'
@@ -372,9 +577,19 @@ import { uploadAPI } from '@/api/upload'
 import { aiAPI } from '@/api/ai'
 import { imagesAPI } from '@/api/images'
 import { taskAPI } from '@/api/task'
+import { productionAPI } from '@/api/production'
+import { mapLatestFinalsByDrama, productionMediaUrl } from '@/utils/productionMedia'
+import { getConfigReadiness } from '@/utils/configReadiness'
 
 const router = useRouter()
+const route = useRoute()
 const { isDark, toggle: toggleTheme } = useTheme()
+const workflowStages = ['故事', '资产', '分镜与预演', '视频生成', '剪辑交付']
+const modeHighlights = [
+  { key: 'human', label: '人工审批', description: '逐项阅读、编辑、确认或打回，适合精细控制。' },
+  { key: 'ai', label: 'AI 审批', description: '自动打回、修改并复审；同一对象连续耗尽上限才找你。' },
+  { key: 'auto', label: '全自动', description: '从故事运行到成片，中间无人确认，仍保留技术与媒体校验。' },
+]
 
 // 库编辑图片 – 文件输入 refs
 const charLibFileRef  = ref(null)
@@ -435,10 +650,59 @@ async function doGenerateLibImg(form, prompt, api, reloadFn) {
 const loading = ref(false)
 const dramas = ref([])
 const total = ref(0)
+const finalMediaByDrama = ref(new Map())
+const showFinalPreview = ref(false)
+const previewFinal = ref(null)
+const previewFinalUrl = computed(() => productionMediaUrl(previewFinal.value))
 
 const showAiConfigDialog = ref(false)
-const showWechat = ref(false)
-const vendorLockEnabled = ref(false)
+const showConfigGuide = ref(false)
+const configInitialAction = ref('')
+const configLoading = ref(true)
+const configError = ref('')
+const aiConfigs = ref([])
+const configReadiness = computed(() => getConfigReadiness(aiConfigs.value))
+const configProgress = computed(() => Math.round((configReadiness.value.readyCount / configReadiness.value.total) * 100))
+
+function positiveInt(value, fallback) {
+  const parsed = Number.parseInt(value, 10)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+}
+
+const archiveState = ref(route.query.archive_state === 'archived' ? 'archived' : 'active')
+const projectKeyword = ref(typeof route.query.keyword === 'string' ? route.query.keyword : '')
+const projectPage = ref(positiveInt(route.query.page, 1))
+const projectPageSize = ref([12, 24, 48].includes(positiveInt(route.query.page_size, 12)) ? positiveInt(route.query.page_size, 12) : 12)
+const listError = ref('')
+let listRequestId = 0
+let projectSearchTimer = null
+
+async function loadConfigReadiness() {
+  configLoading.value = true
+  configError.value = ''
+  try {
+    aiConfigs.value = await aiAPI.list()
+  } catch (error) {
+    configError.value = error?.message || '配置读取失败'
+  } finally {
+    configLoading.value = false
+  }
+}
+
+function openConfigDialog(action = '') {
+  configInitialAction.value = action === 'yinzi' ? 'yinzi' : (action ? `service:${action}` : '')
+  showAiConfigDialog.value = true
+}
+
+function openResourceCenter(command) {
+  if (command === 'characters') showCharLibrary.value = true
+  if (command === 'scenes') showSceneLibrary.value = true
+  if (command === 'props') showPropLibrary.value = true
+}
+
+function scrollToProjects() {
+  document.getElementById('projects')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
 
 // 图片预览
 const previewImageUrl = ref(null)
@@ -602,47 +866,132 @@ const exportingId = ref(null)
 const importing = ref(false)
 const importFileInput = ref(null)
 
-const exampleList = ref([])
-const importingExample = ref(null)
-
-function loadExamples() {
-  dramaAPI.listExamples()
-    .then(res => { exampleList.value = Array.isArray(res) ? res : (res?.data ?? []) })
-    .catch(() => { exampleList.value = [] })
-}
-
-async function onImportExample(ex) {
-  importingExample.value = ex.filename
-  try {
-    const data = await dramaAPI.importExample(ex.filename)
-    ElMessage.success(`示例导入成功：${data?.title || ex.name}`)
-    loadList()
-  } catch (e) {
-    const msg = e.response?.data?.message || e.message || '导入失败'
-    ElMessage.error(msg)
-  } finally {
-    importingExample.value = null
-  }
-}
-
 const showEditDialog = ref(false)
 const editForm = ref({ id: null, title: '', description: '' })
 const editSaving = ref(false)
 
-function loadList() {
+function syncProjectQuery() {
+  const query = {}
+  if (archiveState.value === 'archived') query.archive_state = 'archived'
+  if (projectKeyword.value.trim()) query.keyword = projectKeyword.value.trim()
+  if (projectPage.value > 1) query.page = String(projectPage.value)
+  if (projectPageSize.value !== 12) query.page_size = String(projectPageSize.value)
+  router.replace({ path: '/', query })
+}
+
+async function loadList(options = {}) {
+  const requestId = ++listRequestId
   loading.value = true
-  dramaAPI
-    .list({ page: 1, page_size: 50 })
-    .then((res) => {
-      dramas.value = res?.items ?? []
-      total.value = res?.pagination?.total ?? 0
+  listError.value = ''
+  try {
+    const res = await dramaAPI.list({
+      page: projectPage.value,
+      page_size: projectPageSize.value,
+      keyword: projectKeyword.value.trim() || undefined,
+      archive_state: archiveState.value,
     })
-    .catch(() => {
-      dramas.value = []
+    if (requestId !== listRequestId) return
+    const items = res?.items ?? []
+    const nextTotal = res?.pagination?.total ?? 0
+    if (!items.length && nextTotal > 0 && projectPage.value > 1 && options.allowPageFallback !== false) {
+      projectPage.value = Math.max(1, projectPage.value - 1)
+      syncProjectQuery()
+      return loadList({ allowPageFallback: false })
+    }
+    dramas.value = items
+    total.value = nextTotal
+  } catch (error) {
+    if (requestId !== listRequestId) return
+    listError.value = error?.message || '项目列表加载失败'
+  } finally {
+    if (requestId === listRequestId) loading.value = false
+  }
+}
+
+function onProjectSearch() {
+  if (projectSearchTimer) clearTimeout(projectSearchTimer)
+  projectSearchTimer = setTimeout(() => {
+    projectPage.value = 1
+    syncProjectQuery()
+    loadList()
+  }, 300)
+}
+
+function clearProjectSearch() {
+  projectKeyword.value = ''
+  projectPage.value = 1
+  syncProjectQuery()
+  loadList()
+}
+
+function changeArchiveState() {
+  projectPage.value = 1
+  syncProjectQuery()
+  loadList()
+}
+
+function changeProjectPage() {
+  syncProjectQuery()
+  loadList()
+  scrollToProjects()
+}
+
+function changeProjectPageSize() {
+  projectPage.value = 1
+  syncProjectQuery()
+  loadList()
+}
+
+async function loadFinalMedia() {
+  try {
+    const result = await productionAPI.productionMedia({
+      stage: 'final_edit',
+      kind: 'final_video',
+      media_type: 'video',
+      latest_per_drama: true,
+      page_size: 100,
     })
-    .finally(() => {
-      loading.value = false
-    })
+    finalMediaByDrama.value = mapLatestFinalsByDrama(result?.items || [])
+  } catch (_) {
+    finalMediaByDrama.value = new Map()
+  }
+}
+
+function projectFinal(drama) {
+  return finalMediaByDrama.value.get(Number(drama?.id)) || null
+}
+
+function projectFinalUrl(drama) {
+  return productionMediaUrl(projectFinal(drama))
+}
+
+function openFinalPreview(drama) {
+  const item = projectFinal(drama)
+  if (!item) return
+  previewFinal.value = item
+  showFinalPreview.value = true
+}
+
+function formatDuration(value) {
+  const seconds = Number(value)
+  if (!Number.isFinite(seconds) || seconds <= 0) return ''
+  const minutes = Math.floor(seconds / 60)
+  const remainder = Math.round(seconds % 60)
+  return minutes ? `${minutes}:${String(remainder).padStart(2, '0')}` : `${remainder} 秒`
+}
+
+function downloadFinal(item) {
+  const url = productionMediaUrl(item)
+  if (!url) return ElMessage.warning('成片文件当前不可下载')
+  const extension = String(item.media_path || '').match(/\.[a-z0-9]+$/i)?.[0] || '.mp4'
+  const name = String(item.drama_title || '最终成片').replace(/[\\/:*?"<>|]/g, '_')
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = `${name}-成片${extension}`
+  anchor.rel = 'noopener'
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
 }
 
 function formatDate(val) {
@@ -708,7 +1057,12 @@ function totalStoryboards(d) {
   return (d.episodes || []).reduce((sum, ep) => sum + (ep.storyboards?.length || 0), 0)
 }
 
-function goNewProject() {
+async function goNewProject() {
+  if (configLoading.value) await loadConfigReadiness()
+  if (configError.value || !configReadiness.value.isReady) {
+    showConfigGuide.value = true
+    return
+  }
   showNewDialog.value = true
 }
 
@@ -719,13 +1073,18 @@ function resetNewForm() {
 async function submitNew() {
   const title = newForm.value.title?.trim()
   if (!title) return
+  await loadConfigReadiness()
+  if (configError.value || !configReadiness.value.isReady) {
+    showNewDialog.value = false
+    showConfigGuide.value = true
+    return
+  }
   newSaving.value = true
   try {
     const drama = await dramaAPI.create({ title, description: newForm.value.description?.trim() || undefined, metadata: { aspect_ratio: newForm.value.aspect_ratio || '16:9' } })
     showNewDialog.value = false
     ElMessage.success('项目已创建')
-    loadList()
-    router.push('/film/' + drama.id)
+    router.push('/workflow/' + drama.id)
   } catch (e) {
     ElMessage.error(e.message || '创建失败')
   } finally {
@@ -759,7 +1118,27 @@ async function submitEdit() {
 }
 
 function openProject(id) {
-  router.push('/drama/' + id)
+  router.push('/workflow/' + id)
+}
+
+async function setProjectArchived(drama, archived) {
+  try {
+    await dramaAPI.update(drama.id, { archived })
+    ElMessage.success(archived ? '项目已归档，可在“已归档”中恢复' : '项目已恢复到进行中')
+    await loadList()
+  } catch (error) {
+    ElMessage.error(error?.message || (archived ? '归档失败' : '恢复失败'))
+  }
+}
+
+function handleProjectCommand(command, drama) {
+  if (command === 'director') router.push(`/director/${drama.id}`)
+  if (command === 'media') router.push({ path: '/media-library', query: { drama_id: String(drama.id) } })
+  if (command === 'export') onExport(drama)
+  if (command === 'edit') openEditDialog(drama)
+  if (command === 'archive') setProjectArchived(drama, true)
+  if (command === 'restore') setProjectArchived(drama, false)
+  if (command === 'delete') onDelete(drama)
 }
 
 function onExport(d) {
@@ -798,7 +1177,11 @@ async function onImportFile(e) {
   try {
     const data = await dramaAPI.importDrama(file)
     ElMessage.success(`导入成功：${data?.title || '项目'}`) 
-    loadList()
+    archiveState.value = 'active'
+    projectKeyword.value = ''
+    projectPage.value = 1
+    syncProjectQuery()
+    await loadList()
   } catch (e) {
     const msg = e.response?.data?.message || e.message || '导入失败'
     ElMessage.error(msg)
@@ -827,12 +1210,18 @@ async function onDelete(d) {
 }
 
 onMounted(async () => {
-  loadList()
-  loadExamples()
-  try {
-    const lock = await aiAPI.getVendorLock()
-    vendorLockEnabled.value = !!lock?.enabled
-  } catch (_) {}
+  await Promise.all([
+    loadConfigReadiness(),
+    loadList(),
+    loadFinalMedia(),
+  ])
+  if (route.query.config === 'yinzi') {
+    openConfigDialog('yinzi')
+    router.replace({ path: '/' })
+  } else if (route.query.start === '1') {
+    await goNewProject()
+    router.replace({ path: '/' })
+  }
 })
 </script>
 
@@ -949,25 +1338,6 @@ html.light .btn-theme {
   --el-button-hover-text-color: #4f46e5;
 }
 
-/* 微信我按钮 —— 绿调 */
-.btn-wechat {
-  --el-button-bg-color: rgba(34, 197, 94, 0.1);
-  --el-button-border-color: rgba(34, 197, 94, 0.3);
-  --el-button-text-color: #22c55e;
-  --el-button-hover-bg-color: rgba(34, 197, 94, 0.2);
-  --el-button-hover-border-color: rgba(34, 197, 94, 0.5);
-  --el-button-hover-text-color: #16a34a;
-  transition: all 0.2s;
-}
-html.light .btn-wechat {
-  --el-button-bg-color: rgba(21, 128, 61, 0.08);
-  --el-button-border-color: rgba(21, 128, 61, 0.3);
-  --el-button-text-color: #166534;
-  --el-button-hover-bg-color: rgba(21, 128, 61, 0.14);
-  --el-button-hover-border-color: rgba(21, 128, 61, 0.5);
-  --el-button-hover-text-color: #14532d;
-}
-
 /* AI配置按钮 —— 琥珀调 */
 .btn-settings {
   --el-button-bg-color: rgba(234, 179, 8, 0.1);
@@ -1040,7 +1410,7 @@ html.light .btn-import {
 }
 .project-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(340px, 100%), 1fr));
   gap: 18px;
 }
 .project-card {
@@ -1068,6 +1438,98 @@ html.light .btn-import {
   background: rgba(28, 28, 36, 0.9);
   transform: translateY(-3px);
   box-shadow: 0 12px 40px rgba(99, 102, 241, 0.15), 0 0 0 1px rgba(99, 102, 241, 0.1), 0 2px 8px rgba(0, 0, 0, 0.4);
+}
+.project-card.has-final {
+  padding: 0;
+}
+.project-card.has-final .project-card-body {
+  padding: 16px 20px 20px;
+}
+.project-card.has-final .project-card-actions {
+  z-index: 4;
+}
+.project-final-preview {
+  position: relative;
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  color: #fff;
+  background: #111318;
+  cursor: pointer;
+  text-align: left;
+}
+.project-final-preview video {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+}
+.project-final-preview.is-unavailable {
+  cursor: default;
+}
+.project-final-placeholder {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: #687077;
+  background: #14171c;
+  font-size: 42px;
+}
+.project-final-shade {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(to bottom, rgba(8, 10, 12, 0.56), transparent 48%, rgba(8, 10, 12, 0.7));
+}
+.project-final-state,
+.project-final-meta,
+.project-final-play {
+  position: absolute;
+  z-index: 2;
+}
+.project-final-state {
+  top: 14px;
+  left: 14px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: calc(100% - 190px);
+  color: #dcfce7;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+.project-final-state .el-icon {
+  color: #4ade80;
+  flex: 0 0 auto;
+}
+.project-final-play {
+  top: 50%;
+  left: 50%;
+  width: 44px;
+  height: 44px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  color: #ecfeff;
+  background: rgba(13, 148, 136, 0.88);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+  font-size: 24px;
+  transform: translate(-50%, -50%);
+  transition: transform .2s, background .2s;
+}
+.project-final-preview:hover .project-final-play {
+  background: #0f766e;
+  transform: translate(-50%, -50%) scale(1.08);
+}
+.project-final-meta {
+  right: 14px;
+  bottom: 12px;
+  color: #d4d4d8;
+  font-size: 11px;
 }
 
 /* 操作卡片 */
@@ -1214,6 +1676,12 @@ html.light .btn-import {
   color: #a5b4fc;
   border: 1px solid rgba(99, 102, 241, 0.25);
 }
+.badge-final {
+  gap: 4px;
+  color: #86efac;
+  background: rgba(34, 197, 94, 0.12);
+  border: 1px solid rgba(34, 197, 94, 0.3);
+}
 .badge-episodes {
   background: rgba(14, 165, 233, 0.12);
   color: #38bdf8;
@@ -1251,6 +1719,7 @@ html.light .btn-import {
   right: 12px;
   display: flex;
   gap: 6px;
+  z-index: 2;
 }
 .project-card-actions .el-button {
   --el-button-size: 28px;
@@ -1258,6 +1727,45 @@ html.light .btn-import {
 }
 .project-card-actions .el-button .el-icon {
   font-size: 14px;
+}
+
+.final-player-shell {
+  min-height: 320px;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  background: #090b0d;
+  border: 1px solid #24282d;
+  border-radius: 6px;
+}
+.final-player {
+  width: 100%;
+  max-height: 68vh;
+  display: block;
+  background: #000;
+}
+.final-player-unavailable {
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+  padding: 32px;
+  color: #a1a1aa;
+  text-align: center;
+}
+.final-player-unavailable .el-icon {
+  color: #5eead4;
+  font-size: 44px;
+}
+.final-player-unavailable strong {
+  color: #e4e4e7;
+}
+.final-player-info {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  padding-top: 12px;
+  color: #71717a;
+  font-size: 12px;
 }
 
 /* 公共库弹窗 */
@@ -1375,6 +1883,14 @@ html.light .badge-status--draft {
   color: #4b5563;
   border-color: rgba(107, 114, 128, 0.25);
 }
+html.light .badge-final {
+  color: #166534;
+  background: rgba(22, 163, 74, 0.1);
+  border-color: rgba(22, 163, 74, 0.25);
+}
+html.light .final-player-info {
+  color: #4b5563;
+}
 
 /* ===== 图片放大预览 ===== */
 .image-preview-overlay {
@@ -1392,5 +1908,583 @@ html.light .badge-status--draft {
   max-height: 90vh;
   border-radius: 8px;
   object-fit: contain;
+}
+
+@media (max-width: 760px) {
+  .header {
+    padding: 10px 12px;
+  }
+  .header-inner {
+    gap: 10px;
+  }
+  .header-library,
+  .header-actions {
+    width: 100%;
+    margin-left: 0;
+    overflow-x: auto;
+    padding-bottom: 2px;
+  }
+  .header-library,
+  .header-actions {
+    flex-wrap: nowrap;
+  }
+  .header-library :deep(.el-button),
+  .header-actions :deep(.el-button) {
+    flex: 0 0 auto;
+  }
+  .main {
+    padding: 16px 12px 36px;
+  }
+  .project-card-actions {
+    max-width: calc(100% - 24px);
+    overflow-x: auto;
+  }
+  .project-final-state {
+    max-width: calc(100% - 150px);
+  }
+  .final-player-shell {
+    min-height: 210px;
+  }
+}
+
+/* ===== 银子 AI 视频工作台 ===== */
+.film-list {
+  min-height: 100vh;
+  color: #e7ece9;
+  background: #0d1110;
+  background-image: none;
+}
+.header {
+  padding: 10px 20px;
+  background: rgba(13, 17, 16, 0.96);
+  border-bottom: 1px solid #27312d;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.18);
+  backdrop-filter: blur(12px);
+}
+.header-inner {
+  max-width: 1480px;
+  display: grid;
+  grid-template-columns: auto minmax(360px, 1fr) auto;
+  gap: 18px;
+}
+.brand {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+.brand-mark {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  color: #f0fdfa;
+  background: #0f766e;
+  border-radius: 7px;
+  font-size: 18px;
+}
+.brand-copy {
+  min-width: 0;
+  display: grid;
+  line-height: 1.2;
+}
+.brand-copy strong {
+  color: #f4f7f5;
+  font-size: 15px;
+  white-space: nowrap;
+}
+.brand-copy small {
+  margin-top: 3px;
+  color: #85928d;
+  font-size: 10px;
+}
+.primary-nav {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.nav-link {
+  min-height: 36px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 11px;
+  border: 0;
+  border-radius: 6px;
+  color: #a7b2ad;
+  background: transparent;
+  cursor: pointer;
+  font-size: 13px;
+  white-space: nowrap;
+}
+.nav-link:hover,
+.nav-link.is-active {
+  color: #f0fdfa;
+  background: #1b2421;
+}
+.resource-trigger {
+  font-family: inherit;
+}
+.header-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-left: 0;
+}
+.yinzi-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 5px;
+  color: #7dd3fc;
+  font-size: 12px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.yinzi-link:hover { color: #bae6fd; }
+.icon-action { flex: 0 0 auto; }
+.config-status-button {
+  --el-button-bg-color: rgba(245, 158, 11, 0.08);
+  --el-button-border-color: rgba(245, 158, 11, 0.34);
+  --el-button-text-color: #fbbf24;
+  --el-button-hover-bg-color: rgba(245, 158, 11, 0.15);
+  --el-button-hover-border-color: rgba(245, 158, 11, 0.5);
+  --el-button-hover-text-color: #fde68a;
+}
+.config-status-button.ready {
+  --el-button-bg-color: rgba(16, 185, 129, 0.08);
+  --el-button-border-color: rgba(16, 185, 129, 0.34);
+  --el-button-text-color: #6ee7b7;
+  --el-button-hover-bg-color: rgba(16, 185, 129, 0.15);
+  --el-button-hover-border-color: rgba(16, 185, 129, 0.5);
+  --el-button-hover-text-color: #a7f3d0;
+}
+.main {
+  max-width: 1480px;
+  padding: 26px 22px 38px;
+}
+.start-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 1.55fr) minmax(330px, 0.75fr);
+  gap: 32px;
+  padding: 24px 0 28px;
+  border-bottom: 1px solid #27312d;
+}
+.start-copy { min-width: 0; }
+.section-kicker {
+  margin: 0 0 7px;
+  color: #5eead4;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+.start-copy h1,
+.section-toolbar h2 {
+  margin: 0;
+  color: #f4f7f5;
+  letter-spacing: 0;
+}
+.start-copy h1 { font-size: 28px; }
+.start-description {
+  max-width: 780px;
+  margin: 10px 0 20px;
+  color: #a7b2ad;
+  font-size: 14px;
+  line-height: 1.75;
+}
+.primary-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.primary-actions :deep(.el-button) { margin-left: 0; }
+.mode-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-top: 20px;
+  border-top: 1px solid #2b3732;
+  border-bottom: 1px solid #2b3732;
+}
+.mode-summary article {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+  padding: 11px 14px;
+  border-right: 1px solid #2b3732;
+}
+.mode-summary article:first-child { padding-left: 0; }
+.mode-summary article:last-child { border-right: 0; }
+.mode-summary strong { color: #dce6e2; font-size: 12px; }
+.mode-summary small { color: #84918b; font-size: 10px; line-height: 1.55; }
+.workflow-strip {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(100px, 1fr));
+  gap: 0;
+  margin: 26px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.workflow-strip li {
+  position: relative;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #9ba6a1;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.workflow-strip li:not(:last-child)::after {
+  content: '';
+  height: 1px;
+  flex: 1;
+  margin: 0 8px;
+  background: #39443f;
+}
+.workflow-strip span {
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border: 1px solid #3a4b45;
+  border-radius: 50%;
+  color: #99f6e4;
+  background: #18221f;
+}
+.readiness-panel {
+  align-self: start;
+  padding: 17px;
+  border: 1px solid #2c3833;
+  border-radius: 8px;
+  background: #141b18;
+}
+.readiness-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid #29342f;
+}
+.readiness-heading > div { display: grid; gap: 4px; }
+.readiness-heading span { color: #9da9a4; font-size: 12px; }
+.readiness-heading strong { color: #f4f7f5; font-size: 21px; }
+.readiness-list { min-height: 174px; padding: 9px 0 2px; }
+.readiness-item {
+  width: 100%;
+  min-height: 42px;
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) 18px;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 4px;
+  border: 0;
+  color: #fbbf24;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+.readiness-item:hover { background: #1b2421; }
+.readiness-item.ready { color: #34d399; }
+.readiness-item > span { min-width: 0; display: grid; gap: 2px; }
+.readiness-item strong { color: #dce3df; font-size: 13px; font-weight: 600; }
+.readiness-item small { color: #7f8c86; font-size: 11px; }
+.readiness-arrow { color: #64706b; }
+.readiness-note {
+  margin: 9px 0 12px;
+  color: #7f8c86;
+  font-size: 11px;
+  line-height: 1.55;
+}
+.readiness-actions { display: flex; flex-wrap: wrap; gap: 4px; }
+.readiness-actions :deep(.el-button) { margin-left: 0; }
+.config-load-error,
+.list-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: #fca5a5;
+  font-size: 12px;
+}
+.config-load-error { min-height: 174px; padding: 16px 4px; }
+.projects-section { padding: 30px 0 10px; scroll-margin-top: 80px; }
+.section-toolbar {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 16px;
+}
+.section-toolbar h2 { font-size: 20px; }
+.project-filters {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.project-search { width: 260px; }
+.list-error {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid rgba(239, 68, 68, 0.28);
+  border-radius: 6px;
+  background: rgba(127, 29, 29, 0.12);
+}
+.projects-wrap { min-height: 260px; }
+.project-grid {
+  grid-template-columns: repeat(auto-fill, minmax(min(300px, 100%), 1fr));
+  gap: 14px;
+}
+.project-card {
+  padding: 0;
+  border: 1px solid #2b3531;
+  border-radius: 8px;
+  background: #141918;
+  box-shadow: none;
+  backdrop-filter: none;
+  transition: border-color .18s, background .18s, transform .18s;
+}
+.project-card::before { display: none; }
+.project-card:hover {
+  border-color: #447269;
+  background: #171e1b;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.2);
+  transform: translateY(-2px);
+}
+.project-card-menu {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 5;
+}
+.project-card-menu :deep(.el-button) {
+  --el-button-bg-color: rgba(12, 16, 15, 0.78);
+  --el-button-border-color: rgba(255, 255, 255, 0.14);
+  --el-button-text-color: #e7ece9;
+}
+.project-progress-cover {
+  aspect-ratio: 16 / 9;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 8px;
+  color: #7dd3fc;
+  background: #101817;
+  border-bottom: 1px solid #27312d;
+}
+.project-progress-cover .el-icon { font-size: 31px; }
+.project-progress-cover span { color: #8e9b95; font-size: 12px; }
+.project-card.has-final .project-card-body,
+.project-card-body {
+  padding: 15px 16px 14px;
+  padding-right: 16px;
+}
+.project-title { margin-bottom: 6px; color: #f0f4f2; font-size: 15px; }
+.project-desc { min-height: 38px; margin-bottom: 11px; color: #94a099; font-size: 12px; line-height: 1.55; }
+.project-badges { margin-bottom: 12px; }
+.badge { border-radius: 5px; }
+.badge-archived {
+  gap: 4px;
+  color: #c4b5fd;
+  background: rgba(139, 92, 246, 0.1);
+  border: 1px solid rgba(139, 92, 246, 0.26);
+}
+.project-card-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-top: 10px;
+  border-top: 1px solid #27312d;
+  color: #74817b;
+  font-size: 11px;
+}
+.project-card-footer :deep(.el-button) { margin-left: auto; }
+.project-empty {
+  min-height: 300px;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 8px;
+  padding: 32px;
+  border: 1px dashed #34413c;
+  border-radius: 8px;
+  color: #7d8a84;
+  text-align: center;
+}
+.project-empty > .el-icon { color: #5eead4; font-size: 38px; }
+.project-empty h3 { margin: 4px 0 0; color: #dce3df; font-size: 16px; }
+.project-empty p { margin: 0 0 8px; font-size: 12px; }
+.project-pagination {
+  min-height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+  color: #7d8a84;
+  font-size: 12px;
+}
+.home-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  margin-top: 28px;
+  padding: 20px 0 4px;
+  border-top: 1px solid #27312d;
+  color: #78857f;
+  font-size: 11px;
+}
+.home-footer > div { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.home-footer strong { color: #cbd5d0; }
+.home-footer a,
+.home-footer button {
+  padding: 0;
+  border: 0;
+  color: #7dd3fc;
+  background: transparent;
+  font: inherit;
+  text-decoration: none;
+  cursor: pointer;
+}
+.config-guide-intro { margin: 0 0 14px; color: #66736d; font-size: 13px; line-height: 1.65; }
+.config-guide-list { display: grid; gap: 6px; }
+.config-guide-item {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px;
+  border: 1px solid #f1d6a3;
+  border-radius: 6px;
+  color: #d97706;
+  background: #fffbeb;
+}
+.config-guide-item.ready { border-color: #bbdfd0; color: #059669; background: #f0fdf8; }
+.config-guide-item span { min-width: 0; display: grid; gap: 2px; }
+.config-guide-item strong { color: #2e3934; font-size: 13px; }
+.config-guide-item small { color: #77827d; font-size: 11px; line-height: 1.5; }
+.config-guide-error { display: flex; gap: 8px; color: #b91c1c; }
+
+html.light .film-list {
+  color: #24302b;
+  background: #f4f7f5;
+  background-image: none;
+}
+html.light .header {
+  background: rgba(255, 255, 255, 0.96);
+  border-bottom-color: #d9e1dd;
+  box-shadow: 0 2px 12px rgba(20, 40, 32, 0.06);
+}
+html.light .brand-copy strong,
+html.light .start-copy h1,
+html.light .section-toolbar h2,
+html.light .project-title { color: #1d2924; }
+html.light .brand-copy small { color: #7c8882; }
+html.light .nav-link { color: #59665f; }
+html.light .nav-link:hover,
+html.light .nav-link.is-active { color: #115e59; background: #edf5f1; }
+html.light .start-panel,
+html.light .projects-section,
+html.light .home-footer { border-color: #d9e1dd; }
+html.light .start-description { color: #5d6a64; }
+html.light .mode-summary,
+html.light .mode-summary article { border-color: #d9e1dd; }
+html.light .mode-summary strong { color: #2b3832; }
+html.light .mode-summary small { color: #6d7a74; }
+html.light .workflow-strip li { color: #64716b; }
+html.light .workflow-strip li:not(:last-child)::after { background: #cfd9d4; }
+html.light .workflow-strip span { color: #0f766e; border-color: #b6d5c9; background: #effaf6; }
+html.light .readiness-panel { border-color: #d5dfda; background: #ffffff; }
+html.light .readiness-heading { border-color: #e1e7e4; }
+html.light .readiness-heading span,
+html.light .readiness-note { color: #6f7c76; }
+html.light .readiness-heading strong,
+html.light .readiness-item strong { color: #26322d; }
+html.light .readiness-item:hover { background: #f1f6f3; }
+html.light .readiness-item small { color: #76837d; }
+html.light .project-card {
+  border-color: #d6dfdb;
+  background: #ffffff;
+  box-shadow: 0 2px 10px rgba(20, 40, 32, 0.04);
+}
+html.light .project-card:hover { border-color: #7cb5a6; background: #ffffff; box-shadow: 0 10px 28px rgba(20, 40, 32, 0.09); }
+html.light .project-progress-cover { color: #0369a1; background: #eff6f5; border-color: #dbe5e0; }
+html.light .project-progress-cover span,
+html.light .project-desc { color: #65726c; }
+html.light .project-card-footer { border-color: #e1e7e4; color: #78847e; }
+html.light .project-empty { border-color: #cbd7d1; color: #6d7973; background: #fafcfb; }
+html.light .project-empty h3 { color: #26322d; }
+html.light .home-footer { color: #6f7b75; }
+html.light .home-footer strong { color: #34413b; }
+
+@media (max-width: 1180px) {
+  .header-inner { grid-template-columns: auto 1fr; }
+  .primary-nav { order: 3; grid-column: 1 / -1; }
+  .start-panel { grid-template-columns: minmax(0, 1fr) 340px; gap: 22px; }
+}
+
+@media (max-width: 820px) {
+  .header { padding: 9px 12px; }
+  .header-inner { display: flex; flex-wrap: wrap; gap: 9px; }
+  .brand { flex: 1 1 240px; }
+  .header-actions { flex: 1 1 100%; order: 3; justify-content: flex-start; overflow-x: auto; padding-bottom: 2px; }
+  .primary-nav { order: 2; width: 100%; overflow-x: auto; }
+  .main { padding: 16px 12px 32px; }
+  .start-panel { grid-template-columns: minmax(0, 1fr); gap: 20px; padding-top: 14px; }
+  .workflow-strip { overflow-x: auto; grid-template-columns: repeat(5, minmax(130px, 1fr)); padding-bottom: 4px; }
+  .section-toolbar { align-items: stretch; flex-direction: column; }
+  .project-filters { flex-wrap: wrap; }
+  .project-search { min-width: 0; flex: 1 1 230px; }
+  .project-pagination { align-items: flex-start; flex-direction: column; overflow-x: auto; }
+  .home-footer { align-items: flex-start; flex-direction: column; }
+}
+
+@media (max-width: 480px) {
+  .brand-copy strong { white-space: normal; }
+  .yinzi-link { display: none; }
+  .primary-nav {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 4px;
+    overflow: visible;
+  }
+  .primary-nav :deep(.el-dropdown) { min-width: 0; }
+  .primary-nav .nav-link {
+    width: 100%;
+    justify-content: center;
+    padding: 0 4px;
+    font-size: 12px;
+  }
+  .config-status-button { flex: 1 1 auto; }
+  .start-copy h1 { font-size: 24px; }
+  .primary-actions { display: grid; grid-template-columns: 1fr; }
+  .primary-actions :deep(.el-button) { width: 100%; }
+  .mode-summary { grid-template-columns: 1fr; }
+  .mode-summary article,
+  .mode-summary article:first-child { padding: 9px 0; border-right: 0; border-bottom: 1px solid #2b3732; }
+  .mode-summary article:last-child { border-bottom: 0; }
+  html.light .mode-summary article { border-bottom-color: #d9e1dd; }
+  .workflow-strip { grid-template-columns: repeat(5, minmax(0, 1fr)); overflow: visible; }
+  .workflow-strip li { display: grid; justify-items: center; gap: 5px; font-size: 10px; line-height: 1.25; text-align: center; white-space: normal; }
+  .workflow-strip li:not(:last-child)::after { position: absolute; top: 12px; left: calc(50% + 17px); width: calc(100% - 34px); margin: 0; }
+  .readiness-panel { padding: 14px; }
+  .project-filters :deep(.el-radio-group) { width: 100%; display: grid; grid-template-columns: 1fr 1fr; }
+  .project-filters :deep(.el-radio-button__inner) { width: 100%; }
+  .project-search { flex-basis: calc(100% - 44px); }
+  .project-grid { grid-template-columns: 1fr; }
+  .project-card-footer { align-items: flex-start; flex-direction: column; }
 }
 </style>

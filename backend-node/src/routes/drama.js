@@ -35,6 +35,7 @@ function listDramas(db, log) {
     const status = req.query.status || '';
     const genre = req.query.genre || '';
     const keyword = req.query.keyword || '';
+    const archive_state = req.query.archive_state || 'active';
     try {
       const { dramas, total, page: p, pageSize: ps } = dramaService.listDramas(db, {
         page,
@@ -42,6 +43,7 @@ function listDramas(db, log) {
         status,
         genre,
         keyword,
+        archive_state,
       });
       response.successWithPagination(res, dramas, total, p, ps);
     } catch (err) {

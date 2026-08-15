@@ -1,7 +1,7 @@
 'use strict';
 
 const querystring = require('querystring');
-const { Signer } = require('@volcengine/openapi');
+const { signRequest } = require('./volcRequestSigner');
 
 const ALLOWED_ACTIONS = new Set([
   'CreateAssetGroup',
@@ -124,6 +124,7 @@ async function fetchSignedOpenApi({
   signRegion,
   signService,
   projectName,
+  now,
 }) {
   const ver = (apiVersion || '2024-01-01').toString().trim() || '2024-01-01';
   const { protocol, host, pathname } = parseSignedOpenApiUrl(base);
@@ -144,12 +145,11 @@ async function fetchSignedOpenApi({
     body: bodyStr,
   };
 
-  const signer = new Signer(request, (signService || 'ark').toString().trim() || 'ark');
-  signer.addAuthorization({
+  signRequest(request, (signService || 'ark').toString().trim() || 'ark', {
     accessKeyId: accessKeyId.trim(),
     secretKey: secretKey.trim(),
     sessionToken: (sessionToken || '').trim(),
-  });
+  }, now || new Date());
 
   const qs = querystring.stringify(request.params);
   const url = `${protocol}//${host}${pathname}?${qs}`;
@@ -266,4 +266,5 @@ async function callModelArkAsset(opts, log) {
 module.exports = {
   callModelArkAsset,
   ALLOWED_ACTIONS,
+  fetchSignedOpenApi,
 };

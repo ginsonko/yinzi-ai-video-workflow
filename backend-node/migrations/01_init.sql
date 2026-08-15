@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS dramas (
   metadata TEXT,
   created_at TEXT,
   updated_at TEXT,
+  archived_at TEXT,
   deleted_at TEXT
 );
 

@@ -38,10 +38,9 @@ function create(db, log, cfg) {
       return response.badRequest(res, '缺少必填字段: api_key');
     }
     try {
-      const config = aiConfigService.createConfig(db, log, {
-        ...body,
-        model: body.model ?? [],
-      });
+      const config = require('../services/configMutationService').withAutomaticSnapshot(db, `新增 AI 配置 ${body.name}`, () => (
+        aiConfigService.createConfig(db, log, { ...body, model: body.model ?? [] })
+      )).result;
       response.created(res, aiConfigService.toPublicConfig(config));
     } catch (err) {
       log.errorw('Create AI config failed', { error: err.message });
@@ -65,7 +64,9 @@ function update(db, log, cfg) {
       body = allowed;
     }
 
-    const config = aiConfigService.updateConfig(db, log, id, body);
+    const config = require('../services/configMutationService').withAutomaticSnapshot(db, `修改 AI 配置 #${id}`, () => (
+      aiConfigService.updateConfig(db, log, id, body)
+    )).result;
     if (!config) return response.notFound(res, '配置不存在');
     response.success(res, aiConfigService.toPublicConfig(config));
   };
@@ -78,7 +79,9 @@ function remove(db, log, cfg) {
     }
     const id = parseInt(req.params.id, 10);
     if (isNaN(id)) return response.badRequest(res, '无效的配置ID');
-    const ok = aiConfigService.deleteConfig(db, log, id);
+    const ok = require('../services/configMutationService').withAutomaticSnapshot(db, `删除 AI 配置 #${id}`, () => (
+      aiConfigService.deleteConfig(db, log, id)
+    )).result;
     if (!ok) return response.notFound(res, '配置不存在');
     response.success(res, { message: '删除成功' });
   };
@@ -94,7 +97,9 @@ function bulkUpdateKey(db, log, cfg) {
       return response.badRequest(res, '请提供新的 API Key');
     }
     try {
-      const count = aiConfigService.bulkUpdateApiKey(db, log, api_key.trim());
+      const count = require('../services/configMutationService').withAutomaticSnapshot(db, '批量更新 AI 配置凭据', () => (
+        aiConfigService.bulkUpdateApiKey(db, log, api_key.trim())
+      )).result;
       response.success(res, { updated: count, message: `已更新 ${count} 条配置的 API Key` });
     } catch (err) {
       log.error('Bulk update api_key failed', { error: err.message });
@@ -103,27 +108,31 @@ function bulkUpdateKey(db, log, cfg) {
   };
 }
 
-function testConnection(log) {
+function testConnection(db, log) {
   return async (req, res) => {
     const body = req.body || {};
-    if (!body.base_url || !body.api_key) {
-      return response.badRequest(res, '缺少 base_url 或 api_key');
-    }
+    let resolved;
     try {
-      await aiConfigService.testConnection({
-        base_url: body.base_url,
-        api_key: body.api_key,
-        model: body.model,
-        provider: body.provider,
-        api_protocol: body.api_protocol,
-        endpoint: body.endpoint,
-        service_type: body.service_type,
-        settings: body.settings,
+      resolved = aiConfigService.resolveConnectionTestConfig(db, body);
+      const result = await aiConfigService.testConnection(resolved.config);
+      response.success(res, {
+        message: result.authenticated ? '连接与凭据验证成功' : '服务地址已连通',
+        config_id: resolved.config_id,
+        credential_source: resolved.credential_source,
+        service_type: resolved.config.service_type || '',
+        model: resolved.config.model || '',
+        probe: result.probe,
+        authenticated: !!result.authenticated,
+        reachable_only: !!result.reachable_only,
+        generated_media: false,
       });
-      response.success(res, { message: '连接测试成功' });
     } catch (err) {
-      log.error('AI config test connection failed', { error: err.message });
-      response.badRequest(res, '连接测试失败: ' + (err.message || '未知错误'));
+      const safeMessage = aiConfigService.redactConnectionTestError(err, [resolved?.config?.api_key]);
+      log.error('AI config test connection failed', {
+        config_id: resolved?.config_id ?? body.config_id ?? null,
+        error: safeMessage,
+      });
+      response.badRequest(res, '连接测试失败: ' + safeMessage);
     }
   };
 }
@@ -147,7 +156,10 @@ function setupYinzi(db, log, cfg) {
     }
     try {
       const { upsertYinziConfigs } = require('../services/yinziService');
-      response.success(res, upsertYinziConfigs(db, log, req.body || {}));
+      const result = require('../services/configMutationService').withAutomaticSnapshot(db, '一键配置 YinziAPI', () => (
+        upsertYinziConfigs(db, log, req.body || {})
+      )).result;
+      response.success(res, result);
     } catch (err) {
       log.error('Setup Yinzi configs failed', { error: err.message });
       response.badRequest(res, err.message || 'YinziAPI 配置失败');
@@ -218,7 +230,7 @@ module.exports = function aiConfigRoutes(db, log, cfg) {
     create: create(db, log, cfg),
     update: update(db, log, cfg),
     delete: remove(db, log, cfg),
-    testConnection: testConnection(log),
+    testConnection: testConnection(db, log),
     yinziCatalog: yinziCatalog(log),
     setupYinzi: setupYinzi(db, log, cfg),
     listJimeng2MaterialAssets: listJimeng2MaterialAssets(log),

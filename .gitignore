@@ -25,3 +25,9 @@ frontweb-edu
 .superpowers
 build_edu
 node_modules
+
+# Local engineering evidence and release artifacts are not source inputs.
+/AI_VIDEO_*.md
+/docs/ux-audit/
+/backend-node/tools/ffmpeg/*.previous-*
+/backend-node/full-test-*.log

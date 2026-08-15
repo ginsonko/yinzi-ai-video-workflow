@@ -7,8 +7,47 @@ const { loadConfig } = require('./config/index.js');
 const logger = require('./logger.js');
 const { setupRouter } = require('./routes/index.js');
 
-function createApp() {
-  const config = loadConfig();
+function applyLocalRuntimeOrigin(config, value) {
+  if (!value) return config;
+  try {
+    const origin = new URL(String(value).trim());
+    const host = origin.hostname.toLowerCase();
+    if (origin.protocol !== 'http:' || !['127.0.0.1', 'localhost', '::1'].includes(host)) return config;
+    if (origin.username || origin.password || (origin.pathname && origin.pathname !== '/') || origin.search || origin.hash) return config;
+    config.storage = { ...(config.storage || {}), base_url: `${origin.origin}/static` };
+    config.files = { ...(config.files || {}), base_url: `${origin.origin}/static` };
+  } catch (_) {}
+  return config;
+}
+
+function isSpaNavigationRequest(req) {
+  if (!['GET', 'HEAD'].includes(req.method)) return false;
+  if (req.path.startsWith('/api')) return false;
+  if (path.posix.extname(req.path)) return false;
+  const accept = String(req.get('accept') || '');
+  return !accept || accept.includes('text/html') || accept.includes('*/*');
+}
+
+function mountWebDist(app, webDist) {
+  if (!fs.existsSync(webDist)) return false;
+  app.use('/assets', express.static(path.join(webDist, 'assets')));
+  app.use(express.static(webDist, { index: false }));
+  app.get('/favicon.ico', (req, res) => {
+    const fav = path.join(webDist, 'favicon.ico');
+    if (fs.existsSync(fav)) res.sendFile(fav);
+    else res.status(404).end();
+  });
+  app.get('*', (req, res, next) => {
+    if (!isSpaNavigationRequest(req)) return next();
+    const indexHtml = path.join(webDist, 'index.html');
+    if (fs.existsSync(indexHtml)) return res.sendFile(indexHtml);
+    return next();
+  });
+  return true;
+}
+
+function createApp(options = {}) {
+  const config = applyLocalRuntimeOrigin(loadConfig(), options.localOrigin || process.env.LOCAL_APP_ORIGIN);
   const db = getDb(config.database);
   const { runMigrationsAndEnsure } = require('./db/migrate.js');
   runMigrationsAndEnsure(db);
@@ -67,26 +106,11 @@ function createApp() {
   // 前端静态资源（sxy：web/dist）；Electron 打包时可设 WEB_DIST_PATH
   const webDist = process.env.WEB_DIST_PATH || path.join(process.cwd(), '..', 'frontweb', 'dist');
   console.log('webDist', webDist);
-  if (fs.existsSync(webDist)) {
-    app.use('/assets', express.static(path.join(webDist, 'assets')));
-    // 服务 dist 根目录的静态文件（如 wx.jpg、favicon.ico 等）
-    app.use(express.static(webDist, { index: false }));
-    app.get('/favicon.ico', (req, res) => {
-      const fav = path.join(webDist, 'favicon.ico');
-      if (fs.existsSync(fav)) res.sendFile(fav);
-      else res.status(404).end();
-    });
-    app.get('*', (req, res, next) => {
-      if (req.path.startsWith('/api')) return next();
-      const indexHtml = path.join(webDist, 'index.html');
-      if (fs.existsSync(indexHtml)) res.sendFile(indexHtml);
-      else next();
-    });
-  } else {
+  if (!mountWebDist(app, webDist)) {
     app.get('/', (req, res) => {
       res.send(
-        '<!DOCTYPE html><html><head><meta charset="utf-8"><title>LocalMiniDrama</title></head><body>' +
-          '<h1>LocalMiniDrama API</h1><p>后端已启动。请先构建前端：</p>' +
+        '<!DOCTYPE html><html><head><meta charset="utf-8"><title>银子AI视频工作流</title></head><body>' +
+          '<h1>银子AI视频工作流 API</h1><p>后端已启动。请先构建前端：</p>' +
           '<pre>cd web &amp;&amp; pnpm install &amp;&amp; pnpm build</pre>' +
           '<p>然后将 <code>web/dist</code> 放到与 backend-node 同级的 <code>web/dist</code>，或访问 <a href="/health">/health</a> 检查接口。</p></body></html>'
       );
@@ -97,7 +121,7 @@ function createApp() {
     if (req.path.startsWith('/api')) {
       return res.status(404).json({ error: 'API endpoint not found' });
     }
-    res.status(404).send('Not Found');
+    res.status(404).type('text/plain').send('Not Found');
   });
 
   app.use((err, req, res, next) => {
@@ -110,7 +134,17 @@ function createApp() {
     }
   });
 
-  return { app, config, db };
+  let productionAutonomyRunner = null;
+  const autonomyDisabled = options.startProductionAutonomy === false
+    || process.env.PRODUCTION_AUTONOMY_DISABLED === '1';
+  if (!autonomyDisabled) {
+    const { createProductionAutonomyRunner } = require('./services/productionAutonomyRunner');
+    productionAutonomyRunner = createProductionAutonomyRunner(db, config, log, options.productionAutonomy || {});
+    productionAutonomyRunner.start();
+  }
+  app.locals.productionAutonomyRunner = productionAutonomyRunner;
+
+  return { app, config, db, productionAutonomyRunner };
 }
 
-module.exports = { createApp };
+module.exports = { applyLocalRuntimeOrigin, createApp, isSpaNavigationRequest, mountWebDist };

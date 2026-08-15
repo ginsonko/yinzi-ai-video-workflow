@@ -164,9 +164,17 @@ function getDrama(db, dramaId, baseUrl) {
   return drama;
 }
 
-function listDramas(db, query) {
+function listDramas(db, query = {}) {
   let sql = 'FROM dramas WHERE deleted_at IS NULL';
   const params = [];
+  const archiveState = ['active', 'archived', 'all'].includes(query.archive_state)
+    ? query.archive_state
+    : 'active';
+  if (archiveState === 'active') {
+    sql += ' AND archived_at IS NULL';
+  } else if (archiveState === 'archived') {
+    sql += ' AND archived_at IS NOT NULL';
+  }
   if (query.status) {
     sql += ' AND status = ?';
     params.push(query.status);
@@ -244,6 +252,13 @@ function updateDrama(db, log, dramaId, req) {
     updates.push('status = ?');
     params.push(req.status);
   }
+  if (typeof req.archived === 'boolean') {
+    const isArchived = Boolean(drama.archived_at);
+    if (req.archived !== isArchived) {
+      updates.push('archived_at = ?');
+      params.push(req.archived ? new Date().toISOString() : null);
+    }
+  }
   if (updates.length === 0) return drama;
   params.push(new Date().toISOString(), dramaId);
   db.prepare(
@@ -314,6 +329,7 @@ function rowToDrama(r) {
     metadata: metadata || {},
     created_at: r.created_at,
     updated_at: r.updated_at,
+    archived_at: r.archived_at || null,
   };
 }
 

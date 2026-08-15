@@ -10,7 +10,14 @@
       </div>
       <div class="director-header-actions">
         <span class="save-state">{{ saveState }}</span>
-        <el-button :icon="DocumentChecked" circle title="保存到本机" @click="saveLocal" />
+        <el-button :icon="QuestionFilled" circle title="打开 3D 导演台教程" aria-label="打开 3D 导演台教程" @click="tutorialVisible = true" />
+        <el-button
+          :icon="DocumentChecked"
+          :circle="!workflowRunId"
+          :loading="workflowSaving"
+          :title="workflowRunId ? '保存并确认到制作流程' : '保存到本机'"
+          @click="saveLocal"
+        >{{ workflowRunId ? '保存并确认' : '' }}</el-button>
         <el-button :icon="FolderOpened" circle title="导入场景 JSON" @click="fileInputRef?.click()" />
         <el-button :icon="Download" circle title="导出场景 JSON" @click="exportJson" />
         <input ref="fileInputRef" type="file" accept="application/json,.json" hidden @change="importJson" />
@@ -18,10 +25,11 @@
     </header>
 
     <div class="director-toolbar">
+      <el-button type="primary" :icon="Grid" @click="assetPaletteVisible = true">素材库</el-button>
       <el-dropdown trigger="click" @command="addStageObject">
-        <el-button type="primary">
+        <el-button>
           <el-icon><Plus /></el-icon>
-          添加
+          基础对象
           <el-icon class="el-icon--right"><ArrowDown /></el-icon>
         </el-button>
         <template #dropdown>
@@ -74,7 +82,7 @@
           <span class="record-dot" />
           {{ activeCameraName }}
         </div>
-        <div v-if="!webglReady" class="webgl-fallback">正在初始化 3D 场景…</div>
+        <div v-if="!webglReady" class="webgl-fallback">{{ initError || '正在初始化 3D 场景…' }}</div>
       </section>
 
       <aside class="director-inspector">
@@ -105,28 +113,112 @@
 
           <label class="field-label">位置</label>
           <div class="vector-row">
-            <el-input-number v-model="selectedForm.px" :step="0.1" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
-            <el-input-number v-model="selectedForm.py" :step="0.1" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
-            <el-input-number v-model="selectedForm.pz" :step="0.1" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
+            <el-input-number v-model="selectedForm.px" :step="0.1" :disabled="Boolean(selectedForm.attachTo)" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
+            <el-input-number v-model="selectedForm.py" :step="0.1" :disabled="Boolean(selectedForm.attachTo)" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
+            <el-input-number v-model="selectedForm.pz" :step="0.1" :disabled="Boolean(selectedForm.attachTo)" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
           </div>
           <label class="field-label">旋转</label>
           <div class="vector-row">
-            <el-input-number v-model="selectedForm.rx" :step="1" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
-            <el-input-number v-model="selectedForm.ry" :step="1" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
-            <el-input-number v-model="selectedForm.rz" :step="1" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
+            <el-input-number v-model="selectedForm.rx" :step="1" :disabled="Boolean(selectedForm.attachTo)" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
+            <el-input-number v-model="selectedForm.ry" :step="1" :disabled="Boolean(selectedForm.attachTo)" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
+            <el-input-number v-model="selectedForm.rz" :step="1" :disabled="Boolean(selectedForm.attachTo)" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
           </div>
           <label class="field-label">缩放</label>
           <div class="vector-row">
-            <el-input-number v-model="selectedForm.sx" :step="0.1" :min="0.01" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
-            <el-input-number v-model="selectedForm.sy" :step="0.1" :min="0.01" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
-            <el-input-number v-model="selectedForm.sz" :step="0.1" :min="0.01" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
+            <el-input-number v-model="selectedForm.sx" :step="0.1" :min="0.01" :disabled="Boolean(selectedForm.attachTo)" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
+            <el-input-number v-model="selectedForm.sy" :step="0.1" :min="0.01" :disabled="Boolean(selectedForm.attachTo)" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
+            <el-input-number v-model="selectedForm.sz" :step="0.1" :min="0.01" :disabled="Boolean(selectedForm.attachTo)" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
           </div>
+
+          <section class="keyframe-editor" aria-label="物体随时间移动">
+            <div class="keyframe-editor-heading">
+              <span><strong>随时间移动</strong><small>{{ selectedKeyframes.length }} 个姿态</small></span>
+              <el-switch v-model="autoRecordKeyframes" size="small" inline-prompt active-text="自动" inactive-text="手动" />
+            </div>
+            <template v-if="!selectedForm.attachTo">
+              <div class="keyframe-steps" aria-label="关键帧操作顺序">
+                <span>1 起点</span><span>2 移动时间</span><span>3 调整终点</span><span>4 播放</span>
+              </div>
+              <div class="keyframe-actions">
+                <el-button size="small" :icon="Aim" @click="recordStartKeyframe">记录起点</el-button>
+                <el-button size="small" :icon="Timer" @click="addKeyframe">记录 {{ currentTime.toFixed(2) }}s</el-button>
+                <el-button size="small" :icon="VideoPlay" :disabled="selectedKeyframes.length < 2" @click="previewSelectedMotion">播放检查</el-button>
+              </div>
+              <div v-if="selectedKeyframes.length" class="keyframe-list">
+                <div v-for="frame in selectedKeyframes" :key="`${selectedId}-${frame.time}`" class="keyframe-row">
+                  <button type="button" :title="`跳到 ${Number(frame.time).toFixed(2)} 秒`" @click="jumpToKeyframe(frame)">
+                    <strong>{{ Number(frame.time).toFixed(2) }}s</strong>
+                    <small>{{ keyframePositionText(frame) }}</small>
+                  </button>
+                  <el-button :icon="Delete" link type="danger" :title="`删除 ${Number(frame.time).toFixed(2)} 秒姿态`" @click="deleteSelectedKeyframe(frame)" />
+                </div>
+              </div>
+              <div v-else class="keyframe-empty">先摆好起始姿态并记录起点</div>
+            </template>
+            <div v-else class="keyframe-attached-note">此对象由父对象驱动，请选择「{{ attachmentParentName }}」记录移动。</div>
+          </section>
+
+          <template v-if="!['camera', 'light'].includes(selectedKind)">
+            <label class="field-label">对象挂接</label>
+            <div class="camera-row">
+              <el-select v-model="selectedForm.attachTo" clearable placeholder="不挂接" @change="applyInspector(true)">
+                <el-option v-for="item in attachmentParentOptions" :key="item.id" :label="item.name" :value="item.id" />
+              </el-select>
+              <el-select v-if="selectedForm.attachTo" v-model="selectedForm.attachAnchor" @change="applyInspector(true)">
+                <el-option v-for="anchor in attachmentAnchorOptions" :key="anchor" :label="attachmentAnchorLabel(anchor)" :value="anchor" />
+              </el-select>
+            </div>
+            <div v-if="selectedForm.attachTo" class="attachment-status" role="status">
+              已挂接到「{{ attachmentParentName }}」的{{ attachmentAnchorLabel(selectedForm.attachAnchor) }}；父对象的姿态和关键帧会驱动此对象。
+            </div>
+            <template v-if="selectedForm.attachTo">
+              <label class="field-label">局部偏移</label>
+              <div class="vector-row">
+                <el-input-number v-model="selectedForm.lx" :step="0.05" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
+                <el-input-number v-model="selectedForm.ly" :step="0.05" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
+                <el-input-number v-model="selectedForm.lz" :step="0.05" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
+              </div>
+              <label class="field-label">局部旋转（度）</label>
+              <div class="vector-row">
+                <el-input-number v-model="selectedForm.lrx" :step="1" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
+                <el-input-number v-model="selectedForm.lry" :step="1" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
+                <el-input-number v-model="selectedForm.lrz" :step="1" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
+              </div>
+              <label class="field-label">局部缩放</label>
+              <div class="vector-row">
+                <el-input-number v-model="selectedForm.lsx" :min="0.01" :step="0.1" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
+                <el-input-number v-model="selectedForm.lsy" :min="0.01" :step="0.1" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
+                <el-input-number v-model="selectedForm.lsz" :min="0.01" :step="0.1" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
+              </div>
+            </template>
+          </template>
+
+          <template v-if="selectedKind === 'character'">
+            <label class="field-label">人物模型</label>
+            <el-select v-model="selectedForm.assetId" filterable @change="replaceSelectedCharacter">
+              <el-option v-for="asset in humanAssets" :key="asset.id" :label="asset.label" :value="asset.id" />
+            </el-select>
+            <label class="field-label">姿势与动作</label>
+            <div class="camera-row">
+              <el-select v-model="selectedForm.pose" @change="applyInspector(true)">
+                <el-option v-for="pose in directorPoses" :key="pose.id" :label="pose.label" :value="pose.id" />
+              </el-select>
+              <el-select v-model="selectedForm.motion" @change="applyInspector(true)">
+                <el-option v-for="motion in directorMotions" :key="motion.id" :label="motion.label" :value="motion.id" />
+              </el-select>
+            </div>
+            <label class="field-label">动作速度 / 幅度</label>
+            <div class="camera-row">
+              <el-input-number v-model="selectedForm.motionSpeed" :min="0.1" :max="4" :step="0.1" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
+              <el-input-number v-model="selectedForm.motionIntensity" :min="0" :max="1.5" :step="0.1" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
+            </div>
+          </template>
 
           <template v-if="selectedKind === 'camera'">
             <label class="field-label">镜头</label>
             <div class="camera-row">
               <el-input-number v-model="selectedForm.fov" :min="10" :max="120" :step="1" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
-              <el-select v-model="selectedForm.aspect" @change="applyInspector(true)">
+              <el-select v-model="selectedForm.aspect" :disabled="workflowAspectLocked" @change="applyInspector(true)">
                 <el-option label="16:9" :value="16 / 9" />
                 <el-option label="9:16" :value="9 / 16" />
                 <el-option label="4:3" :value="4 / 3" />
@@ -134,6 +226,30 @@
                 <el-option label="21:9" :value="21 / 9" />
               </el-select>
             </div>
+            <div v-if="workflowAspectLocked" class="aspect-lock-note">项目画幅 {{ projectAspect.label }}，镜头预览与录制保持一致</div>
+            <label class="field-label">构图控制</label>
+            <div class="camera-row">
+              <el-select v-model="selectedForm.aimMode" @change="applyInspector(true)">
+                <el-option label="跟踪主体" value="target" />
+                <el-option label="按旋转角度" value="rotation" />
+              </el-select>
+              <el-select
+                v-if="selectedForm.aimMode === 'target'"
+                v-model="selectedForm.targetId"
+                placeholder="选择主体"
+                @change="applyInspector(true)"
+              >
+                <el-option v-for="item in cameraTargetOptions" :key="item.id" :label="item.name" :value="item.id" />
+              </el-select>
+            </div>
+            <template v-if="selectedForm.aimMode === 'target'">
+              <label class="field-label">焦点偏移</label>
+              <div class="vector-row">
+                <el-input-number v-model="selectedForm.tx" :step="0.1" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
+                <el-input-number v-model="selectedForm.ty" :step="0.1" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
+                <el-input-number v-model="selectedForm.tz" :step="0.1" controls-position="right" @input="applyInspector()" @change="applyInspector(true)" />
+              </div>
+            </template>
             <el-button class="activate-camera" :type="selectedId === activeCameraId ? 'success' : 'primary'" plain @click="activateSelectedCamera">
               {{ selectedId === activeCameraId ? '当前镜头' : '设为当前镜头' }}
             </el-button>
@@ -157,8 +273,52 @@
       </div>
       <span class="timecode">{{ timelineDuration.toFixed(1) }}s</span>
       <el-input-number v-model="timelineDuration" :min="1" :max="60" :step="1" size="small" controls-position="right" @change="changeTimelineDuration" />
-      <el-button :icon="Timer" :disabled="!selectedId" title="在当前时间添加关键帧" @click="addKeyframe">关键帧</el-button>
+      <el-button :icon="Timer" :disabled="!selectedId || Boolean(selectedForm.attachTo)" :title="selectedForm.attachTo ? '挂接对象请给父对象记录姿态' : '在当前播放头记录或覆盖姿态'" @click="addKeyframe">记录当前姿态</el-button>
     </footer>
+
+    <el-drawer v-model="assetPaletteVisible" class="director-asset-drawer" title="导演素材库" size="min(760px, 94vw)" append-to-body>
+      <div class="asset-palette-tools">
+        <el-input v-model="assetSearch" :prefix-icon="Search" clearable placeholder="搜索人物、场景、家具或道具" />
+        <el-segmented v-model="assetCategory" :options="assetCategoryOptions" />
+      </div>
+      <div v-if="filteredDirectorAssets.length" class="asset-palette-grid">
+        <button
+          v-for="asset in filteredDirectorAssets"
+          :key="asset.id"
+          type="button"
+          class="asset-palette-item"
+          @click="addCatalogAsset(asset)"
+        >
+          <img v-if="asset.preview_url" :src="asset.preview_url" :alt="asset.label" />
+          <span v-else class="asset-palette-icon"><el-icon><component :is="assetCategoryIcon(asset.category)" /></el-icon></span>
+          <span class="asset-palette-copy">
+            <strong>{{ asset.label }}</strong>
+            <small>{{ assetSourceLabel(asset) }}</small>
+          </span>
+          <el-icon class="asset-add-icon"><Plus /></el-icon>
+        </button>
+      </div>
+      <el-empty v-else description="没有匹配的素材" />
+    </el-drawer>
+
+    <el-drawer v-model="tutorialVisible" class="director-tutorial-drawer" title="3D 导演台教程" size="min(440px, 94vw)" append-to-body>
+      <div class="tutorial-boundary">
+        <el-icon><CircleCheckFilled /></el-icon>
+        <div><strong>这是可选的构图工具</strong><p>不需要运动参考时可以直接跳过。关闭项目 3D 或把镜头设为“跳过”后，最终参考包不会携带旧预演视频。</p></div>
+      </div>
+      <ol class="tutorial-steps">
+        <li><span>1</span><div><strong>添加角色与场景对象</strong><p>从素材库选择常用人物、场景、家具和道具；缺少模型时也可以先用基础几何体占位。</p><el-button size="small" :icon="Grid" @click="tutorialVisible = false; assetPaletteVisible = true">打开素材库</el-button></div></li>
+        <li><span>2</span><div><strong>摆放对象和摄像机</strong><p>先选对象，再使用移动、旋转、缩放。切换“世界/局部”坐标，避免复杂姿态下移动方向混乱。</p></div></li>
+        <li><span>3</span><div><strong>检查镜头构图</strong><p>添加或选择摄像机，切到“镜头预览”。检查主体是否出框、视线方向、遮挡和背景锚点。</p></div></li>
+        <li><span>4</span><div><strong>让对象随时间移动</strong><p>选中对象并“记录起点”，把时间轴移到目标时刻，再拖动物体到终点；自动记录开启时会保存终点。点击“播放检查”即可预览，重录同一时刻会覆盖旧姿态。</p></div></li>
+        <li><span>5</span><div><strong>录制并返回审批</strong><p>点击摄像机旁的录制按钮生成 WebM。效果不好可以打回并修改 JSON；满意后保存确认，或回到工作流明确跳过。</p></div></li>
+      </ol>
+      <div class="tutorial-when">
+        <div><strong>建议使用</strong><span>多人走位、复杂空间关系、运镜、长镜头、道具交互。</span></div>
+        <div><strong>建议跳过</strong><span>表情特写、静态场景、2–4 秒短镜头、模型不接收参考视频。</span></div>
+      </div>
+      <el-button class="tutorial-guide-link" type="primary" plain @click="router.push('/help#director')">阅读完整 3D 说明</el-button>
+    </el-drawer>
   </div>
 </template>
 
@@ -177,34 +337,62 @@ import {
   Download,
   FolderOpened,
   FullScreen,
+  Grid,
+  House,
+  OfficeBuilding,
   Plus,
+  QuestionFilled,
   Rank,
   RefreshLeft,
   RefreshRight,
+  Search,
   Timer,
+  UserFilled,
   VideoCamera,
   VideoPause,
   VideoPlay,
+  CircleCheckFilled,
 } from '@element-plus/icons-vue'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 import { TransformControls } from 'three/addons/controls/TransformControls.js'
 import { uploadAPI } from '@/api/upload'
 import { storyboardsAPI } from '@/api/storyboards'
+import { productionAPI } from '@/api/production'
 import {
+  cloneDirectorJson,
   createDefaultDirectorDocument,
+  DIRECTOR_ATTACHMENT_ANCHORS,
+  directorKeyframesForObject,
   interpolateObjectKeyframes,
   normalizeDirectorDocument,
+  removeDirectorKeyframe,
+  selectWorkflowDirectorArtifact,
+  upsertDirectorKeyframe,
 } from '@/utils/directorScene'
+import { productionAspectSpec } from '@/utils/aspectRatio'
+import { applyDirectorCameraAim } from '@/utils/directorThree'
+import {
+  createDirectorObject,
+  disposeDirectorObject,
+  applyDirectorAttachments,
+  setDirectorHelperVisibility,
+  updateDirectorObjectAtTime,
+  waitForDirectorObjects,
+} from '@/utils/directorRuntime'
 
 const route = useRoute()
 const router = useRouter()
 const dramaId = computed(() => Number(route.params.id) || null)
 const storyboardId = computed(() => Number(route.query.storyboard) || null)
+const workflowRunId = computed(() => String(route.query.workflow_run || '').trim())
+const workflowShotId = computed(() => String(route.query.shot || '').trim())
 const storyboardRecord = ref(null)
+const workflowArtifact = ref(null)
 const viewportRef = ref(null)
 const fileInputRef = ref(null)
 const webglReady = ref(false)
+const initError = ref('')
 const stageItems = ref([])
 const selectedId = ref(null)
 const selectedKind = ref('')
@@ -215,18 +403,36 @@ const transformSpace = ref('world')
 const saveState = ref('未保存')
 const uploadingFrame = ref(false)
 const recording = ref(false)
+const workflowSaving = ref(false)
 const playing = ref(false)
 const currentTime = ref(0)
 const timelineDuration = ref(5)
 const keyframes = ref([])
 const historyIndex = ref(-1)
 const historyLength = ref(0)
+const directorAssets = ref([])
+const directorPoses = ref([])
+const directorMotions = ref([])
+const assetPaletteVisible = ref(false)
+const assetSearch = ref('')
+const assetCategory = ref('all')
+const tutorialVisible = ref(false)
+const autoRecordKeyframes = ref(true)
+const workflowAspectRatio = ref('16:9')
 
 const selectedForm = reactive({
   name: '', px: 0, py: 0, pz: 0,
   rx: 0, ry: 0, rz: 0,
   sx: 1, sy: 1, sz: 1,
   fov: 42, aspect: 16 / 9,
+  aimMode: 'target', targetId: '',
+  tx: 0, ty: 1.1, tz: 0,
+  assetId: 'human.adult.male', pose: 'neutral', motion: 'idle',
+  motionSpeed: 1, motionIntensity: 1,
+  attachTo: '', attachAnchor: 'root',
+  lx: 0, ly: 0, lz: 0,
+  lrx: 0, lry: 0, lrz: 0,
+  lsx: 1, lsy: 1, lsz: 1,
 })
 
 let renderer
@@ -247,8 +453,13 @@ const history = []
 const raycaster = new THREE.Raycaster()
 const pointer = new THREE.Vector2()
 
-const storageKey = computed(() => `local-mini-drama:director:${dramaId.value || 'standalone'}:${storyboardId.value || 'project'}`)
+const storageKey = computed(() => workflowRunId.value
+  ? `local-mini-drama:director:workflow:${workflowRunId.value}:${workflowShotId.value}`
+  : `local-mini-drama:director:${dramaId.value || 'standalone'}:${storyboardId.value || 'project'}`)
 const storyboardLabel = computed(() => {
+  if (workflowArtifact.value) {
+    return `制作流程 · 镜头 #${workflowArtifact.value.scope_id} · 修订 ${workflowArtifact.value.revision}`
+  }
   if (storyboardRecord.value) {
     return `项目 ${dramaId.value} · 分镜 #${storyboardRecord.value.storyboard_number || storyboardId.value}`
   }
@@ -259,71 +470,79 @@ const visibleKeyframeMarks = computed(() => keyframes.value.map((keyframe, index
   key: `${keyframe.object_id}-${keyframe.time}-${index}`,
   percent: Math.min(100, Math.max(0, (keyframe.time / timelineDuration.value) * 100)),
 })))
+const projectAspect = computed(() => productionAspectSpec(workflowAspectRatio.value))
+const workflowAspectLocked = computed(() => Boolean(workflowRunId.value))
+const selectedKeyframes = computed(() => directorKeyframesForObject(keyframes.value, selectedId.value))
+const cameraTargetOptions = computed(() => stageItems.value.filter((item) => !['camera', 'light'].includes(item.kind)))
+const attachmentParentOptions = computed(() => stageItems.value.filter((item) => (
+  item.id !== selectedId.value
+  && !['camera', 'light'].includes(item.kind)
+  && !wouldCreateAttachmentCycle(item.id, selectedId.value)
+)))
+const attachmentAnchorOptions = computed(() => {
+  const parent = stageItems.value.find((item) => item.id === selectedForm.attachTo)
+  return parent?.kind === 'character' ? DIRECTOR_ATTACHMENT_ANCHORS : ['root']
+})
+const attachmentParentName = computed(() => (
+  stageItems.value.find((item) => item.id === selectedForm.attachTo)?.name || selectedForm.attachTo
+))
+const humanAssets = computed(() => directorAssets.value.filter((asset) => asset.category === 'people'))
+const assetCategoryOptions = computed(() => [
+  { label: '全部', value: 'all' },
+  { label: '人物', value: 'people' },
+  { label: '场景', value: 'environments' },
+  { label: '家具', value: 'furniture' },
+  { label: '道具', value: 'props' },
+])
+const filteredDirectorAssets = computed(() => {
+  const query = assetSearch.value.trim().toLowerCase()
+  return directorAssets.value.filter((asset) => (
+    (assetCategory.value === 'all' || asset.category === assetCategory.value)
+    && (!query || `${asset.label} ${asset.id}`.toLowerCase().includes(query))
+  ))
+})
 
 function uid(kind) {
   return `${kind}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
 }
 
 function kindLabel(kind) {
-  return { character: '角色', box: '方盒', sphere: '球体', plane: '平面', light: '灯光', camera: '镜头' }[kind] || kind
+  return { character: '角色', asset: '素材', procedural: '拼装', box: '方盒', sphere: '球体', plane: '平面', light: '灯光', camera: '镜头' }[kind] || kind
 }
 
-function material(color, options = {}) {
-  return new THREE.MeshStandardMaterial({ color, roughness: 0.72, metalness: 0.06, ...options })
+function attachmentAnchorLabel(anchor) {
+  return {
+    root: '根节点', head: '头部', left_hand: '左手', right_hand: '右手',
+    left_forearm: '左前臂', right_forearm: '右前臂',
+  }[anchor] || anchor
 }
 
-function createCharacter(record) {
-  const group = new THREE.Group()
-  const skin = material('#f3b78f')
-  const shirt = material(record.props.color || '#1fc7a1')
-  const dark = material('#26364a')
-  const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.48, 0.85, 6, 12), shirt)
-  body.position.y = 1.42
-  const head = new THREE.Mesh(new THREE.SphereGeometry(0.38, 24, 16), skin)
-  head.position.y = 2.45
-  const legGeometry = new THREE.CapsuleGeometry(0.14, 0.62, 4, 8)
-  const leftLeg = new THREE.Mesh(legGeometry, dark)
-  const rightLeg = new THREE.Mesh(legGeometry, dark)
-  leftLeg.position.set(-0.22, 0.46, 0)
-  rightLeg.position.set(0.22, 0.46, 0)
-  group.add(body, head, leftLeg, rightLeg)
-  return group
+function wouldCreateAttachmentCycle(parentId, childId) {
+  if (!parentId || !childId) return false
+  const visited = new Set()
+  let cursor = parentId
+  while (cursor && !visited.has(cursor)) {
+    if (cursor === childId) return true
+    visited.add(cursor)
+    cursor = String(objectById.get(cursor)?.userData?.props?.attach_to || '')
+  }
+  return false
+}
+
+function assetCategoryIcon(category) {
+  if (category === 'people') return UserFilled
+  if (category === 'environments') return House
+  if (category === 'furniture') return OfficeBuilding
+  return Grid
+}
+
+function assetSourceLabel(asset) {
+  if (asset.category === 'people') return `${asset.default_props?.age === 'child' ? '儿童' : asset.default_props?.age === 'senior' ? '老年' : '成人'} · ${asset.license}`
+  return '本地程序化素材'
 }
 
 function createStageObject(record) {
-  let object
-  if (record.kind === 'character') {
-    object = createCharacter(record)
-  } else if (record.kind === 'box') {
-    object = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), material(record.props.color || '#e46f51'))
-  } else if (record.kind === 'sphere') {
-    object = new THREE.Mesh(new THREE.SphereGeometry(0.62, 28, 18), material(record.props.color || '#e8b84e'))
-  } else if (record.kind === 'plane') {
-    object = new THREE.Mesh(new THREE.PlaneGeometry(3, 3), material(record.props.color || '#8a93a3', { side: THREE.DoubleSide }))
-    object.rotation.x = -Math.PI / 2
-  } else if (record.kind === 'light') {
-    object = new THREE.Group()
-    const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.18, 16, 10), material('#fff1b3', { emissive: '#ffcf55', emissiveIntensity: 1.4 }))
-    const light = new THREE.SpotLight('#fff0d0', Number(record.props.intensity) || 60, 25, Math.PI / 5, 0.35, 1.5)
-    const target = new THREE.Object3D()
-    target.position.set(0, -3, -2)
-    light.target = target
-    object.add(bulb, light, target)
-    object.userData.light = light
-  } else if (record.kind === 'camera') {
-    object = new THREE.PerspectiveCamera(Number(record.props.fov) || 42, Number(record.props.aspect) || 16 / 9, 0.1, 200)
-  } else {
-    object = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), material('#e46f51'))
-  }
-
-  object.name = record.name
-  object.userData.stageObject = true
-  object.userData.kind = record.kind
-  object.userData.id = record.id
-  object.userData.props = { ...record.props }
-  object.position.fromArray(record.position)
-  object.rotation.fromArray(record.rotation)
-  object.scale.fromArray(record.scale)
+  const object = createDirectorObject(record)
   scene.add(object)
   objectById.set(record.id, object)
 
@@ -335,6 +554,10 @@ function createStageObject(record) {
     scene.add(helper)
     cameraHelpers.set(record.id, helper)
   }
+  object.userData.directorReady.catch((error) => {
+    saveState.value = '素材加载失败'
+    ElMessage.error(error.message || '3D 素材加载失败')
+  })
   return object
 }
 
@@ -343,15 +566,26 @@ function defaultRecord(kind) {
   const record = {
     id: uid(kind), kind, name: `${kindLabel(kind)} ${count}`,
     position: [0, kind === 'box' ? 0.5 : kind === 'sphere' ? 0.65 : kind === 'plane' ? 0.01 : kind === 'light' ? 4 : 0, 0],
-    rotation: [0, 0, 0], scale: [1, 1, 1], props: {},
+    rotation: kind === 'plane' ? [-Math.PI / 2, 0, 0] : [0, 0, 0], scale: [1, 1, 1], props: {},
   }
-  if (kind === 'character') record.position = [0, 0, 0]
+  if (kind === 'character') {
+    const fallbackAsset = humanAssets.value.find((asset) => asset.id === 'human.adult.male')
+    record.position = [0, 0, 0]
+    record.props = fallbackAsset ? cloneDirectorJson(fallbackAsset.default_props) : {
+      asset_id: 'human.procedural', profile_id: 'human.adult.male',
+      focus_height: 1.1, pose: 'neutral', motion: 'idle', motion_speed: 1, motion_intensity: 1,
+    }
+  }
   if (kind === 'camera') {
+    const target = stageItems.value.find((item) => item.kind === 'character')
+      || stageItems.value.find((item) => !['camera', 'light', 'plane'].includes(item.kind))
     record.position = editorCamera ? editorCamera.position.toArray() : [6, 4, 8]
     record.rotation = editorCamera ? editorCamera.rotation.toArray().slice(0, 3) : [-0.3, 0.65, 0]
-    record.props = { fov: 42, aspect: 16 / 9 }
+    record.props = target
+      ? { fov: 42, aspect: projectAspect.value.ratio, aim_mode: 'target', target_id: target.id, target_offset: [0, target.kind === 'character' ? 1.1 : 0, 0] }
+      : { fov: 42, aspect: projectAspect.value.ratio, aim_mode: 'rotation' }
   }
-  if (kind === 'light') record.props = { intensity: 60 }
+  if (kind === 'light') record.props = { intensity: 2 }
   return record
 }
 
@@ -363,17 +597,82 @@ function addStageObject(kind) {
   commitHistory()
 }
 
+function addCatalogAsset(asset) {
+  const count = stageItems.value.filter((item) => item.asset_id === asset.id).length + 1
+  const record = {
+    id: uid(asset.kind),
+    kind: asset.kind,
+    name: count > 1 ? `${asset.label} ${count}` : asset.label,
+    position: [...(asset.default_position || [0, 0, 0])],
+    rotation: [0, 0, 0],
+    scale: [1, 1, 1],
+    props: cloneDirectorJson(asset.default_props),
+  }
+  const object = createStageObject(record)
+  syncStageItems()
+  selectObject(record.id)
+  assetPaletteVisible.value = false
+  commitHistory()
+  object.userData.directorReady.then(() => {
+    updateDirectorObjectAtTime(object, currentTime.value)
+    renderScene()
+  }).catch(() => {})
+}
+
+function replaceSelectedCharacter(assetId) {
+  const current = objectById.get(selectedId.value)
+  const asset = humanAssets.value.find((item) => item.id === assetId)
+  if (!current || !asset || current.userData.kind !== 'character') return
+  const previous = objectRecord(current)
+  const record = {
+    ...previous,
+    kind: 'character',
+    props: {
+      ...cloneDirectorJson(asset.default_props),
+      pose: selectedForm.pose,
+      motion: selectedForm.motion,
+      motion_speed: selectedForm.motionSpeed,
+      motion_intensity: selectedForm.motionIntensity,
+    },
+  }
+  if (transform?.object === current) transform.detach()
+  scene.remove(current)
+  disposeDirectorObject(current)
+  objectById.delete(record.id)
+  const replacement = createStageObject(record)
+  syncStageItems()
+  selectObject(record.id)
+  commitHistory()
+  replacement.userData.directorReady.then(() => {
+    updateDirectorObjectAtTime(replacement, currentTime.value)
+    renderScene()
+  }).catch(() => {})
+}
+
 function disposeObject(object) {
-  object.traverse((child) => {
-    child.geometry?.dispose?.()
-    if (Array.isArray(child.material)) child.material.forEach((entry) => entry.dispose?.())
-    else child.material?.dispose?.()
-  })
+  disposeDirectorObject(object)
 }
 
 function removeStageObject(id) {
   const object = objectById.get(id)
   if (!object) return
+  const dependents = [...objectById.values()].filter((entry) => entry.userData.props?.attach_to === id)
+  for (const dependent of dependents) {
+    const props = { ...(dependent.userData.props || {}) }
+    delete props.attach_to
+    delete props.attach_anchor
+    delete props.local_offset
+    delete props.local_rotation
+    delete props.local_scale
+    dependent.userData.props = props
+    dependent.userData.directorRecordTransform = {
+      position: dependent.position.toArray(),
+      rotation: [dependent.rotation.x, dependent.rotation.y, dependent.rotation.z],
+      scale: dependent.scale.toArray(),
+    }
+    keyframes.value = keyframes.value.filter((frame) => frame.object_id !== dependent.userData.id)
+  }
+  if (dependents.length) ElMessage.warning(`已解除 ${dependents.length} 个下游对象的挂接，避免留下失效锚点`)
   if (transform?.object === object) transform.detach()
   const helper = cameraHelpers.get(id)
   if (helper) {
@@ -409,23 +708,35 @@ function objectRecord(object) {
     props.aspect = object.aspect
   }
   if (object.userData.kind === 'light') props.intensity = object.userData.light?.intensity || 60
+  const attached = Boolean(props.attach_to)
+  if (!attached) {
+    object.userData.directorRecordTransform = {
+      position: object.position.toArray(),
+      rotation: [object.rotation.x, object.rotation.y, object.rotation.z],
+      scale: object.scale.toArray(),
+    }
+  }
+  const stored = object.userData.directorRecordTransform || {
+    position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1],
+  }
   return {
     id: object.userData.id,
     kind: object.userData.kind,
     name: object.name,
-    position: object.position.toArray(),
-    rotation: [object.rotation.x, object.rotation.y, object.rotation.z],
-    scale: object.scale.toArray(),
+    position: attached ? [...stored.position] : object.position.toArray(),
+    rotation: attached ? [...stored.rotation] : [object.rotation.x, object.rotation.y, object.rotation.z],
+    scale: attached ? [...stored.scale] : object.scale.toArray(),
     props,
   }
 }
 
 function serializeDocument() {
   return normalizeDirectorDocument({
+    aspect_ratio: projectAspect.value.value,
     active_camera_id: activeCameraId.value,
     objects: [...objectById.values()].map(objectRecord),
     timeline: { duration: timelineDuration.value, keyframes: keyframes.value },
-  })
+  }, projectAspect.value.value)
 }
 
 function clearStageObjects() {
@@ -434,19 +745,24 @@ function clearStageObjects() {
   cameraHelpers.clear()
 }
 
-function restoreDocument(value, options = {}) {
-  const document = normalizeDirectorDocument(value)
+async function restoreDocument(value, options = {}) {
+  const document = normalizeDirectorDocument(value, projectAspect.value.value)
   isRestoring = true
-  clearStageObjects()
-  for (const record of document.objects) createStageObject(record)
-  activeCameraId.value = document.active_camera_id
-  timelineDuration.value = document.timeline.duration
-  keyframes.value = document.timeline.keyframes
-  currentTime.value = Math.min(currentTime.value, timelineDuration.value)
-  syncStageItems()
-  if (document.objects.length) selectObject(document.objects[0].id)
-  else selectObject(null)
-  isRestoring = false
+  try {
+    clearStageObjects()
+    for (const record of document.objects) createStageObject(record)
+    activeCameraId.value = document.active_camera_id
+    timelineDuration.value = document.timeline.duration
+    keyframes.value = document.timeline.keyframes
+    currentTime.value = Math.min(currentTime.value, timelineDuration.value)
+    syncStageItems()
+    if (document.objects.length) selectObject(document.objects[0].id)
+    else selectObject(null)
+    await waitForDirectorObjects([...objectById.values()])
+    applyTimeline(currentTime.value)
+  } finally {
+    isRestoring = false
+  }
   if (options.commit) commitHistory()
 }
 
@@ -455,6 +771,7 @@ function syncStageItems() {
     id: object.userData.id,
     kind: object.userData.kind,
     name: object.name,
+    asset_id: object.userData.props?.asset_id || null,
   }))
 }
 
@@ -471,9 +788,39 @@ function syncSelectedForm() {
   selectedForm.sx = Number(object.scale.x.toFixed(3))
   selectedForm.sy = Number(object.scale.y.toFixed(3))
   selectedForm.sz = Number(object.scale.z.toFixed(3))
+  const attachmentProps = object.userData.props || {}
+  selectedForm.attachTo = String(attachmentProps.attach_to || '')
+  selectedForm.attachAnchor = String(attachmentProps.attach_anchor || 'root')
+  const localOffset = Array.isArray(attachmentProps.local_offset) ? attachmentProps.local_offset : [0, 0, 0]
+  const localRotation = Array.isArray(attachmentProps.local_rotation) ? attachmentProps.local_rotation : [0, 0, 0]
+  const localScale = Array.isArray(attachmentProps.local_scale) ? attachmentProps.local_scale : [1, 1, 1]
+  selectedForm.lx = Number(Number(localOffset[0] || 0).toFixed(3))
+  selectedForm.ly = Number(Number(localOffset[1] || 0).toFixed(3))
+  selectedForm.lz = Number(Number(localOffset[2] || 0).toFixed(3))
+  selectedForm.lrx = Number(THREE.MathUtils.radToDeg(Number(localRotation[0] || 0)).toFixed(2))
+  selectedForm.lry = Number(THREE.MathUtils.radToDeg(Number(localRotation[1] || 0)).toFixed(2))
+  selectedForm.lrz = Number(THREE.MathUtils.radToDeg(Number(localRotation[2] || 0)).toFixed(2))
+  selectedForm.lsx = Number(Number(localScale[0] || 1).toFixed(3))
+  selectedForm.lsy = Number(Number(localScale[1] || 1).toFixed(3))
+  selectedForm.lsz = Number(Number(localScale[2] || 1).toFixed(3))
+  if (object.userData.kind === 'character') {
+    const props = object.userData.props || {}
+    selectedForm.assetId = String(props.asset_id && props.asset_id !== 'human.procedural' ? props.asset_id : (props.profile_id || 'human.adult.male'))
+    selectedForm.pose = String(props.pose || 'neutral')
+    selectedForm.motion = String(props.motion || 'idle')
+    selectedForm.motionSpeed = Number(Number(props.motion_speed ?? 1).toFixed(2))
+    selectedForm.motionIntensity = Number(Number(props.motion_intensity ?? 1).toFixed(2))
+  }
   if (object.userData.kind === 'camera') {
     selectedForm.fov = object.fov
-    selectedForm.aspect = object.aspect
+    selectedForm.aspect = workflowAspectLocked.value ? projectAspect.value.ratio : object.aspect
+    const props = object.userData.props || {}
+    selectedForm.aimMode = props.aim_mode === 'rotation' ? 'rotation' : 'target'
+    selectedForm.targetId = String(props.target_id || '')
+    const targetOffset = Array.isArray(props.target_offset) ? props.target_offset : [0, 1.1, 0]
+    selectedForm.tx = Number(Number(targetOffset[0] || 0).toFixed(3))
+    selectedForm.ty = Number(Number(targetOffset[1] || 0).toFixed(3))
+    selectedForm.tz = Number(Number(targetOffset[2] || 0).toFixed(3))
   }
 }
 
@@ -481,7 +828,7 @@ function selectObject(id) {
   const object = id ? objectById.get(id) : null
   selectedId.value = object?.userData.id || null
   selectedKind.value = object?.userData.kind || ''
-  if (object && previewMode.value === 'free') transform.attach(object)
+  if (object && previewMode.value === 'free' && !object.userData.props?.attach_to) transform.attach(object)
   else transform?.detach()
   syncSelectedForm()
 }
@@ -490,25 +837,107 @@ function applyInspector(shouldCommit = false) {
   const object = objectById.get(selectedId.value)
   if (!object) return
   object.name = String(selectedForm.name || object.name).slice(0, 80)
-  object.position.set(Number(selectedForm.px) || 0, Number(selectedForm.py) || 0, Number(selectedForm.pz) || 0)
-  object.rotation.set(
-    THREE.MathUtils.degToRad(Number(selectedForm.rx) || 0),
-    THREE.MathUtils.degToRad(Number(selectedForm.ry) || 0),
-    THREE.MathUtils.degToRad(Number(selectedForm.rz) || 0)
-  )
-  object.scale.set(
-    Math.max(0.01, Number(selectedForm.sx) || 1),
-    Math.max(0.01, Number(selectedForm.sy) || 1),
-    Math.max(0.01, Number(selectedForm.sz) || 1)
-  )
+  const nextAttachTo = String(selectedForm.attachTo || '')
+  if (nextAttachTo && wouldCreateAttachmentCycle(nextAttachTo, selectedId.value)) {
+    ElMessage.warning('不能把对象挂接到自己的下游对象')
+    syncSelectedForm()
+    return
+  }
+  const props = { ...(object.userData.props || {}) }
+  if (nextAttachTo) {
+    props.attach_to = nextAttachTo
+    props.attach_anchor = String(selectedForm.attachAnchor || 'root')
+    props.local_offset = [Number(selectedForm.lx) || 0, Number(selectedForm.ly) || 0, Number(selectedForm.lz) || 0]
+    props.local_rotation = [
+      THREE.MathUtils.degToRad(Number(selectedForm.lrx) || 0),
+      THREE.MathUtils.degToRad(Number(selectedForm.lry) || 0),
+      THREE.MathUtils.degToRad(Number(selectedForm.lrz) || 0),
+    ]
+    props.local_scale = [
+      Math.max(0.01, Number(selectedForm.lsx) || 1),
+      Math.max(0.01, Number(selectedForm.lsy) || 1),
+      Math.max(0.01, Number(selectedForm.lsz) || 1),
+    ]
+    object.userData.props = props
+  } else {
+    delete props.attach_to
+    delete props.attach_anchor
+    delete props.local_offset
+    delete props.local_rotation
+    delete props.local_scale
+    object.userData.props = props
+    object.position.set(Number(selectedForm.px) || 0, Number(selectedForm.py) || 0, Number(selectedForm.pz) || 0)
+    object.rotation.set(
+      THREE.MathUtils.degToRad(Number(selectedForm.rx) || 0),
+      THREE.MathUtils.degToRad(Number(selectedForm.ry) || 0),
+      THREE.MathUtils.degToRad(Number(selectedForm.rz) || 0)
+    )
+    object.scale.set(
+      Math.max(0.01, Number(selectedForm.sx) || 1),
+      Math.max(0.01, Number(selectedForm.sy) || 1),
+      Math.max(0.01, Number(selectedForm.sz) || 1)
+    )
+    object.userData.directorRecordTransform = {
+      position: object.position.toArray(),
+      rotation: [object.rotation.x, object.rotation.y, object.rotation.z],
+      scale: object.scale.toArray(),
+    }
+  }
   if (object.userData.kind === 'camera') {
     object.fov = Math.min(120, Math.max(10, Number(selectedForm.fov) || 42))
-    object.aspect = Math.max(0.2, Number(selectedForm.aspect) || 16 / 9)
+    object.aspect = workflowAspectLocked.value
+      ? projectAspect.value.ratio
+      : Math.max(0.2, Number(selectedForm.aspect) || 16 / 9)
+    selectedForm.aspect = object.aspect
+    const cameraProps = { ...(object.userData.props || {}) }
+    cameraProps.fov = object.fov
+    cameraProps.aspect = object.aspect
+    cameraProps.aim_mode = selectedForm.aimMode === 'rotation' ? 'rotation' : 'target'
+    if (cameraProps.aim_mode === 'target') {
+      cameraProps.target_id = String(selectedForm.targetId || '')
+      cameraProps.target_offset = [
+        Number(selectedForm.tx) || 0,
+        Number(selectedForm.ty) || 0,
+        Number(selectedForm.tz) || 0,
+      ]
+    } else {
+      delete cameraProps.target_id
+      delete cameraProps.target_offset
+    }
+    object.userData.props = cameraProps
     object.updateProjectionMatrix()
+  }
+  if (object.userData.kind === 'character') {
+    object.userData.props = {
+      ...(object.userData.props || {}),
+      pose: selectedForm.pose,
+      motion: selectedForm.motion,
+      motion_speed: Math.min(4, Math.max(0.1, Number(selectedForm.motionSpeed) || 1)),
+      motion_intensity: Math.min(1.5, Math.max(0, Number(selectedForm.motionIntensity) || 0)),
+    }
+    updateDirectorObjectAtTime(object, currentTime.value)
+  }
+  if (nextAttachTo) {
+    keyframes.value = keyframes.value.filter((frame) => (
+      frame.object_id !== selectedId.value || Object.prototype.hasOwnProperty.call(frame, 'local_offset')
+    ))
+    transform?.detach()
+    try {
+      applyDirectorAttachments(serializeDocument(), objectById, currentTime.value)
+    } catch (error) {
+      ElMessage.error(error.message)
+    }
+  } else if (previewMode.value === 'free' && transform && transform.object !== object) {
+    transform.attach(object)
   }
   syncStageItems()
   cameraHelpers.get(selectedId.value)?.update()
-  if (shouldCommit) commitHistory()
+  if (shouldCommit) {
+    if (autoRecordKeyframes.value && currentTime.value > 0 && !nextAttachTo) {
+      recordSelectedKeyframe(currentTime.value, { commit: false })
+    }
+    commitHistory()
+  }
 }
 
 function activateSelectedCamera() {
@@ -553,18 +982,18 @@ function commitHistory() {
   saveState.value = '有未保存更改'
 }
 
-function undo() {
+async function undo() {
   if (historyIndex.value <= 0) return
   historyIndex.value -= 1
-  restoreDocument(JSON.parse(history[historyIndex.value]))
+  await restoreDocument(JSON.parse(history[historyIndex.value]))
   historyLength.value = history.length
   saveState.value = '有未保存更改'
 }
 
-function redo() {
+async function redo() {
   if (historyIndex.value >= history.length - 1) return
   historyIndex.value += 1
-  restoreDocument(JSON.parse(history[historyIndex.value]))
+  await restoreDocument(JSON.parse(history[historyIndex.value]))
   historyLength.value = history.length
   saveState.value = '有未保存更改'
 }
@@ -580,11 +1009,30 @@ async function saveLocal() {
   applyInspector()
   const document = serializeDocument()
   localStorage.setItem(storageKey.value, JSON.stringify(document))
-  if (storyboardId.value) {
-    await persistStoryboardWorkflow({ director_scene_json: document })
-    saveState.value = '已保存到分镜'
-  } else {
-    saveState.value = '已保存到本机'
+  workflowSaving.value = true
+  try {
+    if (workflowArtifact.value) {
+      const revised = await productionAPI.updateArtifact(workflowArtifact.value.id, {
+        content: { ...workflowArtifact.value.content, document, manually_adjusted: true },
+      })
+      const approved = await productionAPI.reviewArtifact(revised.id, {
+        decision: 'approved',
+        reason: '用户在 3D 导演台完成精调并确认',
+      })
+      workflowArtifact.value = approved.artifact
+      saveState.value = '已保存并确认到制作流程'
+      ElMessage.success('导演台方案已写回；返回后会重新录制本镜头预演')
+    } else if (storyboardId.value) {
+      await persistStoryboardWorkflow({ director_scene_json: document })
+      saveState.value = '已保存到分镜'
+    } else {
+      saveState.value = '已保存到本机'
+    }
+  } catch (error) {
+    saveState.value = '保存失败'
+    ElMessage.error(error.message || '导演台方案保存失败')
+  } finally {
+    workflowSaving.value = false
   }
 }
 
@@ -600,8 +1048,8 @@ async function importJson(event) {
   event.target.value = ''
   if (!file) return
   try {
-    const document = normalizeDirectorDocument(JSON.parse(await file.text()))
-    restoreDocument(document, { commit: true })
+    const document = normalizeDirectorDocument(JSON.parse(await file.text()), projectAspect.value.value)
+    await restoreDocument(document, { commit: true })
     saveLocal()
     ElMessage.success('场景已导入')
   } catch (error) {
@@ -618,7 +1066,8 @@ function downloadBlob(blob, name) {
   setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
-function canvasBlob() {
+async function canvasBlob() {
+  await waitForDirectorObjects([...objectById.values()])
   renderScene()
   return new Promise((resolve, reject) => {
     renderer.domElement.toBlob((blob) => blob ? resolve(blob) : reject(new Error('截图失败')), 'image/png')
@@ -663,9 +1112,15 @@ async function saveFrameToProject() {
   }
 }
 
-function toggleRecording() {
+async function toggleRecording() {
   if (recording.value) {
     mediaRecorder?.stop()
+    return
+  }
+  try {
+    await waitForDirectorObjects([...objectById.values()])
+  } catch (error) {
+    ElMessage.error(error.message || '3D 素材尚未准备完成')
     return
   }
   if (!renderer?.domElement.captureStream || typeof MediaRecorder === 'undefined') {
@@ -679,6 +1134,7 @@ function toggleRecording() {
   mediaRecorder.ondataavailable = (event) => { if (event.data.size) recordChunks.push(event.data) }
   mediaRecorder.onstop = async () => {
     recording.value = false
+    playing.value = false
     if (recordChunks.length) {
       const blob = new Blob(recordChunks, { type: mimeType || 'video/webm' })
       const filename = `director-preview-${Date.now()}.webm`
@@ -708,25 +1164,72 @@ function toggleRecording() {
     }
     recordChunks = []
   }
+  currentTime.value = 0
+  playStartedAt = performance.now()
+  playing.value = true
   mediaRecorder.start(500)
   recording.value = true
 }
 
-function addKeyframe() {
+function selectedKeyframeRecord(time = currentTime.value) {
   const object = objectById.get(selectedId.value)
-  if (!object) return
-  const frame = {
+  if (!object) return null
+  if (object.userData.props?.attach_to) {
+    ElMessage.warning('挂接对象不能添加世界关键帧，请给父对象添加关键帧')
+    return null
+  }
+  return {
     object_id: selectedId.value,
-    time: Number(currentTime.value.toFixed(3)),
+    time: Number(Math.min(timelineDuration.value, Math.max(0, Number(time) || 0)).toFixed(3)),
     position: object.position.toArray(),
     rotation: [object.rotation.x, object.rotation.y, object.rotation.z],
     scale: object.scale.toArray(),
   }
-  const existing = keyframes.value.findIndex((item) => item.object_id === frame.object_id && Math.abs(item.time - frame.time) < 0.001)
-  if (existing >= 0) keyframes.value.splice(existing, 1, frame)
-  else keyframes.value.push(frame)
-  keyframes.value.sort((a, b) => a.time - b.time)
+}
+
+function recordSelectedKeyframe(time = currentTime.value, options = {}) {
+  const frame = selectedKeyframeRecord(time)
+  if (!frame) return false
+  keyframes.value = upsertDirectorKeyframe(keyframes.value, frame)
+  if (options.commit !== false) commitHistory()
+  if (options.announce) ElMessage.success(`${frame.time.toFixed(2)} 秒姿态已记录；同一时刻再次记录会覆盖`)
+  return true
+}
+
+function recordStartKeyframe() {
+  currentTime.value = 0
+  recordSelectedKeyframe(0, { announce: true })
+}
+
+function addKeyframe() {
+  recordSelectedKeyframe(currentTime.value, { announce: true })
+}
+
+function jumpToKeyframe(frame) {
+  scrubTimeline(Number(frame?.time) || 0)
+}
+
+function deleteSelectedKeyframe(frame) {
+  keyframes.value = removeDirectorKeyframe(keyframes.value, selectedId.value, frame?.time)
+  applyTimeline(currentTime.value)
   commitHistory()
+}
+
+function keyframePositionText(frame) {
+  const position = Array.isArray(frame?.position) ? frame.position : []
+  if (position.length < 3) return '局部姿态'
+  return `X ${Number(position[0]).toFixed(1)} · Y ${Number(position[1]).toFixed(1)} · Z ${Number(position[2]).toFixed(1)}`
+}
+
+function previewSelectedMotion() {
+  if (selectedKeyframes.value.length < 2) {
+    ElMessage.warning('请至少记录起点和终点两个关键帧')
+    return
+  }
+  currentTime.value = 0
+  applyTimeline(0)
+  playStartedAt = performance.now()
+  playing.value = true
 }
 
 function applyTimeline(time) {
@@ -739,11 +1242,15 @@ function applyTimeline(time) {
     const value = interpolateObjectKeyframes(track, time)
     const object = objectById.get(id)
     if (!value || !object) continue
-    object.position.fromArray(value.position)
-    object.rotation.set(...value.rotation)
-    object.scale.fromArray(value.scale)
-    cameraHelpers.get(id)?.update()
+    if (Array.isArray(value.position) && Array.isArray(value.rotation) && Array.isArray(value.scale)) {
+      object.position.fromArray(value.position)
+      object.rotation.set(...value.rotation)
+      object.scale.fromArray(value.scale)
+      cameraHelpers.get(id)?.update()
+    }
   }
+  for (const object of objectById.values()) updateDirectorObjectAtTime(object, time)
+  applyDirectorAttachments(serializeDocument(), objectById, time)
   syncSelectedForm()
 }
 
@@ -767,6 +1274,13 @@ function changeTimelineDuration(value) {
   timelineDuration.value = Math.min(60, Math.max(1, Number(value) || 5))
   keyframes.value = keyframes.value.filter((frame) => frame.time <= timelineDuration.value)
   currentTime.value = Math.min(currentTime.value, timelineDuration.value)
+  commitHistory()
+}
+
+function onTransformMouseUp() {
+  if (autoRecordKeyframes.value && currentTime.value > 0 && selectedId.value && !selectedForm.attachTo) {
+    recordSelectedKeyframe(currentTime.value, { commit: false })
+  }
   commitHistory()
 }
 
@@ -803,13 +1317,23 @@ function resizeRenderer() {
   editorCamera.updateProjectionMatrix()
 }
 
+function orientTargetCameras() {
+  for (const object of objectById.values()) {
+    if (!object?.isPerspectiveCamera) continue
+    applyDirectorCameraAim(object, { props: object.userData.props || {} }, objectById)
+  }
+}
+
 function renderScene() {
   if (!renderer || !scene) return
   const width = renderer.domElement.width / renderer.getPixelRatio()
   const height = renderer.domElement.height / renderer.getPixelRatio()
   const shotCamera = objectById.get(activeCameraId.value)
+  orientTargetCameras()
+  const showDirectorHelpers = previewMode.value === 'free' && !recording.value
+  setDirectorHelperVisibility(scene, showDirectorHelpers)
   for (const [id, helper] of cameraHelpers) {
-    helper.visible = previewMode.value !== 'shot' || id !== activeCameraId.value
+    helper.visible = showDirectorHelpers && id !== activeCameraId.value
     helper.update()
   }
   renderer.setScissorTest(false)
@@ -842,6 +1366,7 @@ function animate(now) {
     if (next >= timelineDuration.value) {
       currentTime.value = timelineDuration.value
       playing.value = false
+      if (recording.value && mediaRecorder?.state === 'recording') mediaRecorder.stop()
     } else {
       currentTime.value = next
     }
@@ -852,7 +1377,7 @@ function animate(now) {
   animationFrame = requestAnimationFrame(animate)
 }
 
-function initScene() {
+async function initScene() {
   scene = new THREE.Scene()
   scene.background = new THREE.Color('#0d1119')
   scene.fog = new THREE.Fog('#0d1119', 24, 72)
@@ -883,13 +1408,14 @@ function initScene() {
     syncSelectedForm()
     cameraHelpers.get(selectedId.value)?.update()
   })
-  transform.addEventListener('mouseUp', commitHistory)
+  transform.addEventListener('mouseUp', onTransformMouseUp)
   transformHelper = transform.getHelper ? transform.getHelper() : transform
   scene.add(transformHelper)
 
   const grid = new THREE.GridHelper(80, 80, '#257a6c', '#28313f')
   grid.material.opacity = 0.62
   grid.material.transparent = true
+  grid.userData.directorHelper = true
   scene.add(grid)
   const ambient = new THREE.HemisphereLight('#c8dcff', '#253327', 2.2)
   scene.add(ambient)
@@ -902,41 +1428,58 @@ function initScene() {
   resizeObserver.observe(viewportRef.value)
   resizeRenderer()
 
-  let initial = storyboardRecord.value?.director_scene_json || createDefaultDirectorDocument()
+  let initial = workflowArtifact.value?.content?.document || storyboardRecord.value?.director_scene_json || createDefaultDirectorDocument()
   const saved = localStorage.getItem(storageKey.value)
-  if (saved && !storyboardRecord.value?.director_scene_json) {
+  if (saved && !workflowArtifact.value?.content?.document && !storyboardRecord.value?.director_scene_json) {
     try {
-      initial = normalizeDirectorDocument(JSON.parse(saved))
+      initial = normalizeDirectorDocument(JSON.parse(saved), projectAspect.value.value)
       saveState.value = '已从本机恢复'
     } catch (_) {
       saveState.value = '本机存档损坏，已载入默认场景'
     }
   }
-  restoreDocument(initial)
+  await restoreDocument(initial)
   commitHistory()
-  saveState.value = storyboardRecord.value?.director_scene_json
-    ? '已从分镜恢复'
+  saveState.value = workflowArtifact.value?.content?.document
+    ? '已从制作流程恢复'
+    : storyboardRecord.value?.director_scene_json
+      ? '已从分镜恢复'
     : saved ? '已从本机恢复' : '默认场景'
   webglReady.value = true
   animationFrame = requestAnimationFrame(animate)
 }
 
 function goBack() {
-  if (dramaId.value && storyboardId.value) {
+  if (dramaId.value && workflowRunId.value) {
+    router.push({ path: `/workflow/${dramaId.value}`, query: { run: workflowRunId.value } })
+  } else if (dramaId.value && storyboardId.value) {
     router.push({ path: `/workflow/${dramaId.value}`, query: { stage: 'director', storyboard: storyboardId.value } })
   } else {
-    router.push(dramaId.value ? `/drama/${dramaId.value}` : '/')
+    router.push('/')
   }
 }
 
 onMounted(async () => {
+  tutorialVisible.value = route.query.tutorial === '1'
   await nextTick()
   try {
-    if (storyboardId.value) storyboardRecord.value = await storyboardsAPI.get(storyboardId.value)
-    initScene()
+    const graphResult = await productionAPI.graph()
+    directorAssets.value = graphResult.director_assets || []
+    directorPoses.value = graphResult.director_poses || []
+    directorMotions.value = graphResult.director_motions || []
+    if (workflowRunId.value) {
+      const summary = await productionAPI.getRun(workflowRunId.value)
+      workflowAspectRatio.value = summary.run?.policy?.aspect_ratio || '16:9'
+      workflowArtifact.value = selectWorkflowDirectorArtifact(summary.artifacts, workflowShotId.value)
+      if (!workflowArtifact.value) throw new Error('找不到这个镜头可审查的导演台方案')
+    } else if (storyboardId.value) {
+      storyboardRecord.value = await storyboardsAPI.get(storyboardId.value)
+    }
+    await initScene()
     window.addEventListener('keydown', onKeyDown)
   } catch (error) {
-    ElMessage.error('3D 场景初始化失败：' + error.message)
+    initError.value = '3D 场景初始化失败：' + error.message
+    ElMessage.error(initError.value)
   }
 })
 
@@ -995,6 +1538,7 @@ onBeforeUnmount(() => {
   font-size: 15px;
   line-height: 1.2;
   letter-spacing: 0;
+  white-space: nowrap;
 }
 .director-brand span,
 .save-state {
@@ -1011,6 +1555,9 @@ onBeforeUnmount(() => {
 }
 .director-toolbar::-webkit-scrollbar {
   display: none;
+}
+.director-toolbar > * {
+  flex: 0 0 auto;
 }
 .toolbar-divider {
   flex: 0 0 1px;
@@ -1136,6 +1683,131 @@ onBeforeUnmount(() => {
   white-space: nowrap;
   font-size: 12px;
 }
+.attachment-status {
+  margin: 6px 0 10px;
+  padding: 7px 8px;
+  border-left: 3px solid #35b6a0;
+  color: #8fd8c8;
+  background: rgba(53, 182, 160, .12);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.keyframe-editor {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+  padding: 10px;
+  border: 1px solid #303a49;
+  border-radius: 5px;
+  background: #121822;
+}
+.keyframe-editor-heading,
+.keyframe-editor-heading > span {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.keyframe-editor-heading {
+  justify-content: space-between;
+}
+.keyframe-editor-heading strong {
+  color: #e0e7ef;
+  font-size: 12px;
+}
+.keyframe-editor-heading small {
+  color: #78879a;
+  font-size: 10px;
+}
+.keyframe-steps {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 4px;
+}
+.keyframe-steps span {
+  min-width: 0;
+  padding: 4px 3px;
+  border: 1px solid #293444;
+  color: #91a0b2;
+  background: #19212d;
+  font-size: 9px;
+  text-align: center;
+  white-space: nowrap;
+}
+.keyframe-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 5px;
+}
+.keyframe-actions :deep(.el-button) {
+  width: 100%;
+  min-width: 0;
+  margin-left: 0;
+  padding-inline: 6px;
+  font-size: 10px;
+}
+.keyframe-list {
+  display: grid;
+  gap: 4px;
+  max-height: 132px;
+  overflow: auto;
+}
+.keyframe-row {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px;
+  align-items: center;
+  gap: 3px;
+  border: 1px solid #293545;
+  background: #18202c;
+}
+.keyframe-row > button {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 46px minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+  padding: 6px 7px;
+  border: 0;
+  background: transparent;
+  color: #dce5ee;
+  cursor: pointer;
+  text-align: left;
+}
+.keyframe-row > button:hover,
+.keyframe-row > button:focus-visible {
+  background: #202b39;
+  outline: 1px solid #3e8e80;
+}
+.keyframe-row strong {
+  color: #f1bd59;
+  font-family: 'Menlo', 'Consolas', monospace;
+  font-size: 10px;
+}
+.keyframe-row small {
+  min-width: 0;
+  overflow: hidden;
+  color: #8998aa;
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.keyframe-empty,
+.keyframe-attached-note,
+.aspect-lock-note {
+  padding: 7px 8px;
+  color: #8d9bad;
+  background: #19212c;
+  font-size: 10px;
+  line-height: 1.45;
+}
+.keyframe-attached-note {
+  color: #8fd8c8;
+}
+.aspect-lock-note {
+  margin-top: 6px;
+  color: #a5d8ce;
+  border-left: 3px solid #35b6a0;
+}
 .active-camera-mark {
   color: #ff8f76;
   font-size: 9px;
@@ -1174,9 +1846,18 @@ onBeforeUnmount(() => {
 .camera-row :deep(.el-select) {
   width: 100%;
 }
+.vector-row :deep(.el-input-number.is-controls-right .el-input__wrapper) {
+  padding-left: 6px;
+  padding-right: 30px;
+}
+.vector-row :deep(.el-input-number.is-controls-right .el-input-number__increase),
+.vector-row :deep(.el-input-number.is-controls-right .el-input-number__decrease) {
+  width: 26px;
+}
 .vector-row :deep(.el-input__inner) {
-  padding-left: 5px;
-  padding-right: 27px;
+  min-width: 0;
+  padding: 0 2px;
+  text-align: center;
 }
 .activate-camera {
   width: 100%;
@@ -1238,6 +1919,124 @@ onBeforeUnmount(() => {
 .director-studio :deep(.el-select__selected-item) {
   color: #e5ebf2;
 }
+.director-studio :deep(.el-input-number) {
+  --el-input-bg-color: #1b2230;
+  --el-input-text-color: #edf2f7;
+  --el-disabled-bg-color: #141a24;
+  --el-disabled-text-color: #738094;
+  --el-fill-color-light: #242d3b;
+  --el-fill-color: #242d3b;
+}
+.director-studio :deep(.el-input-number .el-input__wrapper) {
+  background: #1b2230 !important;
+  box-shadow: 0 0 0 1px #3a4658 inset !important;
+}
+.director-studio :deep(.el-input-number .el-input__inner) {
+  color: #edf2f7 !important;
+  -webkit-text-fill-color: #edf2f7 !important;
+}
+.director-studio :deep(.el-input-number__increase),
+.director-studio :deep(.el-input-number__decrease) {
+  border-color: #3a4658 !important;
+  background: #252e3d !important;
+  color: #c9d4e1 !important;
+}
+.director-studio :deep(.el-input-number__increase:hover),
+.director-studio :deep(.el-input-number__decrease:hover) {
+  background: #314052 !important;
+  color: #77d8c4 !important;
+}
+.director-studio :deep(.el-input-number .el-input__wrapper.is-focus) {
+  box-shadow: 0 0 0 1px #35b69d inset, 0 0 0 2px rgba(53, 182, 157, .16) !important;
+}
+.director-studio :deep(.el-input-number.is-disabled .el-input__wrapper),
+.director-studio :deep(.el-input-number .el-input.is-disabled .el-input__wrapper) {
+  background: #141a24 !important;
+  box-shadow: 0 0 0 1px #27303d inset !important;
+}
+.director-studio :deep(.el-input-number.is-disabled .el-input__inner),
+.director-studio :deep(.el-input-number .el-input.is-disabled .el-input__inner) {
+  color: #738094 !important;
+  -webkit-text-fill-color: #738094 !important;
+}
+.director-studio :deep(.el-input-number.is-disabled .el-input-number__increase),
+.director-studio :deep(.el-input-number.is-disabled .el-input-number__decrease) {
+  background: #171d27 !important;
+  color: #536073 !important;
+}
+.asset-palette-tools {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.asset-palette-tools :deep(.el-segmented) {
+  width: 100%;
+  overflow-x: auto;
+}
+.asset-palette-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+}
+.asset-palette-item {
+  min-width: 0;
+  min-height: 76px;
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr) 24px;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid #d9e0e2;
+  border-radius: 5px;
+  background: #fff;
+  color: #26363e;
+  cursor: pointer;
+  text-align: left;
+}
+.asset-palette-item:hover,
+.asset-palette-item:focus-visible {
+  border-color: #2f9c89;
+  box-shadow: 0 0 0 2px rgba(47, 156, 137, 0.14);
+  outline: none;
+}
+.asset-palette-item img,
+.asset-palette-icon {
+  width: 58px;
+  height: 58px;
+  display: grid;
+  place-items: center;
+  border-radius: 4px;
+  background: #e9eef0;
+  object-fit: contain;
+}
+.asset-palette-icon :deep(.el-icon) {
+  font-size: 25px;
+  color: #61737b;
+}
+.asset-palette-copy {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+.asset-palette-copy strong,
+.asset-palette-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.asset-palette-copy strong {
+  font-size: 13px;
+}
+.asset-palette-copy small {
+  color: #7a888e;
+  font-size: 10px;
+}
+.asset-add-icon {
+  color: #2f8f7e;
+}
+:global(.director-asset-drawer .el-drawer__header) {
+  margin-bottom: 12px;
+}
 @media (max-width: 860px) {
   .director-studio {
     min-height: 600px;
@@ -1271,6 +2070,9 @@ onBeforeUnmount(() => {
   }
 }
 @media (max-width: 520px) {
+  .asset-palette-grid {
+    grid-template-columns: 1fr;
+  }
   .director-header {
     padding: 0 8px;
   }
@@ -1293,7 +2095,7 @@ onBeforeUnmount(() => {
   .vector-row :deep(.el-input-number__decrease) {
     display: none;
   }
-  .vector-row :deep(.el-input__wrapper) {
+  .vector-row :deep(.el-input-number.is-controls-right .el-input__wrapper) {
     padding-inline: 6px;
   }
   .director-timeline {
@@ -1305,4 +2107,53 @@ onBeforeUnmount(() => {
     display: none;
   }
 }
+:global(.director-tutorial-drawer .el-drawer__body) {
+  padding: 0 18px 24px;
+  background: #10151d;
+}
+:global(.director-tutorial-drawer .el-drawer__header) {
+  margin-bottom: 0;
+  padding: 18px;
+  color: #eef2f7;
+  background: #10151d;
+  border-bottom: 1px solid #28313e;
+}
+.tutorial-boundary {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  gap: 9px;
+  margin: 16px 0;
+  padding: 13px;
+  border: 1px solid #28584f;
+  border-radius: 6px;
+  color: #5eead4;
+  background: #10211f;
+}
+.tutorial-boundary strong { color: #ccfbf1; font-size: 12px; }
+.tutorial-boundary p { margin: 4px 0 0; color: #9aaba6; font-size: 11px; line-height: 1.6; }
+.tutorial-steps { display: grid; gap: 0; margin: 0; padding: 0; list-style: none; }
+.tutorial-steps li {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  gap: 10px;
+  padding: 13px 0;
+  border-bottom: 1px solid #29323f;
+}
+.tutorial-steps li > span {
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  border: 1px solid #3d4c5f;
+  border-radius: 50%;
+  color: #c4b5fd;
+  font-size: 11px;
+}
+.tutorial-steps strong { color: #e6ebf2; font-size: 12px; }
+.tutorial-steps p { margin: 4px 0 8px; color: #929eae; font-size: 11px; line-height: 1.55; }
+.tutorial-when { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 15px 0; }
+.tutorial-when div { display: grid; gap: 4px; padding: 10px; border-radius: 5px; background: #181f29; }
+.tutorial-when strong { color: #cbd5e1; font-size: 11px; }
+.tutorial-when span { color: #8793a3; font-size: 10px; line-height: 1.5; }
+.tutorial-guide-link { width: 100%; }
 </style>

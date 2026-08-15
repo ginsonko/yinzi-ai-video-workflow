@@ -45,6 +45,7 @@ describe('normalizeYinziCatalog', () => {
         { model_name: 'mg-seedance2.0 -480p mini', supported_endpoint_types: ['openai-video', 'openai'], enable_groups: ['视频组'], group_pricing: { v: { group: '视频组', billing_mode: 'fixed_price', billing_unit: 'per_second', effective_model_price: 0.2004 } } },
         { model_name: 'gpt-image-2', supported_endpoint_types: ['image-generation', 'openai'], enable_groups: ['图片组'] },
         { model_name: 'gpt-5.4-mini', supported_endpoint_types: ['openai'], enable_groups: ['文本组'] },
+        { model_name: 'gpt-5.6-sol', supported_endpoint_types: ['openai'], enable_groups: ['文本组'] },
       ],
     });
     assert.equal(result.video[0].model, 'mg-seedance2.0 -480p mini');
@@ -55,7 +56,50 @@ describe('normalizeYinziCatalog', () => {
     assert.equal(result.video[0].capabilities.duration_min, 5);
     assert.equal(result.video[0].capabilities.duration_max, 15);
     assert.equal(result.image[0].model, 'gpt-image-2');
-    assert.equal(result.text[0].model, 'gpt-5.4-mini');
+    assert.equal(result.text[0].model, 'gpt-5.6-sol');
+  });
+
+  it('uses the V0.1.2 video price snapshot while the public catalog is on the known stale revision', () => {
+    const staleVideoPrice = (model, unit, value, group = '特价视频分组(即梦)') => ({
+      model_name: model,
+      supported_endpoint_types: ['openai-video', 'openai'],
+      enable_groups: [group],
+      group_pricing: {
+        [group]: {
+          group,
+          billing_mode: unit === 'per_million_tokens' ? 'ratio' : 'fixed_price',
+          billing_unit: unit,
+          effective_model_price: value,
+          effective_input_usd: unit === 'per_million_tokens' ? value : null,
+          effective_output_usd: unit === 'per_million_tokens' ? value : null,
+        },
+      },
+    });
+    const result = normalizeYinziCatalog({
+      success: true,
+      pricing_version: 'a42d372ccf0b5dd13ecf71203521f9d2',
+      data: [
+        staleVideoPrice('mg-seedance2.0 -480p mini', 'per_second', 0.2004),
+        staleVideoPrice('af-seedance-2.0', 'per_million_tokens', 90),
+        staleVideoPrice('seedance-2.5-720p', 'per_million_tokens', 90),
+        staleVideoPrice('grok-imagine-video', 'per_request', 0.1125, '视频模型渠道'),
+        staleVideoPrice('MiniMax-H3-2k', 'per_second', 0.205, 'minimax/可灵视频'),
+        staleVideoPrice('Kling VIDEO 3.0 Omni', 'per_request', 0.25, 'minimax/可灵视频'),
+      ],
+    });
+    const price = (model) => result.video.find((item) => item.model === model).prices[0];
+    assert.deepEqual(price('mg-seedance2.0 -480p mini'), {
+      group: '特价视频分组(即梦)', billing_mode: 'fixed_price', billing_unit: 'per_second',
+      effective_price: 0.1664, effective_input_usd: null, effective_output_usd: null,
+      fixed_duration_seconds: null, source: 'v0.1.2-default',
+    });
+    assert.equal(price('af-seedance-2.0').billing_unit, 'per_request');
+    assert.equal(price('af-seedance-2.0').effective_price, 0.3484);
+    assert.equal(price('seedance-2.5-720p').billing_unit, 'per_second');
+    assert.equal(price('seedance-2.5-720p').effective_price, 0.7644);
+    assert.equal(price('grok-imagine-video').effective_price, 0.1125);
+    assert.equal(price('MiniMax-H3-2k').effective_price, 0.20475);
+    assert.equal(price('Kling VIDEO 3.0 Omni').effective_price, 0.25);
   });
 });
 

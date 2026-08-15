@@ -1,0 +1,112 @@
+import request from '@/utils/request'
+
+export const productionAPI = {
+  graph() {
+    return request.get('/production-graph')
+  },
+  listRuns(params = {}) {
+    return request.get('/production-runs', { params })
+  },
+  productionMedia(params = {}) {
+    return request.get('/production-media', { params })
+  },
+  createRun(body) {
+    return request.post('/production-runs', body)
+  },
+  getRun(id) {
+    return request.get(`/production-runs/${id}`)
+  },
+  costs(id, params = {}) {
+    return request.get(`/production-runs/${id}/costs`, { params })
+  },
+  getVideoRouting(id, params = {}) {
+    return request.get(`/production-runs/${id}/video-routing`, { params })
+  },
+  updateVideoRouting(id, body) {
+    return request.patch(`/production-runs/${id}/video-routing`, body)
+  },
+  updateRun(id, body) {
+    return request.patch(`/production-runs/${id}`, body)
+  },
+  preflight(id, body = {}) {
+    return request.post(`/production-runs/${id}/preflight`, body)
+  },
+  start(id, body = {}) {
+    return request.post(`/production-runs/${id}/start`, body)
+  },
+  advance(id, body = {}) {
+    return request.post(`/production-runs/${id}/advance`, body)
+  },
+  rebuildFinalEdit(id, body = {}) {
+    return request.post(`/production-runs/${id}/final-edit/rebuild`, body)
+  },
+  pause(id, body = {}) {
+    return request.post(`/production-runs/${id}/pause`, body)
+  },
+  resume(id, body = {}) {
+    return request.post(`/production-runs/${id}/resume`, body)
+  },
+  retry(id, body) {
+    return request.post(`/production-runs/${id}/retry`, body)
+  },
+  recoverStoryboard(id, body = {}) {
+    return request.post(`/production-runs/${id}/recover-storyboard`, body)
+  },
+  cancel(id, body = {}) {
+    return request.post(`/production-runs/${id}/cancel`, body)
+  },
+  transition(id, body) {
+    return request.post(`/production-runs/${id}/transition`, body)
+  },
+  returnToStage(id, body) {
+    return request.post(`/production-runs/${id}/return`, body)
+  },
+  clientResult(id, body) {
+    return request.post(`/production-runs/${id}/client-result`, body)
+  },
+  listArtifacts(id, params = {}) {
+    return request.get(`/production-runs/${id}/artifacts`, { params })
+  },
+  reusableMedia(id, params = {}) {
+    return request.get(`/production-runs/${id}/reusable-media`, { params })
+  },
+  materializeReusableMedia(id, artifactId, body = {}) {
+    return request.post(`/production-runs/${id}/reusable-media/${artifactId}/materialize`, body)
+  },
+  addArtifact(id, body) {
+    return request.post(`/production-runs/${id}/artifacts`, body)
+  },
+  updateArtifact(id, body) {
+    return request.patch(`/production-artifacts/${id}`, body)
+  },
+  reviewArtifact(id, body) {
+    return request.post(`/production-artifacts/${id}/review`, body)
+  },
+  excludeArtifact(id, body = {}) {
+    return request.post(`/production-artifacts/${id}/exclude`, body)
+  },
+  restoreArtifact(id, body = {}) {
+    return request.post(`/production-artifacts/${id}/restore`, body)
+  },
+  suggestArtifact(id, body = {}) {
+    return request.post(`/production-artifacts/${id}/suggest`, body)
+  },
+  assist(body) {
+    return request.post('/production-assist', body)
+  },
+  events(id, params = {}) {
+    return request.get(`/production-runs/${id}/events`, { params })
+  },
+  reviews(id, params = {}) {
+    return request.get(`/production-runs/${id}/reviews`, { params })
+  },
+  actions(id, params = {}) {
+    return request.get(`/production-runs/${id}/actions`, { params })
+  },
+  exportRun(id) {
+    return request.post(`/production-runs/${id}/export`)
+  },
+  zipRun(id) {
+    return request.post(`/production-runs/${id}/export.zip`)
+  },
+}

@@ -1,5 +1,6 @@
 const aiConfigService = require('./aiConfigService');
 const { getYinziVideoCapability } = require('./yinziVideoCapabilities');
+const { resolveYinziVideoPrices } = require('./yinziVideoDefaults');
 
 const YINZI_CATALOG_URL = 'https://yinziapi.top/api/pricing';
 const YINZI_DEFAULT_BASE_URL = 'https://api.yinziapi.top/v1';
@@ -40,23 +41,29 @@ function normalizePricing(item) {
     group: String(price.group || ''),
     billing_mode: String(price.billing_mode || ''),
     billing_unit: String(price.billing_unit || ''),
-    effective_price: Number.isFinite(Number(price.effective_model_price))
+    effective_price: price.effective_model_price != null && Number.isFinite(Number(price.effective_model_price))
       ? Number(price.effective_model_price)
       : null,
-    effective_input_usd: Number.isFinite(Number(price.effective_input_usd))
+    effective_input_usd: price.effective_input_usd != null && Number.isFinite(Number(price.effective_input_usd))
       ? Number(price.effective_input_usd)
       : null,
-    effective_output_usd: Number.isFinite(Number(price.effective_output_usd))
+    effective_output_usd: price.effective_output_usd != null && Number.isFinite(Number(price.effective_output_usd))
       ? Number(price.effective_output_usd)
+      : null,
+    fixed_duration_seconds: price.fixed_duration_seconds != null && Number.isFinite(Number(price.fixed_duration_seconds))
+      ? Number(price.fixed_duration_seconds)
       : null,
   }));
 }
 
-function normalizeCatalogItem(item) {
+function normalizeCatalogItem(item, pricingVersion = '') {
   const endpointTypes = Array.isArray(item?.supported_endpoint_types)
     ? item.supported_endpoint_types.map((v) => String(v))
     : [];
-  const prices = normalizePricing(item);
+  const normalizedPrices = normalizePricing(item);
+  const prices = endpointTypes.includes('openai-video')
+    ? resolveYinziVideoPrices(item?.model_name, normalizedPrices, String(pricingVersion || ''))
+    : normalizedPrices;
   const fixedPrices = prices
     .map((p) => p.effective_price)
     .filter((p) => Number.isFinite(p));
@@ -72,7 +79,7 @@ function normalizeCatalogItem(item) {
 
 function recommendedRank(kind, model) {
   const recommendations = {
-    text: ['gpt-5.4-mini', 'deepseek-v4-flash', 'gpt-5.6-terra', 'gpt-5.4', 'gpt-5.6-sol'],
+    text: ['gpt-5.6-sol', 'gpt-5.4-mini', 'deepseek-v4-flash', 'gpt-5.6-terra', 'gpt-5.4'],
     image: ['gpt-image-2', 'flux-2-pro', 'seedream-v5-lite'],
     video: ['mg-seedance2.0 -480p mini', 'mg-seedance2.0 -480p fast', 'mg-seedance2.0 -720p mini'],
   };
@@ -92,7 +99,9 @@ function normalizeYinziCatalog(payload) {
   if (!payload || payload.success === false || !Array.isArray(payload.data)) {
     throw new Error('模型目录返回格式异常');
   }
-  const all = payload.data.map(normalizeCatalogItem).filter((item) => item.model);
+  const all = payload.data
+    .map((item) => normalizeCatalogItem(item, payload.pricing_version))
+    .filter((item) => item.model);
   const image = sortCatalogItems('image', all.filter((item) => item.endpoint_types.includes('image-generation')));
   const video = sortCatalogItems('video', all.filter((item) => item.endpoint_types.includes('openai-video')));
   const text = sortCatalogItems(

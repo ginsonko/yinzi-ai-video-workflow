@@ -2,6 +2,12 @@ import { createRouter, createWebHistory } from 'vue-router'
 
 const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
+  scrollBehavior(to, from, savedPosition) {
+    if (savedPosition) return savedPosition
+    if (to.hash) return { el: to.hash, behavior: 'smooth' }
+    if (to.path === from.path) return false
+    return { top: 0 }
+  },
   routes: [
     {
       path: '/',
@@ -12,19 +18,19 @@ const router = createRouter({
     {
       path: '/drama/:id',
       name: 'drama-detail',
-      component: () => import('@/views/DramaDetail.vue'),
+      redirect: (to) => ({ name: 'production-workflow', params: { id: to.params.id }, query: to.query }),
       meta: { title: '剧集管理' }
     },
     {
       path: '/film/:id',
       name: 'film',
-      component: () => import('@/views/FilmCreate.vue'),
+      redirect: (to) => ({ name: 'production-workflow', params: { id: to.params.id }, query: to.query }),
       meta: { title: 'AI 视频生成' }
     },
     {
       path: '/film/:id/canvas',
       name: 'film-canvas',
-      component: () => import('@/views/DramaCanvas.vue'),
+      redirect: (to) => ({ name: 'production-workflow', params: { id: to.params.id }, query: to.query }),
       meta: { title: '画布模式' }
     },
     {
@@ -46,6 +52,12 @@ const router = createRouter({
       meta: { title: 'AI 配置' }
     },
     {
+      path: '/advanced-settings',
+      name: 'advanced-settings',
+      component: () => import('@/views/AdvancedSettings.vue'),
+      meta: { title: '高级设置' }
+    },
+    {
       path: '/free-create',
       name: 'free-create',
       component: () => import('@/views/FreeCreate.vue'),
@@ -56,13 +68,25 @@ const router = createRouter({
       name: 'media-library',
       component: () => import('@/views/MediaLibrary.vue'),
       meta: { title: '媒体素材库' }
+    },
+    {
+      path: '/guided-demo',
+      name: 'guided-demo',
+      component: () => import('@/views/GuidedDemo.vue'),
+      meta: { title: '零成本流程模拟' }
+    },
+    {
+      path: '/help',
+      name: 'help-center',
+      component: () => import('@/views/HelpCenter.vue'),
+      meta: { title: '使用指南' }
     }
   ]
 })
 
 router.beforeEach((to) => {
   if (to.meta.title) {
-    document.title = `${to.meta.title} - LocalMiniDrama`
+    document.title = `${to.meta.title} - 银子AI视频工作流`
   }
   return true
 })

@@ -111,8 +111,13 @@ function ensureAllColumns(database) {
     { name: 'metadata',       type: 'TEXT' },
     { name: 'created_at',     type: 'TEXT' },
     { name: 'updated_at',     type: 'TEXT' },
+    { name: 'archived_at',    type: 'TEXT' },
     { name: 'deleted_at',     type: 'TEXT' },
   ]);
+  database.exec(`
+    CREATE INDEX IF NOT EXISTS idx_dramas_archive_list
+      ON dramas (deleted_at, archived_at, updated_at DESC);
+  `);
 
   // --- episodes ---
   ensureColumns(database, 'episodes', [
@@ -325,6 +330,8 @@ function ensureAllColumns(database) {
     { name: 'prompt',           type: 'TEXT' },
     { name: 'negative_prompt',  type: 'TEXT' },
     { name: 'model',            type: 'TEXT' },
+    { name: 'image_service_type', type: 'TEXT' },
+    { name: 'image_config_id',  type: 'INTEGER' },
     { name: 'frame_type',       type: 'TEXT' },
     { name: 'reference_images', type: 'TEXT' },
     { name: 'use_first_frame_layout_lock', type: 'INTEGER' },
@@ -367,6 +374,8 @@ function ensureAllColumns(database) {
     { name: 'status',               type: 'TEXT' },
     { name: 'task_id',              type: 'TEXT' },
     { name: 'provider_task_id',     type: 'TEXT' },
+    { name: 'prompt_contract_json', type: 'TEXT' },
+    { name: 'provider_prompt_receipt_json', type: 'TEXT' },
     { name: 'scene_id',             type: 'INTEGER' },
     { name: 'completed_at',         type: 'TEXT' },
     { name: 'error_msg',            type: 'TEXT' },
@@ -391,6 +400,7 @@ function ensureAllColumns(database) {
     { name: 'completed_at', type: 'TEXT' },
     { name: 'error_msg',    type: 'TEXT' },
     { name: 'created_at',   type: 'TEXT' },
+    { name: 'updated_at',   type: 'TEXT' },
     { name: 'deleted_at',   type: 'TEXT' },
   ]);
 
@@ -526,6 +536,228 @@ function ensureAllColumns(database) {
       updated_at TEXT NOT NULL DEFAULT ''
     )`);
   } catch (_) {}
+
+  // --- production workflow v1 ---
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS production_runs (
+      id TEXT PRIMARY KEY,
+      drama_id INTEGER NOT NULL,
+      episode_id INTEGER,
+      idempotency_key TEXT,
+      graph_version INTEGER NOT NULL DEFAULT 1,
+      handler_version INTEGER NOT NULL DEFAULT 1,
+      review_owner TEXT NOT NULL DEFAULT 'human',
+      next_stage_strategy TEXT NOT NULL DEFAULT 'auto_generate',
+      manual_next_default INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'draft',
+      current_stage TEXT NOT NULL DEFAULT 'story_input',
+      current_scope_type TEXT,
+      current_scope_id TEXT,
+      input_json TEXT NOT NULL DEFAULT '{}',
+      policy_json TEXT NOT NULL DEFAULT '{}',
+      budget_json TEXT NOT NULL DEFAULT '{}',
+      usage_json TEXT NOT NULL DEFAULT '{}',
+      review_profile_json TEXT NOT NULL DEFAULT '{}',
+      runtime_json TEXT NOT NULL DEFAULT '{}',
+      waiting_reason TEXT,
+      error_code TEXT,
+      error_message TEXT,
+      lease_owner TEXT,
+      lease_expires_at TEXT,
+      version INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      completed_at TEXT,
+      deleted_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_production_runs_project
+      ON production_runs (drama_id, episode_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_production_runs_status
+      ON production_runs (status, updated_at DESC);
+    CREATE TABLE IF NOT EXISTS production_actions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id TEXT NOT NULL,
+      action_key TEXT NOT NULL,
+      stage TEXT NOT NULL,
+      scope_type TEXT,
+      scope_id TEXT,
+      kind TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'reserved',
+      attempt INTEGER NOT NULL DEFAULT 1,
+      handler_version INTEGER NOT NULL DEFAULT 1,
+      request_json TEXT NOT NULL DEFAULT '{}',
+      request_hash TEXT,
+      task_id TEXT,
+      generation_id INTEGER,
+      merge_id INTEGER,
+      provider_id TEXT,
+      result_json TEXT,
+      error_code TEXT,
+      error_message TEXT,
+      reserved_video_seconds REAL NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      completed_at TEXT,
+      UNIQUE (run_id, action_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_production_actions_run
+      ON production_actions (run_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_production_actions_status
+      ON production_actions (run_id, status, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS production_artifacts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id TEXT NOT NULL,
+      stage TEXT NOT NULL,
+      scope_type TEXT NOT NULL,
+      scope_id TEXT NOT NULL DEFAULT '',
+      revision INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'draft',
+      title TEXT,
+      content_json TEXT NOT NULL DEFAULT '{}',
+      media_path TEXT,
+      mime_type TEXT,
+      content_hash TEXT,
+      parent_artifact_id INTEGER,
+      source_action_id INTEGER,
+      source_task_id TEXT,
+      source_generation_id INTEGER,
+      source_merge_id INTEGER,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      approved_at TEXT,
+      rejected_at TEXT,
+      deleted_at TEXT,
+      UNIQUE (run_id, stage, scope_type, scope_id, revision)
+    );
+    CREATE INDEX IF NOT EXISTS idx_production_artifacts_current
+      ON production_artifacts (run_id, stage, scope_type, scope_id, revision DESC);
+    CREATE INDEX IF NOT EXISTS idx_production_artifacts_status
+      ON production_artifacts (run_id, status, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS production_artifact_dependencies (
+      artifact_id INTEGER NOT NULL,
+      depends_on_artifact_id INTEGER NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (artifact_id, depends_on_artifact_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_production_dependencies_upstream
+      ON production_artifact_dependencies (depends_on_artifact_id, artifact_id);
+
+    CREATE TABLE IF NOT EXISTS production_reviews (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id TEXT NOT NULL,
+      artifact_id INTEGER NOT NULL,
+      reviewer_type TEXT NOT NULL,
+      decision TEXT NOT NULL,
+      reason TEXT,
+      criteria_version TEXT,
+      confidence REAL,
+      scores_json TEXT NOT NULL DEFAULT '{}',
+      evidence_json TEXT NOT NULL DEFAULT '{}',
+      prompt_snapshot TEXT,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_production_reviews_artifact
+      ON production_reviews (artifact_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_production_reviews_run
+      ON production_reviews (run_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS production_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      stage TEXT,
+      scope_type TEXT,
+      scope_id TEXT,
+      payload_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_production_events_run
+      ON production_events (run_id, id DESC);
+  `);
+
+  // Keep local databases created by an earlier workflow draft forward-compatible.
+  ensureColumns(database, 'production_runs', [
+    { name: 'idempotency_key', type: 'TEXT' },
+  ]);
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS model_prices (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      provider TEXT NOT NULL,
+      service_type TEXT NOT NULL,
+      model TEXT NOT NULL,
+      group_name TEXT NOT NULL DEFAULT '',
+      billing_unit TEXT NOT NULL,
+      unit_price_microusd INTEGER,
+      input_price_microusd INTEGER,
+      output_price_microusd INTEGER,
+      currency TEXT NOT NULL DEFAULT 'USD',
+      source TEXT NOT NULL DEFAULT 'manual',
+      source_version TEXT,
+      source_fetched_at TEXT,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE (provider, service_type, model, group_name, billing_unit)
+    );
+    CREATE INDEX IF NOT EXISTS idx_model_prices_lookup
+      ON model_prices (provider, service_type, model, enabled, updated_at DESC);
+    CREATE TABLE IF NOT EXISTS cost_ledger (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id TEXT,
+      action_id INTEGER,
+      idempotency_key TEXT NOT NULL UNIQUE,
+      provider TEXT NOT NULL DEFAULT '',
+      service_type TEXT NOT NULL,
+      model TEXT NOT NULL DEFAULT '',
+      billing_unit TEXT NOT NULL DEFAULT 'unknown',
+      units REAL NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'reserved',
+      estimated_microusd INTEGER,
+      reserved_microusd INTEGER NOT NULL DEFAULT 0,
+      actual_microusd INTEGER,
+      price_snapshot_json TEXT NOT NULL DEFAULT '{}',
+      usage_snapshot_json TEXT NOT NULL DEFAULT '{}',
+      note TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      settled_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_cost_ledger_run
+      ON cost_ledger (run_id, status, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_cost_ledger_action
+      ON cost_ledger (action_id, created_at DESC);
+    CREATE TABLE IF NOT EXISTS config_snapshots (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      snapshot_type TEXT NOT NULL DEFAULT 'automatic',
+      reason TEXT NOT NULL DEFAULT '',
+      schema_version INTEGER NOT NULL,
+      sections_json TEXT NOT NULL,
+      content_hash TEXT NOT NULL,
+      pinned INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_config_snapshots_created
+      ON config_snapshots (created_at DESC, id DESC);
+    CREATE TABLE IF NOT EXISTS config_import_previews (
+      token TEXT PRIMARY KEY,
+      bundle_json TEXT NOT NULL,
+      bundle_hash TEXT NOT NULL,
+      base_fingerprint TEXT NOT NULL,
+      diff_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      applied_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_config_import_previews_expiry
+      ON config_import_previews (expires_at, applied_at);
+  `);
+  database.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_production_runs_idempotency
+      ON production_runs (drama_id, IFNULL(episode_id, 0), idempotency_key)
+      WHERE idempotency_key IS NOT NULL AND deleted_at IS NULL;
+  `);
 }
 
 /** 对已打开的 database 执行迁移与兜底补列（供 app 启动时调用） */

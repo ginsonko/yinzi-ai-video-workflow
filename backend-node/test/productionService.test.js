@@ -1,0 +1,2023 @@
+const { describe, it, beforeEach, afterEach } = require('node:test');
+const assert = require('node:assert/strict');
+const Database = require('better-sqlite3');
+const { runMigrationsAndEnsure } = require('../src/db/migrate');
+const repo = require('../src/services/productionRepository');
+const { createProductionService } = require('../src/services/productionService');
+const { createProductionMediaService } = require('../src/services/productionMediaService');
+const automationPreferences = require('../src/services/productionAutomationPreferences');
+
+let db;
+const log = { info() {}, warn() {}, error() {} };
+
+function migrateQuietly() {
+  const originalLog = console.log;
+  const originalWarn = console.warn;
+  console.log = () => {};
+  console.warn = () => {};
+  try { runMigrationsAndEnsure(db); } finally { console.log = originalLog; console.warn = originalWarn; }
+}
+
+function createRun(reviewOwner = 'human') {
+  return repo.createRun(db, {
+    drama_id: 1,
+    episode_id: 1,
+    idempotency_key: `run-${reviewOwner}`,
+    review_owner: reviewOwner,
+    input: { story: '宇航员林夏在星尘花园寻找一颗会发光的种子。' },
+    policy: { target_shots: 3, style: '电影感科幻写实' },
+    budget: { max_video_attempts: 10, max_video_seconds: 60, max_shots: 5 },
+  }).run;
+}
+
+function scriptedAdapter(responses, calls) {
+  return async (user, system, options) => {
+    calls.push({ user, system, options });
+    if (!responses.length) throw new Error('unexpected AI call');
+    return responses.shift();
+  };
+}
+
+beforeEach(() => {
+  db = new Database(':memory:');
+  migrateQuietly();
+  const now = new Date().toISOString();
+  db.prepare('INSERT INTO dramas (id, title, created_at, updated_at) VALUES (1, ?, ?, ?)').run('星尘花园', now, now);
+  db.prepare('INSERT INTO episodes (id, drama_id, episode_number, title, created_at, updated_at) VALUES (1, 1, 1, ?, ?, ?)').run('第一集', now, now);
+});
+
+afterEach(() => db.close());
+
+describe('production executor text stages', () => {
+  it('defers strict first-frame capability selection to automatic routing', async () => {
+    let run = createRun('human');
+    run = repo.updateRun(db, run.id, {
+      policy: { ...run.policy, video_routing_mode: 'auto', video_model: '' },
+    });
+    const shot = repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'storyboard_plan',
+      scope_type: 'shot',
+      scope_id: '2',
+      title: '严格续拍镜头',
+      content: {
+        included: true,
+        number: 2,
+        duration: 5,
+        route_profile: 'short_image_guided',
+        transition_mode: 'strict_continuation',
+        continuous_take_id: 'take-1',
+        cut_in: '沿用上一镜最终画面',
+        cut_out: '角色完成抬手动作',
+        boundary_prompt: '第一帧严格使用上一镜末帧',
+        action: '角色继续抬手',
+        visual: '同一机位近景',
+        video_prompt: '从上一镜末帧继续动作',
+      },
+    });
+    const service = createProductionService(db, {}, log, {});
+    const approved = await service.reviewArtifact(shot.id, {
+      reviewer_type: 'human', decision: 'approved', reason: '用户确认严格续拍',
+    });
+    assert.equal(approved.artifact.status, 'approved');
+  });
+
+  it('generates a screenplay once and waits for human review without mutating approval', async () => {
+    const run = createRun('human');
+    repo.transitionRun(db, run.id, { next_stage_strategy: 'auto_generate' });
+    const calls = [];
+    const service = createProductionService(db, {}, log, {
+      generateText: scriptedAdapter([
+        '# 星尘花园\n\n## 人物\n林夏：年轻宇航员。\n\n## 第一场\n林夏走进温室，发现星尘像雪一样漂浮。她伸手接住一颗发光种子，却听见远处传来低沉警报。她必须在氧气耗尽前把种子带回基地。',
+      ], calls),
+    });
+    const first = await service.advance(run.id, { lease_owner: 'test' });
+    assert.equal(first.state, 'waiting_review');
+    const script = repo.listArtifacts(db, run.id, { stage: 'script', current: true }).items[0];
+    assert.equal(script.status, 'draft');
+    assert.match(script.content.text, /低沉警报/);
+    assert.equal(calls[0].options.silence_timeout_ms, 180000);
+    const second = await service.advance(run.id, { lease_owner: 'test' });
+    assert.equal(second.state, 'waiting_review');
+    assert.equal(calls.length, 1);
+  });
+
+  it('uses straight-through review on valid text while preserving deterministic gates', async () => {
+    const run = createRun('auto_accept');
+    repo.transitionRun(db, run.id, { next_stage_strategy: 'auto_generate' });
+    const calls = [];
+    const service = createProductionService(db, {}, log, {
+      generateText: scriptedAdapter([
+        '# 星尘花园\n\n## 人物\n林夏：宇航员。\n\n## 第一场\n警报响起，林夏穿过透明温室。她在漂浮的花粉中找到发光种子，并把它装进密封容器。温室灯光由红转绿，基地重新获得能源。',
+        JSON.stringify({
+          characters: [{ name: '林夏', role: '主角', description: '年轻宇航员', appearance: '银白宇航服，短黑发', identity_anchors: ['短黑发', '左眉小痣'], visual_prompt: '林夏角色四视图' }],
+          scenes: [{ name: '星尘温室', location: '月面基地温室', time: '夜', description: '透明穹顶与漂浮花粉', spatial_anchors: ['中央培养台'], visual_prompt: '星尘温室四视图' }],
+          props: [{ name: '发光种子', category: '关键道具', description: '蓝白发光晶体种子', visual_prompt: '发光种子产品图' }],
+        }),
+      ], calls),
+    });
+
+    assert.equal((await service.advance(run.id, { lease_owner: 'a' })).state, 'approved');
+    assert.equal(repo.listArtifacts(db, run.id, { stage: 'script', current: true }).items[0].status, 'approved');
+    assert.equal((await service.advance(run.id, { lease_owner: 'a' })).state, 'progressed');
+    assert.equal(repo.getRun(db, run.id).current_stage, 'asset_text');
+    assert.equal((await service.advance(run.id, { lease_owner: 'a' })).state, 'approved');
+    const assets = repo.listArtifacts(db, run.id, { stage: 'asset_text', current: true }).items;
+    assert.equal(assets.length, 3);
+    assert.equal(assets.every((item) => item.status === 'approved'), true);
+    assert.equal(calls.length, 2);
+  });
+
+  it('approves low-confidence work when the AI found no blocking issue', async () => {
+    const run = createRun('ai');
+    repo.transitionRun(db, run.id, { next_stage_strategy: 'auto_generate' });
+    const calls = [];
+    const service = createProductionService(db, {}, log, {
+      generateText: scriptedAdapter([
+        '# 星尘花园\n\n## 人物\n林夏：宇航员。\n\n## 第一场\n林夏进入月面温室寻找种子。警报倒计时开始，她穿过漂浮花粉，找到发光种子并放入容器，最终恢复基地能源供应。',
+        JSON.stringify({
+          decision: 'needs_human', reason: '审美仍有不确定性', confidence: 0.2,
+          severity: 'minor', blocking_issues: [], improvement_notes: ['对白还可以更精炼'],
+          requires_human_authority: false, scores: { clarity: 60 },
+        }),
+      ], calls),
+    });
+    const result = await service.advance(run.id, { lease_owner: 'review-test' });
+    assert.equal(result.state, 'approved');
+    assert.equal(repo.getRun(db, run.id).status, 'running');
+    const script = repo.listArtifacts(db, run.id, { stage: 'script', current: true }).items[0];
+    assert.equal(script.status, 'approved');
+    assert.equal(script.revision, 1);
+    assert.equal(repo.getRun(db, run.id).runtime.autonomy.objects['script:run:'], undefined);
+    assert.equal(calls.length, 2);
+  });
+
+  it('escalates only after the same AI-reviewed object reaches its configured consecutive limit', async () => {
+    let run = createRun('ai');
+    run = repo.updateRun(db, run.id, { budget: { ...run.budget, max_text_revisions: 2 } });
+    repo.transitionRun(db, run.id, { next_stage_strategy: 'auto_generate' });
+    const calls = [];
+    const service = createProductionService(db, {}, log, {
+      generateText: scriptedAdapter([
+        '# 星尘花园\n\n第一场：月面基地警报响起，林夏穿过透明温室，在漂浮花粉和失灵机械臂之间寻找最后一颗发光种子。她听见氧气倒计时，却缺少明确路线，只能沿中央培养台继续前进。远处舱门开始关闭，她必须在基地能源耗尽前做出选择。',
+        JSON.stringify({
+          decision: 'rejected', reason: '动作链不够明确', confidence: 0.9,
+          severity: 'major', blocking_issues: ['缺少绕过机械臂的可执行动作'],
+          requires_human_authority: false, scores: { clarity: 40 },
+        }),
+        JSON.stringify({ text: '第一场：林夏沿中央平台寻找发光种子。警报持续倒计时，失灵机械臂封住两侧通道，她尝试从平台下方绕行，却仍没有明确解决机械臂的方法。舱门正在关闭，她必须尽快把种子送进密封容器并恢复基地供能。', title: '星尘花园', required_fields: ['text'] }),
+        JSON.stringify({
+          decision: 'rejected', reason: '仍然缺少可执行阻力', confidence: 0.95,
+          severity: 'major', blocking_issues: ['没有说明如何解决机械臂封锁'],
+          requires_human_authority: false, scores: { clarity: 35 },
+        }),
+      ], calls),
+    });
+
+    assert.equal((await service.advance(run.id, { lease_owner: 'limit-test' })).state, 'progressed');
+    const stopped = await service.advance(run.id, { lease_owner: 'limit-test' });
+    assert.equal(stopped.state, 'waiting_review');
+    assert.equal(stopped.reason, 'automation_limit_reached');
+    const saved = repo.getRun(db, run.id);
+    assert.equal(saved.runtime.autonomy.intervention.object_key, 'script:run:');
+    assert.equal(saved.runtime.autonomy.objects['script:run:'].consecutive_review_failures, 2);
+    assert.equal(calls.length, 4);
+
+    const blockedScript = repo.listArtifacts(db, run.id, { stage: 'script', current: true }).items[0];
+    repo.updateRun(db, run.id, { review_owner: 'human' });
+    await service.reviewArtifact(blockedScript.id, {
+      reviewer_type: 'human', decision: 'approved', reason: '人工检查后确认当前修订可用',
+    });
+    const resolved = repo.getRun(db, run.id);
+    assert.equal(resolved.runtime.autonomy.intervention, undefined);
+    assert.equal(resolved.runtime.autonomy.objects['script:run:'], undefined);
+    assert.equal(resolved.status, 'running');
+  });
+
+  it('stops immediately only when the review truly requires human authority', async () => {
+    const run = createRun('ai');
+    repo.transitionRun(db, run.id, { next_stage_strategy: 'auto_generate' });
+    const calls = [];
+    const service = createProductionService(db, {}, log, {
+      generateText: scriptedAdapter([
+        '# 星尘花园\n\n## 人物\n林夏：年轻宇航员，负责月面温室的能源维护。\n\n## 第一场\n林夏进入透明穹顶温室，沿中央培养台避开失灵机械臂，找到最后一颗发光种子。她把种子放入密封能源舱，警报解除，穹顶灯光由红转绿。制作方随后要求启动超出当前金额上限的额外高价渲染流程。',
+        JSON.stringify({
+          decision: 'needs_human', reason: '需要用户授权提高任务金额上限', confidence: 0.98,
+          severity: 'critical', blocking_issues: ['当前金额上限不足'],
+          improvement_notes: [], requires_human_authority: true, scores: { clarity: 95 },
+        }),
+      ], calls),
+    });
+
+    const stopped = await service.advance(run.id, { lease_owner: 'authority-test' });
+    assert.equal(stopped.state, 'waiting_review');
+    assert.equal(stopped.reason, 'human_authority_required');
+    const saved = repo.getRun(db, run.id);
+    assert.equal(saved.runtime.autonomy.intervention.reason, 'human_authority_required');
+    assert.match(saved.runtime.autonomy.intervention.summary.reason, /授权提高任务金额上限/);
+    assert.equal(repo.listArtifacts(db, run.id, { stage: 'script', current: true }).items[0].revision, 1);
+    assert.equal(calls.length, 2);
+  });
+
+  it('clears a legacy source-change intervention instead of surfacing a stale 3/3 gate', async () => {
+    const run = createRun('auto_accept');
+    repo.transitionRun(db, run.id, { next_stage_strategy: 'auto_generate' });
+    const key = 'script:run:';
+    const runtime = {
+      ...(run.runtime || {}),
+      autonomy: {
+        objects: {
+          [key]: {
+            stage: 'script', scope_type: 'run', scope_id: '',
+            consecutive_generation_failures: 3, escalated: true,
+            attempts: [
+              { error_code: 'SOURCE_CHANGED_WHILE_ACTION_ACTIVE', reason: 'source_changed_while_action_active' },
+              { error_code: 'SOURCE_CHANGED_WHILE_ACTION_ACTIVE', reason: 'source_changed_while_action_active' },
+              { error_code: 'SOURCE_CHANGED_WHILE_ACTION_ACTIVE', reason: 'source_changed_while_action_active' },
+            ],
+          },
+        },
+        intervention: {
+          object_key: key, stage: 'script', scope_type: 'run', scope_id: '',
+          reason: 'automation_limit_reached', summary: { reason: '同一对象已连续达到自动处理上限' },
+        },
+      },
+    };
+    repo.updateRun(db, run.id, {
+      runtime,
+      status: 'waiting_review', waiting_reason: 'automation_limit_reached',
+      error_code: 'AUTOMATION_LIMIT_REACHED', error_message: '同一对象已连续达到自动处理上限',
+    });
+    const service = createProductionService(db, {}, log, {
+      generateText: scriptedAdapter([
+        '# 自愈测试\n\n## 人物\n林夏：负责月面温室能源维护的宇航员，冷静、谨慎，始终携带一枚密封能源容器。\n\n## 场景\n月面基地温室：透明穹顶、中央培养台、红色警报灯和一扇通往基地的气密门。\n\n## 第一场\n红色警报灯亮起，林夏进入温室，沿中央培养台寻找最后一颗发光种子。她避开失灵的机械臂，把种子放入密封能源容器，再返回气密门。警报灯由红转绿，基地恢复供能。',
+      ], []),
+    });
+    const result = await service.advance(run.id, { lease_owner: 'legacy-gate-test' });
+    assert.notEqual(result.reason, 'automation_limit_reached');
+    const saved = repo.getRun(db, run.id);
+    assert.equal(saved.runtime.autonomy.intervention, undefined);
+    assert.equal(saved.runtime.autonomy.objects[key], undefined);
+    assert.equal(db.prepare("SELECT COUNT(*) AS n FROM production_events WHERE run_id = ? AND event_type = 'automation.legacy_convergence_intervention_cleared'").get(run.id).n, 1);
+  });
+
+  it('rewrites an AI-rejected text artifact once and reviews the new revision', async () => {
+    const run = createRun('ai');
+    repo.transitionRun(db, run.id, { next_stage_strategy: 'auto_generate' });
+    const calls = [];
+    const revisedText = '第一场：林夏进入月面温室，确认氧气倒计时。她沿着中央培养台找到发光种子，放入密封舱，恢复基地供能。';
+    const service = createProductionService(db, {}, log, {
+      generateText: scriptedAdapter([
+        '# 星尘花园\n\n第一场：月面基地警报响起，林夏穿过透明温室，在漂浮花粉和失灵机械臂之间寻找最后一颗发光种子。她听见氧气倒计时，却缺少明确路线，只能沿中央培养台继续前进。远处舱门开始关闭，她必须在基地能源耗尽前做出选择。',
+        JSON.stringify({ decision: 'rejected', reason: '缺少明确阻力和可执行动作', confidence: 0.92, scores: { clarity: 45 } }),
+        JSON.stringify({ text: revisedText, title: '星尘花园', required_fields: ['text'] }),
+        JSON.stringify({ decision: 'approved', reason: '动作与阻力明确', confidence: 0.91, scores: { clarity: 90 } }),
+      ], calls),
+    });
+
+    const revised = await service.advance(run.id, { lease_owner: 'rewrite-test' });
+    assert.equal(revised.state, 'progressed');
+    let script = repo.listArtifacts(db, run.id, { stage: 'script', current: true }).items[0];
+    assert.equal(script.revision, 2);
+    assert.equal(script.status, 'draft');
+    assert.equal(script.content.text, revisedText);
+    const approved = await service.advance(run.id, { lease_owner: 'rewrite-test' });
+    assert.equal(approved.state, 'progressed');
+    assert.equal(repo.getRun(db, run.id).current_stage, 'asset_text');
+    script = repo.listArtifacts(db, run.id, { stage: 'script', current: true }).items[0];
+    assert.equal(script.status, 'approved');
+    assert.equal(repo.listActions(db, run.id, { page_size: 200 }).items.filter((item) => item.kind === 'ai_rewrite').length, 1);
+    assert.equal(calls.length, 4);
+  });
+
+  it('routes image and video reviews through vision and persists their evidence receipts', async () => {
+    let run = createRun('ai');
+    run = repo.updateRun(db, run.id, {
+      current_stage: 'asset_images',
+      status: 'running',
+      review_profile: { model: 'vision-review-model', version: 'vision-v1' },
+    });
+    const image = repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'asset_images',
+      scope_type: 'character',
+      scope_id: 'character-vision',
+      title: '林夏角色设定图',
+      content: { included: true },
+      status: 'draft',
+      media_path: 'images/linxia.png',
+      mime_type: 'image/png',
+      content_hash: 'image-hash',
+    });
+    const video = repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'shot_video',
+      scope_type: 'shot',
+      scope_id: 'shot-vision',
+      title: '镜头首中尾检查',
+      content: { included: true, validation: { duration: 5 } },
+      status: 'draft',
+      media_path: 'videos/shot.mp4',
+      mime_type: 'video/mp4',
+      content_hash: 'video-hash',
+    });
+    const visualCalls = [];
+    const cleaned = [];
+    const service = createProductionService(db, {}, log, {
+      validateImage: async () => ({ relative_path: 'images/linxia.png', width: 1536, height: 1024, nonblank: true }),
+      validateVideo: async () => ({ relative_path: 'videos/shot.mp4', duration: 5, video_codec: 'h264', audio_codec: 'aac' }),
+      prepareReviewEvidence: async (artifact) => ({
+        imageSource: { localAbsPath: artifact.stage === 'asset_images' ? 'C:\\review\\image.png' : 'C:\\review\\sheet.jpg' },
+        receipt: artifact.stage === 'asset_images'
+          ? { kind: 'source_image', media_sha256: 'image-hash', relative_path: 'images/linxia.png' }
+          : { kind: 'video_first_middle_last_sheet', media_sha256: 'video-hash', relative_path: 'videos/shot.mp4', sampled_at_seconds: [0.4, 2.5, 4.6] },
+        cleanup: () => cleaned.push(artifact.id),
+      }),
+      generateTextWithVision: async (user, system, imageSource, options) => {
+        visualCalls.push({ user, system, imageSource, options });
+        return JSON.stringify({ decision: 'approved', reason: '画面符合当前对象约束', confidence: 0.94, scores: { clarity: 92, continuity: 91 } });
+      },
+    });
+
+    assert.equal((await service.applyReviewPolicy(run, [image])).state, 'approved');
+    assert.equal((await service.applyReviewPolicy(repo.getRun(db, run.id), [video])).state, 'approved');
+    assert.equal(visualCalls.length, 2);
+    assert.match(visualCalls[0].user, /当前待审原图/);
+    assert.match(visualCalls[1].user, /首段、中段、尾段/);
+    assert.equal(visualCalls.every((call) => call.options.model === 'vision-review-model'), true);
+    assert.deepEqual(cleaned, [image.id, video.id]);
+    const imageAction = repo.getLatestAction(db, run.id, {
+      stage: 'asset_images', scope_type: 'character', scope_id: 'character-vision', kind: 'ai_review',
+    });
+    const videoAction = repo.getLatestAction(db, run.id, {
+      stage: 'shot_video', scope_type: 'shot', scope_id: 'shot-vision', kind: 'ai_review',
+    });
+    assert.equal(imageAction.result.visual_evidence.kind, 'source_image');
+    assert.deepEqual(videoAction.result.visual_evidence.sampled_at_seconds, [0.4, 2.5, 4.6]);
+  });
+
+  it('bounds independent asset reviews and persists actions and decisions in source order', async () => {
+    let run = createRun('ai');
+    run = repo.updateRun(db, run.id, {
+      current_stage: 'asset_text', status: 'running',
+      review_profile: { model: 'review-model', version: 'review-v2' },
+    });
+    automationPreferences.set(db, { review_concurrency: 2 });
+    const assets = Array.from({ length: 5 }, (_, index) => repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'asset_text',
+      scope_type: 'character',
+      scope_id: `asset-${index + 1}`,
+      title: `Asset ${index + 1}`,
+      content: { included: true, description: `Character ${index + 1}` },
+      status: 'draft',
+    }));
+    let active = 0;
+    let maximum = 0;
+    const completed = [];
+    const service = createProductionService(db, {}, log, {
+      generateText: async (user) => {
+        const number = Number(user.match(/Asset (\d+)/)?.[1] || 0);
+        active += 1;
+        maximum = Math.max(maximum, active);
+        await new Promise((resolve) => setTimeout(resolve, number % 2 ? 24 : 4));
+        completed.push(number);
+        active -= 1;
+        return JSON.stringify({
+          decision: 'approved', reason: `Asset ${number} can proceed`, confidence: 0.9,
+          severity: 'minor', blocking_issues: [], improvement_notes: [],
+          requires_human_authority: false, scores: { production_ready: 90 },
+        });
+      },
+    });
+
+    const result = await service.applyReviewPolicy(run, assets);
+    assert.equal(result.state, 'approved');
+    assert.equal(maximum, 2);
+    assert.notDeepEqual(completed, [1, 2, 3, 4, 5]);
+    const actions = repo.listActions(db, run.id, { page_size: 50 }).items
+      .filter((item) => item.kind === 'ai_review' && item.stage === 'asset_text')
+      .sort((left, right) => left.id - right.id);
+    assert.deepEqual(actions.map((item) => item.request.artifact_id), assets.map((item) => item.id));
+    const assetIds = new Set(assets.map((item) => item.id));
+    const reviews = repo.listReviews(db, run.id, { page_size: 50 }).items
+      .filter((item) => assetIds.has(item.artifact_id))
+      .sort((left, right) => left.id - right.id);
+    assert.deepEqual(reviews.map((item) => item.artifact_id), assets.map((item) => item.id));
+    assert.equal(assets.every((item) => repo.getArtifact(db, item.id).status === 'approved'), true);
+  });
+
+  it('keeps successful asset reviews when one evidence preparation fails', async () => {
+    let run = createRun('ai');
+    run = repo.updateRun(db, run.id, {
+      current_stage: 'asset_images', status: 'running',
+      review_profile: { model: 'vision-review-model', version: 'review-v2' },
+    });
+    automationPreferences.set(db, { review_concurrency: 3 });
+    const assets = Array.from({ length: 3 }, (_, index) => repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'asset_images',
+      scope_type: 'character',
+      scope_id: `image-${index + 1}`,
+      title: `Image ${index + 1}`,
+      content: { included: true },
+      status: 'draft',
+      media_path: `images/image-${index + 1}.png`,
+      mime_type: 'image/png',
+      content_hash: `hash-${index + 1}`,
+    }));
+    const reviewed = [];
+    const cleaned = [];
+    const service = createProductionService(db, {}, log, {
+      validateImage: async () => ({ width: 1024, height: 1024, nonblank: true }),
+      prepareReviewEvidence: async (artifact) => {
+        if (artifact.id === assets[1].id) {
+          const error = new Error('temporary evidence extraction failure');
+          error.code = 'REVIEW_EVIDENCE_FAILED';
+          throw error;
+        }
+        return {
+          imageSource: { localAbsPath: `C:\\review\\${artifact.id}.png` },
+          receipt: { kind: 'source_image', media_sha256: artifact.content_hash, relative_path: artifact.media_path },
+          cleanup: () => cleaned.push(artifact.id),
+        };
+      },
+      generateTextWithVision: async (user) => {
+        const number = Number(user.match(/Image (\d+)/)?.[1] || 0);
+        reviewed.push(number);
+        return JSON.stringify({
+          decision: 'approved', reason: 'visual asset can proceed', confidence: 0.92,
+          severity: 'minor', blocking_issues: [], improvement_notes: [],
+          requires_human_authority: false, scores: { production_ready: 92 },
+        });
+      },
+      generateText: async (_user, _system, options) => {
+        assert.equal(options.scene_key, 'production_automation_diagnosis');
+        return JSON.stringify({
+          action: 'retry_same_model', root_cause: 'temporary local evidence extraction failure',
+          correction: 'retry evidence extraction for this asset', model_requirements: '',
+        });
+      },
+    });
+
+    const result = await service.applyReviewPolicy(run, assets);
+    assert.equal(result.state, 'progressed');
+    assert.deepEqual(reviewed.sort(), [1, 3]);
+    assert.deepEqual(cleaned.sort((a, b) => a - b), [assets[0].id, assets[2].id]);
+    assert.equal(repo.getArtifact(db, assets[0].id).status, 'approved');
+    assert.equal(repo.getArtifact(db, assets[1].id).status, 'draft');
+    assert.equal(repo.getArtifact(db, assets[2].id).status, 'approved');
+    const actions = repo.listActions(db, run.id, { page_size: 50 }).items;
+    assert.equal(actions.filter((item) => item.kind === 'ai_review' && item.status === 'completed').length, 2);
+  });
+
+  it('keeps storyboard and shot-video reviews serial even when review concurrency is higher', async () => {
+    let run = createRun('ai');
+    run = repo.updateRun(db, run.id, {
+      current_stage: 'storyboard_plan', status: 'running',
+      review_profile: { model: 'review-model', version: 'review-v2' },
+    });
+    automationPreferences.set(db, { review_concurrency: 8 });
+    const shots = [1, 2, 3].map((number) => repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'storyboard_plan',
+      scope_type: 'shot',
+      scope_id: String(number),
+      title: `Shot ${number}`,
+      content: {
+        included: true, number, duration: 5,
+        route_profile: 'long_previs_guided', transition_mode: number === 1 ? 'opening' : 'hard_cut',
+        cut_motivation: number === 1 ? '' : 'new camera angle',
+        cut_in: `shot ${number} entry`, cut_out: `shot ${number} exit`, boundary_prompt: `shot ${number} boundary`,
+      },
+      status: 'draft',
+    }));
+    let activeText = 0;
+    let maximumText = 0;
+    const service = createProductionService(db, {}, log, {
+      generateText: async () => {
+        activeText += 1;
+        maximumText = Math.max(maximumText, activeText);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        activeText -= 1;
+        return JSON.stringify({
+          decision: 'approved', reason: 'shot can proceed', confidence: 0.9,
+          severity: 'minor', blocking_issues: [], improvement_notes: [],
+          requires_human_authority: false, scores: { production_ready: 90 },
+        });
+      },
+    });
+    assert.equal((await service.applyReviewPolicy(run, shots)).state, 'approved');
+    assert.equal(maximumText, 1);
+
+    run = repo.updateRun(db, run.id, { current_stage: 'shot_video', status: 'running' });
+    const videos = [1, 2, 3].map((number) => repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'shot_video',
+      scope_type: 'shot',
+      scope_id: String(number),
+      title: `Video ${number}`,
+      content: { included: true, validation: { duration: 5 } },
+      status: 'draft',
+      media_path: `videos/video-${number}.mp4`,
+      mime_type: 'video/mp4',
+      content_hash: `video-hash-${number}`,
+    }));
+    let activeVision = 0;
+    let maximumVision = 0;
+    const videoService = createProductionService(db, {}, log, {
+      validateVideo: async () => ({ duration: 5, video_codec: 'h264', audio_codec: 'aac' }),
+      prepareReviewEvidence: async (artifact) => ({
+        imageSource: { localAbsPath: `C:\\review\\${artifact.id}.jpg` },
+        receipt: { kind: 'video_first_middle_last_sheet', sampled_at_seconds: [0.5, 2.5, 4.5] },
+      }),
+      generateTextWithVision: async () => {
+        activeVision += 1;
+        maximumVision = Math.max(maximumVision, activeVision);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        activeVision -= 1;
+        return JSON.stringify({
+          decision: 'approved', reason: 'video can proceed', confidence: 0.9,
+          severity: 'minor', blocking_issues: [], improvement_notes: [],
+          requires_human_authority: false, scores: { production_ready: 90 },
+        });
+      },
+    });
+    assert.equal((await videoService.applyReviewPolicy(run, videos)).state, 'approved');
+    assert.equal(maximumVision, 1);
+  });
+
+  it('diagnoses a definite generation failure and authorizes one bounded retry', async () => {
+    let run = createRun('ai');
+    run = repo.updateRun(db, run.id, {
+      current_stage: 'asset_images', current_scope_type: 'character', current_scope_id: 'character-1',
+      status: 'failed', waiting_reason: 'image_generation_failed',
+      error_code: 'IMAGE_GENERATION_FAILED', error_message: 'temporary provider outage',
+    });
+    const failed = repo.reserveAction(db, {
+      run_id: run.id, action_key: 'auto-image-failure', stage: 'asset_images',
+      scope_type: 'character', scope_id: 'character-1', kind: 'image_generate', attempt: 1,
+      request: { model: 'image-model-a' },
+    }).action;
+    repo.updateAction(db, failed.id, {
+      status: 'failed', error_code: 'IMAGE_GENERATION_FAILED', error_message: 'temporary provider outage',
+    });
+    const diagnosisCalls = [];
+    const service = createProductionService(db, {}, log, {
+      generateText: async (user, system, options) => {
+        diagnosisCalls.push({ user, system, options });
+        return JSON.stringify({
+          action: 'revise_prompt',
+          root_cause: '上游短时失败，同时提示词包含不稳定修饰',
+          correction: '保留角色锚点，缩短环境修饰后重试一次',
+          model_requirements: '保持当前图片能力',
+        });
+      },
+    });
+
+    const recovered = await service.advance(run.id, { lease_owner: 'auto-image-recovery' });
+    assert.equal(recovered.state, 'progressed');
+    assert.equal(recovered.reason, 'automatic_recovery_scheduled');
+    assert.equal(diagnosisCalls.length, 1);
+    const action = repo.getAction(db, failed.id);
+    assert.equal(action.status, 'cancelled');
+    assert.equal(action.result.retry_authorized, true);
+    assert.equal(action.result.retry_authorized_by, 'production_autonomy');
+    assert.match(action.result.retry_reason, /缩短环境修饰/);
+    assert.equal(repo.getRun(db, run.id).status, 'running');
+    assert.equal(repo.getRun(db, run.id).runtime.autonomy.objects['asset_images:character:character-1'].consecutive_generation_failures, 1);
+  });
+
+  it('stops an ambiguous external creation result without diagnosis or resubmission', async () => {
+    let run = createRun('auto_accept');
+    run = repo.updateRun(db, run.id, {
+      current_stage: 'shot_video', current_scope_type: 'shot', current_scope_id: '1',
+      status: 'failed', waiting_reason: 'ambiguous_video_create',
+      error_code: 'VIDEO_CREATE_AMBIGUOUS', error_message: 'provider result unknown',
+    });
+    const ambiguous = repo.reserveAction(db, {
+      run_id: run.id, action_key: 'auto-video-ambiguous', stage: 'shot_video',
+      scope_type: 'shot', scope_id: '1', kind: 'video_generate', attempt: 1,
+      request: { model: 'video-model-a' },
+    }).action;
+    repo.updateAction(db, ambiguous.id, {
+      status: 'ambiguous', error_code: 'VIDEO_CREATE_AMBIGUOUS', error_message: 'provider result unknown',
+    });
+    let diagnosisCalls = 0;
+    const service = createProductionService(db, {}, log, {
+      generateText: async () => { diagnosisCalls += 1; return '{}'; },
+    });
+
+    const stopped = await service.advance(run.id, { lease_owner: 'ambiguous-stop' });
+    assert.equal(stopped.state, 'waiting_review');
+    assert.equal(stopped.reason, 'ambiguous_external_task');
+    assert.equal(diagnosisCalls, 0);
+    assert.equal(repo.getAction(db, ambiguous.id).status, 'ambiguous');
+    assert.equal(repo.getRun(db, run.id).runtime.autonomy.intervention.reason, 'ambiguous_external_task');
+
+    const reconciled = service.authorizeRetry(run.id, {
+      action_id: ambiguous.id,
+      reason: '已等待并核对上游，确认没有任务号、媒体文件或扣费记录',
+      ambiguous_resolution: 'no_result_after_wait',
+    });
+    assert.equal(reconciled.action.status, 'cancelled');
+    assert.equal(reconciled.summary.run.runtime.autonomy.intervention, undefined);
+    assert.equal(reconciled.summary.run.runtime.autonomy.objects['shot_video:shot:1'], undefined);
+  });
+
+  it('switches to a compatible ordinary video model after a definite provider failure', async () => {
+    let run = createRun('ai');
+    run = repo.updateRun(db, run.id, {
+      policy: {
+        ...run.policy,
+        video_routing_mode: 'fixed',
+        video_model: 'cc-seedance2.0 480p-fast-nsp',
+        video_group: '特价视频分组(即梦)',
+        video_quality: 'balanced',
+        director_mode: 'off',
+        allow_auto_model_switch: true,
+      },
+      current_stage: 'shot_video', current_scope_type: 'shot', current_scope_id: '1',
+      status: 'failed', waiting_reason: 'video_generation_failed',
+      error_code: 'VIDEO_GENERATION_FAILED', error_message: 'temporary provider outage',
+    });
+    const shot = repo.createArtifact(db, {
+      run_id: run.id, stage: 'storyboard_plan', scope_type: 'shot', scope_id: '1', title: '镜头 1',
+      content: {
+        included: true, number: 1, duration: 5, route_profile: 'short_image_guided', previs_mode: 'skip',
+        transition_mode: 'opening', cut_in: '建立开场', cut_out: '动作结束', boundary_prompt: '独立开场镜头',
+        action: '林夏抬头看向温室灯光', visual: '稳定中近景', video_prompt: '五秒稳定中近景，动作结束后保持',
+      },
+      status: 'approved',
+    });
+    const storyboard = repo.createArtifact(db, {
+      run_id: run.id, stage: 'storyboard_images', scope_type: 'shot', scope_id: '1', title: '镜头 1 分镜图',
+      content: { included: true, source_artifact_id: shot.id }, status: 'approved',
+      media_path: 'images/shot-1.png', mime_type: 'image/png', depends_on: [shot.id],
+    });
+    const failed = repo.reserveAction(db, {
+      run_id: run.id, action_key: 'auto-video-failure', stage: 'shot_video',
+      scope_type: 'shot', scope_id: '1', kind: 'video_generate', attempt: 1,
+      request: { model: 'cc-seedance2.0 480p-fast-nsp' },
+    }).action;
+    repo.updateAction(db, failed.id, {
+      status: 'failed', error_code: 'VIDEO_GENERATION_FAILED', error_message: 'temporary provider outage',
+    });
+    const catalog = {
+      pricing_version: 'automatic-switch-fixture',
+      fetched_at: '2026-08-12T00:00:00.000Z',
+      video: ['cc-seedance2.0 480p-fast-nsp', 'cc-seedance2.0 480p-nsp'].map((model, index) => ({
+        model,
+        endpoint_types: ['openai-video'],
+        groups: ['特价视频分组(即梦)'],
+        prices: [{ group: '特价视频分组(即梦)', billing_unit: 'per_second', effective_price: index ? 0.5148 : 0.4656 }],
+      })),
+    };
+    const service = createProductionService(db, {}, log, {
+      generateText: async () => JSON.stringify({
+        action: 'switch_model', root_cause: '当前模型临时不可用',
+        correction: '切换到同组普通兼容模型后重试', model_requirements: '5 秒，图片参考',
+      }),
+      media: { fetchVideoCatalog: async () => catalog },
+    });
+
+    const switched = await service.advance(run.id, { lease_owner: 'auto-model-switch' });
+    assert.equal(switched.state, 'progressed');
+    assert.equal(switched.reason, 'automatic_model_switched');
+    assert.equal(switched.effects.paid_submission, false);
+    assert.equal(repo.getAction(db, failed.id).status, 'cancelled');
+    const saved = repo.getRun(db, run.id);
+    assert.equal(saved.policy.video_model_overrides['1'], 'cc-seedance2.0 480p-nsp');
+    assert.equal(saved.current_stage, 'reference_bundle');
+    const bundle = repo.listArtifacts(db, run.id, { stage: 'reference_bundle', current: true }).items[0];
+    assert.equal(bundle.content.routing_receipt.model, 'cc-seedance2.0 480p-nsp');
+    assert.equal(bundle.content.images[0].artifact_id, storyboard.id);
+  });
+
+  it('uses the user-authorized moderation fallback even when diagnosis asks to stop', async () => {
+    let run = createRun('ai');
+    run = repo.updateRun(db, run.id, {
+      policy: {
+        ...run.policy,
+        video_routing_mode: 'fixed',
+        video_model: 'cc-seedance2.0 480p-fast-nsp',
+        video_group: '特价视频分组(即梦)',
+        video_quality: 'balanced',
+        director_mode: 'off',
+        allow_auto_model_switch: true,
+      },
+      current_stage: 'shot_video', current_scope_type: 'shot', current_scope_id: '1',
+      status: 'failed', waiting_reason: 'video_generation_failed',
+      error_code: 'VIDEO_GENERATION_FAILED', error_message: '400 content moderation rejected by safety policy',
+    });
+    automationPreferences.set(db, {
+      moderation_fallback_enabled: true,
+      moderation_fallback_model: '破甲seedance 720p-fast',
+    });
+    const shot = repo.createArtifact(db, {
+      run_id: run.id, stage: 'storyboard_plan', scope_type: 'shot', scope_id: '1', title: '镜头 1',
+      content: {
+        included: true, number: 1, duration: 5, route_profile: 'short_image_guided', previs_mode: 'skip',
+        transition_mode: 'opening', cut_in: '建立开场', cut_out: '动作结束', boundary_prompt: '独立开场镜头',
+        action: '林夏抬头看向温室灯光', visual: '稳定中近景', video_prompt: '五秒稳定中近景，动作结束后保持',
+      },
+      status: 'approved',
+    });
+    const storyboard = repo.createArtifact(db, {
+      run_id: run.id, stage: 'storyboard_images', scope_type: 'shot', scope_id: '1', title: '镜头 1 分镜图',
+      content: { included: true, source_artifact_id: shot.id }, status: 'approved',
+      media_path: 'images/shot-1.png', mime_type: 'image/png', depends_on: [shot.id],
+    });
+    const failed = repo.reserveAction(db, {
+      run_id: run.id, action_key: 'moderation-video-failure', stage: 'shot_video',
+      scope_type: 'shot', scope_id: '1', kind: 'video_generate', attempt: 1,
+      request: { model: 'cc-seedance2.0 480p-fast-nsp' },
+    }).action;
+    repo.updateAction(db, failed.id, {
+      status: 'failed', error_code: 'VIDEO_GENERATION_FAILED',
+      error_message: '400 content moderation rejected by safety policy',
+    });
+    const catalog = {
+      pricing_version: 'moderation-fallback-fixture', fetched_at: '2026-08-13T00:00:00.000Z',
+      video: [
+        ['cc-seedance2.0 480p-fast-nsp', 0.4656],
+        ['破甲seedance 720p-fast', 2.1528],
+      ].map(([model, effectivePrice]) => ({
+        model, endpoint_types: ['openai-video'], groups: ['特价视频分组(即梦)'],
+        prices: [{ group: '特价视频分组(即梦)', billing_unit: 'per_second', effective_price: effectivePrice }],
+      })),
+    };
+    const service = createProductionService(db, {}, log, {
+      generateText: async () => JSON.stringify({
+        action: 'stop', root_cause: '当前内容被普通模型安全策略拦截',
+        correction: '保留剧情语义并改用已授权的内容审核兜底模型', model_requirements: '5 秒，图片参考',
+      }),
+      media: { fetchVideoCatalog: async () => catalog },
+    });
+
+    const switched = await service.advance(run.id, { lease_owner: 'moderation-fallback' });
+    assert.equal(switched.state, 'progressed');
+    assert.equal(switched.reason, 'automatic_moderation_fallback_switched');
+    assert.equal(switched.effects.paid_submission, false);
+    assert.equal(switched.switch_receipt.trigger_category, 'content_moderation_failure');
+    assert.equal(switched.switch_receipt.designated_fallback_used, true);
+    assert.equal(switched.switch_receipt.expensive_model_authorized, true);
+    const savedAction = repo.getAction(db, failed.id);
+    assert.equal(savedAction.status, 'cancelled');
+    assert.equal(savedAction.result.automatic_diagnosis.requested_action, 'stop');
+    assert.equal(savedAction.result.automatic_diagnosis.stop_deferred_until_limit, true);
+    assert.equal(savedAction.result.automatic_model_switch.selected_model, '破甲seedance 720p-fast');
+    const saved = repo.getRun(db, run.id);
+    assert.equal(saved.policy.video_model_overrides['1'], '破甲seedance 720p-fast');
+    const bundle = repo.listArtifacts(db, run.id, { stage: 'reference_bundle', current: true }).items[0];
+    assert.equal(bundle.content.routing_receipt.model, '破甲seedance 720p-fast');
+    assert.equal(bundle.content.images[0].artifact_id, storyboard.id);
+  });
+
+  it('keeps moderation fallback off by default and chooses an ordinary compatible model', async () => {
+    let run = createRun('ai');
+    run = repo.updateRun(db, run.id, {
+      policy: {
+        ...run.policy,
+        video_routing_mode: 'fixed', video_model: 'cc-seedance2.0 480p-fast-nsp',
+        video_group: '特价视频分组(即梦)', director_mode: 'off', allow_auto_model_switch: true,
+      },
+      current_stage: 'shot_video', current_scope_type: 'shot', current_scope_id: '1',
+      status: 'failed', error_code: 'VIDEO_GENERATION_FAILED', error_message: 'moderation rejected',
+    });
+    const shot = repo.createArtifact(db, {
+      run_id: run.id, stage: 'storyboard_plan', scope_type: 'shot', scope_id: '1', title: '镜头 1',
+      content: {
+        included: true, number: 1, duration: 5, route_profile: 'short_image_guided', previs_mode: 'skip',
+        transition_mode: 'opening', cut_in: '开场', cut_out: '结束', boundary_prompt: '独立镜头',
+      }, status: 'approved',
+    });
+    repo.createArtifact(db, {
+      run_id: run.id, stage: 'storyboard_images', scope_type: 'shot', scope_id: '1', title: '分镜图',
+      content: { included: true, source_artifact_id: shot.id }, status: 'approved', media_path: 'images/shot.png',
+    });
+    const failed = repo.reserveAction(db, {
+      run_id: run.id, action_key: 'moderation-default-off', stage: 'shot_video', scope_type: 'shot', scope_id: '1',
+      kind: 'video_generate', request: { model: 'cc-seedance2.0 480p-fast-nsp' },
+    }).action;
+    repo.updateAction(db, failed.id, {
+      status: 'failed', error_code: 'VIDEO_GENERATION_FAILED', error_message: 'moderation rejected',
+    });
+    const catalog = {
+      pricing_version: 'moderation-default-off', fetched_at: '2026-08-13T00:00:00.000Z',
+      video: [
+        ['cc-seedance2.0 480p-fast-nsp', 0.4656],
+        ['cc-seedance2.0 480p-nsp', 0.5148],
+        ['破甲seedance 720p-fast', 2.1528],
+      ].map(([model, effectivePrice]) => ({
+        model, endpoint_types: ['openai-video'], groups: ['特价视频分组(即梦)'],
+        prices: [{ group: '特价视频分组(即梦)', billing_unit: 'per_second', effective_price: effectivePrice }],
+      })),
+    };
+    const service = createProductionService(db, {}, log, {
+      generateText: async () => JSON.stringify({
+        action: 'stop', root_cause: 'moderation', correction: 'use another compatible model', model_requirements: '',
+      }),
+      media: { fetchVideoCatalog: async () => catalog },
+    });
+    const switched = await service.advance(run.id, { lease_owner: 'moderation-default-off' });
+    assert.equal(switched.reason, 'automatic_model_switched');
+    assert.equal(repo.getRun(db, run.id).policy.video_model_overrides['1'], 'cc-seedance2.0 480p-nsp');
+    assert.equal(repo.getAction(db, failed.id).result.automatic_model_switch.designated_fallback_used, false);
+  });
+
+  it('binds a manually uploaded resource image to its exact approved source', async () => {
+    const run = createRun('human');
+    const source = repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'asset_text',
+      scope_type: 'character',
+      scope_id: 'character-1',
+      title: '林夏',
+      content: { name: '林夏', description: '宇航员', visual_prompt: '角色四视图', included: true },
+      status: 'approved',
+    });
+    repo.updateRun(db, run.id, { current_stage: 'asset_images', status: 'waiting_review' });
+    const receipt = {
+      relative_path: 'images/linxia.png', bytes: 120000, sha256: 'a'.repeat(64),
+      width: 1536, height: 1024, format: 'png', nonblank: true,
+    };
+    const service = createProductionService(db, {}, log, {
+      validateImage: async () => receipt,
+    });
+    await assert.rejects(() => service.addManualArtifact(run.id, {
+      stage: 'asset_images', media_path: 'images/linxia.png', content: { included: true },
+    }), /上游对象/);
+    const image = await service.addManualArtifact(run.id, {
+      stage: 'asset_images', source_artifact_id: source.id,
+      title: '林夏手动四视图', media_path: 'images/linxia.png', mime_type: 'image/png',
+      content: { included: true },
+    });
+    assert.equal(image.scope_type, source.scope_type);
+    assert.equal(image.scope_id, source.scope_id);
+    assert.equal(image.content.source_artifact_id, source.id);
+    assert.equal(image.media_path, receipt.relative_path);
+    const dependency = db.prepare('SELECT * FROM production_artifact_dependencies WHERE artifact_id = ?').get(image.id);
+    assert.equal(dependency.depends_on_artifact_id, source.id);
+    const reviewed = await service.reviewArtifact(image.id, { reviewer_type: 'human', decision: 'approved', reason: '用户确认' });
+    assert.equal(reviewed.artifact.status, 'approved');
+  });
+
+  it('keeps filling asset-image slots while completed drafts wait for human review', async () => {
+    let run = createRun('human');
+    run = repo.updateRun(db, run.id, {
+      current_stage: 'asset_images',
+      status: 'running',
+      policy: { ...run.policy, image_concurrency: 2 },
+    });
+    const firstSource = repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'asset_text',
+      scope_type: 'character',
+      scope_id: 'character-1',
+      title: 'Hero',
+      content: { name: 'Hero', description: 'adult heroine', visual_prompt: 'identity sheet', included: true },
+      status: 'approved',
+    });
+    const secondSource = repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'asset_text',
+      scope_type: 'scene',
+      scope_id: 'scene-1',
+      title: 'Courtyard',
+      content: { name: 'Courtyard', description: 'empty courtyard', visual_prompt: 'scene sheet', included: true },
+      status: 'approved',
+    });
+    repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'asset_images',
+      scope_type: firstSource.scope_type,
+      scope_id: firstSource.scope_id,
+      title: firstSource.title,
+      content: { source_artifact_id: firstSource.id, included: true },
+      status: 'draft',
+      media_path: 'images/hero.png',
+      depends_on: [firstSource.id],
+    });
+    let createCalls = 0;
+    const service = createProductionService(db, {}, log, {
+      media: {
+        createImage: async () => {
+          createCalls += 1;
+          return { id: 501, task_id: 'image-task-501' };
+        },
+      },
+    });
+
+    const result = await service.advance(run.id, { lease_owner: 'parallel-draft-test' });
+    assert.equal(result.state, 'waiting_task');
+    assert.equal(createCalls, 1);
+    assert.equal(result.action.scope_id, secondSource.scope_id);
+    assert.equal(repo.getRun(db, run.id).waiting_reason, 'image_generation');
+  });
+
+  it('requires explicit feedback for failures and explicit reconciliation for ambiguity', () => {
+    const run = createRun('human');
+    repo.updateRun(db, run.id, { current_stage: 'asset_images', status: 'waiting_review' });
+    const failed = repo.reserveAction(db, {
+      run_id: run.id, action_key: 'failed-image', stage: 'asset_images',
+      scope_type: 'character', scope_id: 'character-1', kind: 'image_generate', request: {},
+    }).action;
+    repo.updateAction(db, failed.id, { status: 'failed', error_code: 'UPSTREAM_FAILED', error_message: '审核失败' });
+    const service = createProductionService(db, {}, log);
+    assert.throws(() => service.authorizeRetry(run.id, { action_id: failed.id }), /填写本次重试/);
+    const authorized = service.authorizeRetry(run.id, { action_id: failed.id, reason: '移除画面中的文字标识' });
+    assert.equal(authorized.action.status, 'cancelled');
+    assert.equal(authorized.action.result.retry_authorized, true);
+    assert.equal(repo.getRun(db, run.id).status, 'running');
+
+    const ambiguous = repo.reserveAction(db, {
+      run_id: run.id, action_key: 'ambiguous-image', stage: 'asset_images',
+      scope_type: 'scene', scope_id: 'scene-1', kind: 'image_generate', request: {},
+    }).action;
+    repo.updateAction(db, ambiguous.id, { status: 'ambiguous', error_code: 'AMBIGUOUS_ACTION' });
+    assert.throws(
+      () => service.authorizeRetry(run.id, { action_id: ambiguous.id, reason: '重试' }),
+      /必须先核对上游任务/
+    );
+    const reconciled = service.authorizeRetry(run.id, {
+      action_id: ambiguous.id,
+      reason: '等待九小时仍无上游任务号、图片地址或本地文件',
+      ambiguous_resolution: 'no_result_after_wait',
+    });
+    assert.equal(reconciled.action.status, 'cancelled');
+    assert.equal(reconciled.action.result.retry_authorized, true);
+    assert.equal(reconciled.action.result.ambiguous_reconciled, true);
+    assert.equal(reconciled.action.result.ambiguous_resolution, 'no_result_after_wait');
+    const event = db.prepare("SELECT payload_json FROM production_events WHERE run_id = ? AND event_type = 'action.ambiguous_reconciled' ORDER BY id DESC LIMIT 1").get(run.id);
+    assert.equal(JSON.parse(event.payload_json).action_id, ambiguous.id);
+  });
+
+  it('switches the current shot model locally, rebuilds its bundle, and preserves budget and failure history', async () => {
+    let run = createRun('human');
+    run = repo.updateRun(db, run.id, {
+      policy: {
+        ...run.policy,
+        video_routing_mode: 'auto',
+        video_group: '特价视频分组(即梦)',
+        video_quality: 'balanced',
+        director_mode: 'off',
+      },
+      budget: { ...run.budget, max_video_attempts_per_shot: 2 },
+      usage: { video_attempts_reserved: 7, video_seconds_reserved: 38 },
+    });
+    const shot = repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'storyboard_plan',
+      scope_type: 'shot',
+      scope_id: '5',
+      title: 'Reaction shot',
+      content: {
+        included: true,
+        number: 5,
+        duration: 5,
+        action: 'The heroine completes a restrained reaction.',
+        visual: 'Stable close-up.',
+        video_prompt: 'Complete the reaction and hold the final state.',
+        previs_mode: 'skip',
+        transition_mode: 'hard_cut',
+      },
+      status: 'approved',
+    });
+    repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'storyboard_images',
+      scope_type: 'shot',
+      scope_id: '5',
+      title: 'Reaction frame',
+      content: { included: true, source_artifact_id: shot.id },
+      status: 'approved',
+      media_path: 'images/reaction.png',
+      depends_on: [shot.id],
+    });
+    run = repo.updateRun(db, run.id, {
+      current_stage: 'reference_bundle',
+      current_scope_type: 'shot',
+      current_scope_id: '5',
+      status: 'running',
+    });
+    const catalog = {
+      pricing_version: 'routing-switch-fixture',
+      fetched_at: '2026-08-09T00:00:00.000Z',
+      video: ['cc-seedance2.0 480p-fast-nsp', 'cc-seedance2.0 480p-nsp'].map((model, index) => ({
+        model,
+        endpoint_types: ['openai-video'],
+        groups: ['特价视频分组(即梦)'],
+        prices: [{ group: '特价视频分组(即梦)', billing_unit: 'per_second', effective_price: index ? 0.5148 : 0.4656 }],
+      })),
+    };
+    const service = createProductionService(db, {}, log, {
+      media: { fetchVideoCatalog: async () => catalog },
+    });
+    const prepared = await service.advance(run.id, { lease_owner: 'route-switch-prepare' });
+    assert.equal(prepared.state, 'progressed');
+    repo.reviewArtifact(db, prepared.artifact.id, {
+      reviewer_type: 'human', decision: 'approved', reason: '旧模型参考包已确认',
+    });
+    const oldBundle = repo.getArtifact(db, prepared.artifact.id);
+    const first = repo.reserveAction(db, {
+      run_id: run.id, action_key: 'shot-5-old-attempt-1', stage: 'shot_video',
+      scope_type: 'shot', scope_id: '5', kind: 'video_generate', attempt: 1,
+      request: { model: 'cc-seedance2.0 480p-fast-nsp', bundle_artifact_id: oldBundle.id },
+    }).action;
+    repo.updateAction(db, first.id, { status: 'cancelled', result: { duration_contract_repaired: true } });
+    const failed = repo.reserveAction(db, {
+      run_id: run.id, action_key: 'shot-5-old-attempt-2', stage: 'shot_video',
+      scope_type: 'shot', scope_id: '5', kind: 'video_generate', attempt: 2,
+      request: { model: 'cc-seedance2.0 480p-fast-nsp', bundle_artifact_id: oldBundle.id },
+    }).action;
+    repo.updateAction(db, failed.id, { status: 'failed', error_code: 'UPSTREAM_UNAVAILABLE', error_message: 'temporary outage' });
+    run = repo.updateRun(db, run.id, { status: 'waiting_review', waiting_reason: 'video_generation_failed' });
+    const beforeUsage = structuredClone(run.usage);
+
+    const switched = await service.updateVideoRouting(run.id, {
+      scope: 'shot',
+      shot_id: '5',
+      mode: 'fixed',
+      model: 'cc-seedance2.0 480p-nsp',
+      authorize_retry: true,
+      retry_reason: '原快速模型临时不可用，改用均衡模型',
+      expected_version: run.version,
+    });
+    assert.equal(switched.effects.paid_submission, false);
+    assert.equal(switched.effects.reference_bundle_refreshed, true);
+    assert.equal(switched.effects.retry_authorized, true);
+    assert.deepEqual(switched.summary.run.usage, beforeUsage);
+    assert.equal(switched.summary.run.current_stage, 'reference_bundle');
+    assert.equal(switched.summary.run.policy.video_model_overrides['5'], 'cc-seedance2.0 480p-nsp');
+    const newBundle = repo.getArtifact(db, switched.effects.reference_bundle_artifact_id);
+    assert.equal(newBundle.status, 'draft');
+    assert.equal(newBundle.content.routing_receipt.model, 'cc-seedance2.0 480p-nsp');
+    assert.notEqual(newBundle.content.routing_material_signature, oldBundle.content.routing_material_signature);
+    assert.equal(repo.getArtifact(db, oldBundle.id).status, 'approved');
+    assert.equal(repo.getAction(db, failed.id).status, 'cancelled');
+    assert.equal(repo.getAction(db, failed.id).result.retry_authorized, true);
+  });
+
+  it('supersedes a failed old-model action on a project route change without an extra retry gate', async () => {
+    let run = createRun('human');
+    run = repo.updateRun(db, run.id, {
+      policy: {
+        ...run.policy,
+        video_routing_mode: 'fixed',
+        video_group: '特价视频分组(即梦)',
+        video_model: 'cc-seedance2.0 480p-fast-nsp',
+        director_mode: 'off',
+      },
+    });
+    const shot = repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'storyboard_plan',
+      scope_type: 'shot',
+      scope_id: '5',
+      title: 'Project route replacement shot',
+      content: {
+        included: true,
+        number: 5,
+        duration: 5,
+        action: 'The heroine turns toward the skyline and holds.',
+        visual: 'Stable medium close-up.',
+        video_prompt: 'Turn once, then hold the final pose.',
+        previs_mode: 'skip',
+        transition_mode: 'hard_cut',
+      },
+      status: 'approved',
+    });
+    repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'storyboard_images',
+      scope_type: 'shot',
+      scope_id: '5',
+      title: 'Approved storyboard frame',
+      content: { included: true, source_artifact_id: shot.id },
+      status: 'approved',
+      media_path: 'images/project-route-frame.png',
+      depends_on: [shot.id],
+    });
+    const edgeShots = ['6', '7', '8'].map((scopeId) => repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'storyboard_plan',
+      scope_type: 'shot',
+      scope_id: scopeId,
+      title: `Route edge shot ${scopeId}`,
+      content: {
+        included: true,
+        number: Number(scopeId),
+        duration: 5,
+        action: 'Hold one stable pose.',
+        visual: 'Stable medium shot.',
+        video_prompt: 'Hold one stable pose for the full shot.',
+        previs_mode: 'skip',
+        transition_mode: 'hard_cut',
+      },
+      status: 'approved',
+    }));
+    run = repo.updateRun(db, run.id, {
+      current_stage: 'reference_bundle',
+      current_scope_type: 'shot',
+      current_scope_id: '5',
+      status: 'running',
+    });
+    const catalog = {
+      pricing_version: 'project-route-switch-fixture',
+      fetched_at: '2026-08-15T00:00:00.000Z',
+      video: ['cc-seedance2.0 480p-fast-nsp', 'cc-seedance2.0 480p-nsp'].map((model, index) => ({
+        model,
+        endpoint_types: ['openai-video'],
+        groups: ['特价视频分组(即梦)'],
+        prices: [{
+          group: '特价视频分组(即梦)',
+          billing_unit: 'per_second',
+          effective_price: index ? 0.5148 : 0.4656,
+        }],
+      })),
+    };
+    const service = createProductionService(db, {}, log, {
+      media: { fetchVideoCatalog: async () => catalog },
+    });
+    const prepared = await service.advance(run.id, { lease_owner: 'project-route-prepare' });
+    assert.equal(prepared.state, 'progressed');
+    repo.reviewArtifact(db, prepared.artifact.id, {
+      reviewer_type: 'human', decision: 'approved', reason: '旧模型参考包已确认',
+    });
+    const oldBundle = repo.getArtifact(db, prepared.artifact.id);
+    const failed = repo.reserveAction(db, {
+      run_id: run.id,
+      action_key: 'shot-5-project-old-model-a1',
+      stage: 'shot_video',
+      scope_type: 'shot',
+      scope_id: '5',
+      kind: 'video_generate',
+      attempt: 1,
+      request: {
+        source_artifact_id: shot.id,
+        model: 'cc-seedance2.0 480p-fast-nsp',
+        bundle_artifact_id: oldBundle.id,
+        routing_receipt: oldBundle.content.routing_receipt,
+        routing_material_signature: oldBundle.content.routing_material_signature,
+      },
+      reserved_video_seconds: 5,
+    }).action;
+    repo.updateAction(db, failed.id, {
+      status: 'failed',
+      error_code: 'UPSTREAM_MODEL_UNAVAILABLE',
+      error_message: 'The upstream model has been removed.',
+    });
+    const reserved = repo.reserveAction(db, {
+      run_id: run.id,
+      action_key: 'shot-6-project-old-model-a1',
+      stage: 'shot_video', scope_type: 'shot', scope_id: '6', kind: 'video_generate', attempt: 1,
+      request: {
+        source_artifact_id: edgeShots[0].id,
+        model: 'cc-seedance2.0 480p-fast-nsp',
+        routing_receipt: oldBundle.content.routing_receipt,
+        routing_material_signature: oldBundle.content.routing_material_signature,
+      },
+      reserved_video_seconds: 5,
+      cost: {
+        provider: 'yinzi', service_type: 'video', model: 'cc-seedance2.0 480p-fast-nsp',
+        group_name: '特价视频分组(即梦)', billing_unit: 'per_second', units: 5,
+        usage: { units: 5, duration_seconds: 5 }, estimated_microusd: 500000,
+      },
+    }).action;
+    const submitted = repo.reserveAction(db, {
+      run_id: run.id,
+      action_key: 'shot-7-project-old-model-a1',
+      stage: 'shot_video', scope_type: 'shot', scope_id: '7', kind: 'video_generate', attempt: 1,
+      request: {
+        source_artifact_id: edgeShots[1].id,
+        model: 'cc-seedance2.0 480p-fast-nsp',
+        routing_receipt: oldBundle.content.routing_receipt,
+        routing_material_signature: oldBundle.content.routing_material_signature,
+      },
+      reserved_video_seconds: 5,
+    }).action;
+    repo.updateAction(db, submitted.id, { status: 'submitted' });
+    const waiting = repo.reserveAction(db, {
+      run_id: run.id,
+      action_key: 'shot-8-project-old-model-a1',
+      stage: 'shot_video', scope_type: 'shot', scope_id: '8', kind: 'video_generate', attempt: 1,
+      request: {
+        source_artifact_id: edgeShots[2].id,
+        model: 'cc-seedance2.0 480p-fast-nsp',
+        routing_receipt: oldBundle.content.routing_receipt,
+        routing_material_signature: oldBundle.content.routing_material_signature,
+      },
+      reserved_video_seconds: 5,
+    }).action;
+    repo.updateAction(db, waiting.id, {
+      status: 'waiting', task_id: 'old-task-8', generation_id: 8808,
+    });
+    run = repo.updateRun(db, run.id, {
+      current_stage: 'shot_video',
+      current_scope_type: 'shot',
+      current_scope_id: '5',
+      status: 'waiting_review',
+      waiting_reason: 'video_generation_failed',
+      error_code: 'UPSTREAM_MODEL_UNAVAILABLE',
+      error_message: 'The upstream model has been removed.',
+    });
+
+    const switched = await service.updateVideoRouting(run.id, {
+      scope: 'run',
+      mode: 'fixed',
+      model: 'cc-seedance2.0 480p-nsp',
+      expected_version: run.version,
+    });
+    const oldAction = repo.getAction(db, failed.id);
+    assert.equal(oldAction.status, 'cancelled');
+    assert.equal(oldAction.result.superseded_by_route_change, true);
+    assert.equal(oldAction.result.retry_authorized, true);
+    assert.equal(switched.effects.retry_authorized, true);
+    assert.deepEqual(switched.effects.superseded_action_ids, [failed.id, reserved.id, submitted.id, waiting.id]);
+    assert.deepEqual(switched.effects.ambiguous_action_ids, [submitted.id]);
+    assert.deepEqual(switched.effects.in_flight_action_ids, [waiting.id]);
+    assert.equal(repo.getAction(db, reserved.id).status, 'cancelled');
+    assert.equal(repo.getAction(db, reserved.id).result.superseded_before_submission, true);
+    assert.equal(repo.getAction(db, submitted.id).status, 'ambiguous');
+    assert.equal(repo.getAction(db, waiting.id).status, 'waiting');
+    assert.equal(repo.getAction(db, waiting.id).result.superseded_by_route_change, true);
+    assert.equal(
+      db.prepare('SELECT status FROM cost_ledger WHERE action_id = ?').get(reserved.id).status,
+      'released'
+    );
+    const newBundle = repo.getArtifact(db, switched.effects.reference_bundle_artifact_id);
+    assert.equal(newBundle.content.routing_receipt.model, 'cc-seedance2.0 480p-nsp');
+    assert.notEqual(newBundle.content.routing_material_signature, oldBundle.content.routing_material_signature);
+    repo.reviewArtifact(db, newBundle.id, {
+      reviewer_type: 'human', decision: 'approved', reason: '新模型参考包已确认',
+    });
+
+    const dispatched = [];
+    const media = createProductionMediaService(db, {}, log, {
+      fetchVideoCatalog: async () => catalog,
+      createVideo: async (request) => {
+        dispatched.push(request);
+        return { id: 9901, task_id: 'new-model-task', model: request.model };
+      },
+    });
+    const submission = await media.ensureShotVideos(repo.getRun(db, run.id));
+    assert.equal(submission.state, 'waiting_provider');
+    assert.equal(dispatched.length, 1);
+    assert.equal(dispatched[0].model, 'cc-seedance2.0 480p-nsp');
+    assert.equal(submission.action.request.model, 'cc-seedance2.0 480p-nsp');
+    assert.equal(
+      submission.action.request.routing_material_signature,
+      newBundle.content.routing_material_signature
+    );
+  });
+
+  it('lets the current long shot skip 3D from the routing dialog and rebuilds a zero-video bundle', async () => {
+    let run = createRun('human');
+    run = repo.updateRun(db, run.id, {
+      policy: {
+        ...run.policy,
+        video_routing_mode: 'auto',
+        video_group: '特价视频分组(即梦)',
+        video_quality: 'balanced',
+        director_mode: 'auto',
+      },
+      usage: { video_attempts_reserved: 9, video_seconds_reserved: 48 },
+    });
+    const shot = repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'storyboard_plan',
+      scope_type: 'shot',
+      scope_id: '6',
+      title: 'Twelve second continuous shot',
+      content: {
+        included: true,
+        number: 6,
+        duration: 12,
+        route_profile: 'long_previs_guided',
+        previs_mode: 'auto',
+        transition_mode: 'hard_cut',
+        action: 'Complete one continuous action in the same camera setup.',
+        visual: 'Locked high-angle wide shot.',
+        video_prompt: 'Complete the action and settle before the cut.',
+      },
+      status: 'approved',
+    });
+    const frame = repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'storyboard_images',
+      scope_type: 'shot',
+      scope_id: '6',
+      title: 'Approved storyboard frame',
+      content: { included: true, source_artifact_id: shot.id },
+      status: 'approved',
+      media_path: 'images/shot-6.png',
+      depends_on: [shot.id],
+    });
+    const directorPlan = repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'director_plan',
+      scope_type: 'shot',
+      scope_id: '6',
+      title: 'Historical director plan',
+      content: { included: true, source_artifact_id: shot.id },
+      status: 'approved',
+      depends_on: [shot.id],
+    });
+    const directorPreview = repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'director_preview',
+      scope_type: 'shot',
+      scope_id: '6',
+      title: 'Historical director preview',
+      content: { included: true, source_artifact_id: directorPlan.id, validation: { duration: 12 } },
+      status: 'approved',
+      media_path: 'previews/shot-6.webm',
+      depends_on: [directorPlan.id],
+    });
+    const oldBundle = repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'reference_bundle',
+      scope_type: 'shot',
+      scope_id: '6',
+      title: 'Old preview-required bundle',
+      content: {
+        included: true,
+        source_artifact_id: shot.id,
+        images: [{ path: frame.media_path, artifact_id: frame.id, source: 'storyboard', role: 'reference' }],
+        videos: [{ path: directorPreview.media_path, artifact_id: directorPreview.id, source: 'director' }],
+        audios: [],
+        routing_receipt: {
+          profile: 'long_previs_guided', model: 'mg-seedance2.0 -480p mini',
+          planned_duration: 12, duration: 12, previs_mode: 'auto',
+          uses_reference_video: true, requires_director_preview: true,
+          limits: { images: 4, videos: 3, audios: 1 }, material_signature: 'old-preview-route',
+        },
+        routing_material_signature: 'old-preview-route',
+        transition_mode: 'hard_cut',
+        previs_mode: 'auto',
+        uses_reference_video: true,
+        requires_director_preview: true,
+        limits: { images: 4, videos: 3, audios: 1 },
+      },
+      status: 'approved',
+      depends_on: [shot.id, frame.id, directorPreview.id],
+    });
+    run = repo.updateRun(db, run.id, {
+      current_stage: 'reference_bundle',
+      current_scope_type: 'shot',
+      current_scope_id: '6',
+      status: 'waiting_review',
+    });
+    const beforeUsage = structuredClone(run.usage);
+    const catalog = {
+      pricing_version: 'previs-skip-fixture',
+      fetched_at: '2026-08-10T00:00:00.000Z',
+      video: [{
+        model: 'mg-seedance2.0 -480p mini',
+        endpoint_types: ['openai-video'],
+        groups: ['特价视频分组(即梦)'],
+        prices: [{ group: '特价视频分组(即梦)', billing_unit: 'per_second', effective_price: 0.2004 }],
+      }],
+    };
+    const service = createProductionService(db, {}, log, {
+      media: { fetchVideoCatalog: async () => catalog },
+    });
+
+    await assert.rejects(
+      service.updateVideoRouting(run.id, {
+        scope: 'shot', shot_id: '6', mode: 'inherit', previs_mode: 'omit', expected_version: run.version,
+      }),
+      (error) => error.code === 'VIDEO_PREVIS_MODE_INVALID'
+    );
+    assert.equal(repo.getRun(db, run.id).policy.video_previs_overrides, undefined);
+    assert.deepEqual(repo.getRun(db, run.id).usage, beforeUsage);
+
+    const skipped = await service.updateVideoRouting(run.id, {
+      scope: 'shot',
+      shot_id: '6',
+      mode: 'inherit',
+      previs_mode: 'skip',
+      expected_version: run.version,
+    });
+
+    assert.equal(skipped.effects.paid_submission, false);
+    assert.equal(skipped.effects.reference_bundle_refreshed, true);
+    assert.deepEqual(skipped.summary.run.usage, beforeUsage);
+    assert.equal(skipped.summary.run.current_stage, 'reference_bundle');
+    assert.equal(skipped.summary.run.policy.video_previs_overrides['6'], 'skip');
+    assert.equal(skipped.routing.shot.previs_mode_override, 'skip');
+    assert.equal(skipped.routing.effective_route.previs_mode, 'skip');
+    assert.equal(skipped.routing.effective_route.requires_director_preview, false);
+    assert.equal(skipped.routing.effective_route.uses_reference_video, false);
+    assert.equal(repo.getArtifact(db, shot.id).status, 'approved');
+    assert.equal(repo.getArtifact(db, shot.id).content.previs_mode, 'auto');
+
+    const bundle = repo.getArtifact(db, skipped.effects.reference_bundle_artifact_id);
+    assert.notEqual(bundle.id, oldBundle.id);
+    assert.equal(bundle.status, 'draft');
+    assert.equal(bundle.content.previs_mode, 'skip');
+    assert.equal(bundle.content.requires_director_preview, false);
+    assert.equal(bundle.content.uses_reference_video, false);
+    assert.equal(bundle.content.limits.videos, 0);
+    assert.deepEqual(bundle.content.videos, []);
+    assert.equal(repo.listUpstreamArtifactIds(db, bundle.id).includes(directorPlan.id), false);
+    assert.equal(repo.listUpstreamArtifactIds(db, bundle.id).includes(directorPreview.id), false);
+    await assert.doesNotReject(service.validateArtifactForApproval(bundle));
+  });
+
+  it('keeps routing editable on the latest rejected storyboard without entering production', async () => {
+    let run = createRun('human');
+    const approved = repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'storyboard_plan',
+      scope_type: 'shot',
+      scope_id: '7',
+      title: 'Approved rough shot seven',
+      content: {
+        included: true,
+        number: 7,
+        duration: 8,
+        route_profile: 'long_previs_guided',
+        previs_mode: 'auto',
+        transition_mode: 'hard_cut',
+        action: 'The subject completes a continuous movement.',
+        visual: 'Stable wide shot.',
+        video_prompt: 'Keep the continuous movement readable for eight seconds.',
+      },
+      status: 'approved',
+    });
+    const rejected = repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'storyboard_plan',
+      scope_type: 'shot',
+      scope_id: '7',
+      title: 'Rejected revision of shot seven',
+      parent_artifact_id: approved.id,
+      content: {
+        ...approved.content,
+        visual: 'Revision awaiting a clearer composition.',
+      },
+    });
+    repo.reviewArtifact(db, rejected.id, {
+      reviewer_type: 'human',
+      decision: 'rejected',
+      reason: 'Composition needs another revision.',
+    });
+    run = repo.getRun(db, run.id);
+    run = repo.updateRun(db, run.id, {
+      current_stage: 'storyboard_plan',
+      current_scope_type: 'shot',
+      current_scope_id: '7',
+      status: 'waiting_review',
+      waiting_reason: 'revision_required',
+      policy: {
+        ...run.policy,
+        video_previs_overrides: { 7: 'skip' },
+      },
+    });
+    const beforeUsage = structuredClone(run.usage);
+    const beforeArtifacts = repo.listArtifacts(db, run.id, { page_size: 200 }).items.map((item) => item.id);
+    const beforeActions = repo.listActions(db, run.id, { page_size: 200 }).items.map((item) => item.id);
+    const catalog = {
+      pricing_version: 'rejected-routing-fixture',
+      fetched_at: '2026-08-10T00:00:00.000Z',
+      video: [{
+        model: 'mg-seedance2.0 -480p mini',
+        endpoint_types: ['openai-video'],
+        groups: ['特价视频分组(即梦)'],
+        prices: [{ group: '特价视频分组(即梦)', billing_unit: 'per_second', effective_price: 0.2004 }],
+      }],
+    };
+    const service = createProductionService(db, {}, log, {
+      media: { fetchVideoCatalog: async () => catalog },
+    });
+
+    const routing = await service.getVideoRouting(run.id, { shot_id: '7' });
+    assert.equal(routing.shot_status, 'rejected');
+    assert.equal(routing.route_edit_deferred, true);
+    assert.equal(routing.shot.previs_mode_override, 'skip');
+    assert.equal(routing.effective_route.previs_mode, 'skip');
+    assert.equal(routing.effective_route.requires_director_preview, false);
+    assert.equal(routing.effective_route.limits.videos, 0);
+
+    const saved = await service.updateVideoRouting(run.id, {
+      scope: 'shot',
+      shot_id: '7',
+      mode: 'inherit',
+      previs_mode: 'skip',
+      expected_version: run.version,
+    });
+    assert.equal(saved.effects.route_edit_deferred, true);
+    assert.equal(saved.effects.reference_bundle_refreshed, false);
+    assert.equal(saved.effects.reference_bundle_artifact_id, null);
+    assert.equal(saved.summary.run.current_stage, 'storyboard_plan');
+    assert.equal(saved.summary.run.current_scope_id, '7');
+    assert.equal(saved.summary.run.status, 'waiting_review');
+    assert.equal(saved.summary.run.waiting_reason, 'revision_required');
+    assert.deepEqual(saved.summary.run.usage, beforeUsage);
+    assert.deepEqual(repo.listArtifacts(db, run.id, { page_size: 200 }).items.map((item) => item.id), beforeArtifacts);
+    assert.deepEqual(repo.listActions(db, run.id, { page_size: 200 }).items.map((item) => item.id), beforeActions);
+    assert.equal(repo.listArtifacts(db, run.id, { stage: 'reference_bundle', page_size: 200 }).items.length, 0);
+
+    const steady = await service.advance(run.id, { lease_owner: 'rejected-revision-steady' });
+    assert.equal(steady.state, 'waiting_review');
+    assert.equal(steady.reason, 'revision_required');
+    assert.equal(steady.artifacts[0].id, rejected.id);
+    assert.equal(steady.run.status, 'waiting_review');
+    assert.equal(steady.run.error_code, null);
+
+    repo.updateRun(db, run.id, {
+      status: 'failed',
+      waiting_reason: 'revision_required',
+      error_code: 'ADVANCE_FAILED',
+      error_message: 'Shot 7 has no approved rough plan to refine',
+    });
+    const healed = await service.advance(run.id, { lease_owner: 'rejected-revision-heal' });
+    assert.equal(healed.state, 'waiting_review');
+    assert.equal(healed.reason, 'revision_required');
+    assert.equal(healed.run.status, 'waiting_review');
+    assert.equal(healed.run.error_code, null);
+    assert.equal(healed.run.error_message, null);
+    assert.deepEqual(repo.listArtifacts(db, run.id, { page_size: 200 }).items.map((item) => item.id), beforeArtifacts);
+    assert.deepEqual(repo.listActions(db, run.id, { page_size: 200 }).items.map((item) => item.id), beforeActions);
+  });
+
+  it('still returns replacement options when the configured model has disappeared from the live catalog', async () => {
+    let run = createRun('human');
+    run = repo.updateRun(db, run.id, {
+      policy: {
+        ...run.policy,
+        video_routing_mode: 'fixed',
+        video_model: 'removed-upstream-model',
+        video_group: '特价视频分组(即梦)',
+        director_mode: 'off',
+      },
+      current_stage: 'reference_bundle',
+      current_scope_type: 'shot',
+      current_scope_id: '5',
+    });
+    repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'storyboard_plan',
+      scope_type: 'shot',
+      scope_id: '5',
+      title: 'Replacement route shot',
+      content: {
+        included: true,
+        number: 5,
+        duration: 5,
+        action: 'The heroine looks toward the city lights.',
+        visual: 'Stable medium close-up.',
+        video_prompt: 'Hold a stable medium close-up for five seconds.',
+        previs_mode: 'skip',
+        transition_mode: 'hard_cut',
+      },
+      status: 'approved',
+    });
+    const catalog = {
+      pricing_version: 'replacement-options-fixture',
+      fetched_at: '2026-08-09T00:00:00.000Z',
+      video: [{
+        model: 'cc-seedance2.0 480p-nsp',
+        endpoint_types: ['openai-video'],
+        groups: ['特价视频分组(即梦)'],
+        prices: [{ group: '特价视频分组(即梦)', billing_unit: 'per_second', effective_price: 0.5148 }],
+      }],
+    };
+    const service = createProductionService(db, {}, log, {
+      media: { fetchVideoCatalog: async () => catalog },
+    });
+
+    const routing = await service.getVideoRouting(run.id, { shot_id: '5' });
+    assert.equal(routing.effective_route, null);
+    assert.equal(routing.effective_route_error.code, 'VIDEO_ROUTE_MODEL_UNAVAILABLE');
+    assert.match(routing.effective_route_error.message, /removed-upstream-model/);
+    assert.equal(routing.catalog.options.some((item) => item.model === 'cc-seedance2.0 480p-nsp' && item.selectable), true);
+    assert.equal(routing.run_version, run.version);
+  });
+
+  it('returns field assistance as an unsaved candidate only', async () => {
+    const run = createRun('human');
+    const service = createProductionService(db, {}, log, {
+      generateText: async () => '银白宇航服左肩有一枚青绿色叶片徽章，短黑发，左眉上方有小痣。',
+    });
+    const result = await service.assist({
+      run_id: run.id,
+      field_key: 'appearance',
+      current_value: '银白宇航服',
+      instruction: '增加三个稳定辨识点',
+    });
+    assert.match(result.value, /叶片徽章/);
+    assert.equal(repo.listArtifacts(db, run.id, { stage: 'asset_text', current: true }).items.length, 0);
+  });
+
+  it('transitions human review one shot at a time and blocks an unrefined next rough shot', () => {
+    const run = createRun('human');
+    const shots = [1, 2].map((number) => repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'storyboard_plan',
+      scope_type: 'shot',
+      scope_id: String(number),
+      title: `Shot ${number}`,
+      content: {
+        number,
+        title: `Shot ${number}`,
+        duration: 5,
+        route_profile: 'long_previs_guided',
+        action: `Action ${number}`,
+        visual: `Visual ${number}`,
+        video_prompt: `Provider prompt ${number}`,
+        included: true,
+      },
+      status: 'approved',
+    }));
+    repo.updateRun(db, run.id, {
+      current_stage: 'storyboard_plan',
+      current_scope_type: null,
+      current_scope_id: null,
+      status: 'waiting_review',
+    });
+    const service = createProductionService(db, {}, log);
+    const first = service.transition(run.id, { next_stage_strategy: 'auto_generate' });
+    assert.equal(first.run.current_stage, 'storyboard_images');
+    assert.equal(first.run.current_scope_id, '1');
+
+    repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'storyboard_images',
+      scope_type: 'shot',
+      scope_id: '1',
+      title: 'Shot 1 frame',
+      content: { source_artifact_id: shots[0].id, included: true },
+      status: 'approved',
+      media_path: 'images/shot-1.png',
+    });
+    const director = service.transition(run.id, { next_stage_strategy: 'auto_generate' });
+    assert.equal(director.run.current_stage, 'director_plan');
+    assert.equal(director.run.current_scope_id, '1');
+
+    repo.updateRun(db, run.id, {
+      current_stage: 'shot_video',
+      current_scope_type: 'shot',
+      current_scope_id: '1',
+      status: 'waiting_review',
+    });
+    const shotVideo = repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'shot_video',
+      scope_type: 'shot',
+      scope_id: '1',
+      title: 'Shot 1 video',
+      content: { source_artifact_id: shots[0].id, included: true },
+      status: 'approved',
+      media_path: 'videos/shot-1.mp4',
+    });
+    const next = service.transition(run.id, { next_stage_strategy: 'auto_generate' });
+    assert.equal(next.run.current_stage, 'storyboard_plan');
+    assert.equal(next.run.current_scope_id, '2');
+    const summary = repo.getRunSummary(db, run.id);
+    assert.equal(summary.unresolved.complete, false);
+    assert.equal(summary.unresolved.unresolved[0].reason, 'shot_plan_not_refined');
+    assert.throws(
+      () => service.transition(run.id, { next_stage_strategy: 'auto_generate' }),
+      /未处理内容/
+    );
+    assert.equal(repo.getArtifact(db, shotVideo.id).status, 'approved');
+  });
+
+  it('locally recovers a truncated sequential refinement once and preserves the failed action', () => {
+    const run = createRun('human');
+    const first = repo.createArtifact(db, {
+      run_id: run.id, stage: 'storyboard_plan', scope_type: 'shot', scope_id: '1', title: '深潭',
+      content: {
+        number: 1, title: '深潭', duration: 5, action: '取回信物并完成动作。',
+        visual: '深潭水下广角。', video_prompt: '完成取物动作。', transition_mode: 'opening',
+        cut_out: '信物已经收好，动作完整结束。', included: true,
+      }, status: 'approved',
+    });
+    const rough = repo.createArtifact(db, {
+      run_id: run.id, stage: 'storyboard_plan', scope_type: 'shot', scope_id: '2', title: '雨后集市',
+      content: {
+        number: 2, title: '雨后集市', duration: 4, action: '少女停在摊位前抬眼。',
+        visual: '雨后集市独立中景。', video_prompt: '停下并抬眼。', transition_mode: 'hard_cut',
+        cut_in: '新机位建立集市场景。', cut_out: '视线稳定落向画外。',
+        cut_motivation: '切到新的地点和信息。', included: true,
+      }, status: 'approved',
+    });
+    const video = repo.createArtifact(db, {
+      run_id: run.id, stage: 'shot_video', scope_type: 'shot', scope_id: '1', title: '深潭成片',
+      content: { source_artifact_id: first.id, validation: { duration: 5 }, included: true },
+      status: 'approved', media_path: 'videos/shot-1.mp4', depends_on: [first.id],
+    });
+    repo.updateRun(db, run.id, {
+      current_stage: 'storyboard_plan', current_scope_type: 'shot', current_scope_id: '2',
+      status: 'failed', runtime: { shot_pipeline: { mode: 'sequential', current_shot_id: '2' } },
+    });
+    const failed = repo.reserveAction(db, {
+      run_id: run.id, action_key: 'storyboard-refine-truncated', stage: 'storyboard_plan',
+      scope_type: 'shot', scope_id: '2', kind: 'storyboard_refine', request: {},
+    }).action;
+    repo.updateAction(db, failed.id, {
+      status: 'failed', error_code: 'AI_GENERATION_FAILED',
+      error_message: '分镜结果为空或缺少动作/构图',
+    });
+    const service = createProductionService(db, {}, log);
+    const recovered = service.recoverScopedShotRevision(run.id, { action_id: failed.id });
+    assert.equal(recovered.state, 'waiting_review');
+    assert.equal(recovered.reused, false);
+    assert.equal(recovered.artifact.status, 'draft');
+    assert.equal(recovered.artifact.content.rough_source_artifact_id, rough.id);
+    assert.equal(recovered.artifact.content.refined_from_video_artifact_id, video.id);
+    assert.equal(recovered.artifact.content.transition_mode, 'hard_cut');
+    assert.match(recovered.artifact.content.boundary_prompt, /不使用上一段视频尾帧/);
+    assert.equal(repo.getAction(db, failed.id).status, 'failed');
+    assert.equal(repo.getRun(db, run.id).status, 'waiting_review');
+    const repeated = service.recoverScopedShotRevision(run.id, { action_id: failed.id });
+    assert.equal(repeated.reused, true);
+    assert.equal(repeated.artifact.id, recovered.artifact.id);
+    assert.equal(repo.listArtifacts(db, run.id, {
+      stage: 'storyboard_plan', scope_type: 'shot', scope_id: '2', page_size: 20,
+    }).items.length, 2);
+  });
+
+  it('skips both director stages for a two-second image-guided shot without creating a capture action', async () => {
+    const run = createRun('human');
+    const shot = repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'storyboard_plan',
+      scope_type: 'shot',
+      scope_id: '1',
+      title: 'Two-second reaction',
+      content: {
+        number: 1,
+        title: 'Two-second reaction',
+        duration: 2,
+        route_profile: 'short_image_guided',
+        previs_mode: 'auto',
+        transition_mode: 'opening',
+        action: 'The heroine lifts her eyes once, then holds still.',
+        visual: 'Tight expression close-up from a stable camera.',
+        video_prompt: 'A complete two-second reaction beat.',
+        included: true,
+      },
+      status: 'approved',
+    });
+    repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'storyboard_images',
+      scope_type: 'shot',
+      scope_id: '1',
+      title: 'Reaction frame',
+      content: { source_artifact_id: shot.id, included: true },
+      status: 'approved',
+      media_path: 'images/reaction.png',
+    });
+    repo.updateRun(db, run.id, {
+      current_stage: 'storyboard_images',
+      current_scope_type: 'shot',
+      current_scope_id: '1',
+      status: 'waiting_review',
+      runtime: { shot_pipeline: { mode: 'sequential', current_shot_id: '1' } },
+    });
+
+    const service = createProductionService(db, {}, log);
+    const transitioned = service.transition(run.id, { next_stage_strategy: 'auto_generate' });
+    assert.equal(transitioned.run.current_stage, 'reference_bundle');
+    assert.equal(transitioned.run.current_scope_id, '1');
+    const skipped = db.prepare(`
+      SELECT stage, payload_json
+      FROM production_events
+      WHERE run_id = ? AND event_type = 'stage.skipped'
+      ORDER BY id
+    `).all(run.id);
+    assert.deepEqual(skipped.map((item) => item.stage), ['director_plan', 'director_preview']);
+    assert.ok(skipped.every((item) => {
+      const payload = JSON.parse(item.payload_json);
+      return payload.planned_duration === 2
+        && payload.duration === 5
+        && payload.duration_adjusted === true;
+    }));
+    assert.equal(
+      repo.listActions(db, run.id, { page_size: 200 }).items.filter((item) => item.kind === 'client_capture').length,
+      0
+    );
+    const manualBundle = await service.addManualArtifact(run.id, {
+      stage: 'reference_bundle',
+      source_artifact_id: shot.id,
+      title: 'Manual image-only reference bundle',
+      content: { included: true },
+    });
+    assert.deepEqual(manualBundle.content.limits, { images: 9, videos: 0, audios: 3 });
+    assert.equal(manualBundle.content.uses_reference_video, false);
+  });
+
+  it('makes project-level director opt-out authoritative across preflight, stages, and stale capture actions', async () => {
+    let run = createRun('human');
+    run = repo.updateRun(db, run.id, {
+      policy: { ...run.policy, director_mode: 'off' },
+    });
+    const shot = repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'storyboard_plan',
+      scope_type: 'shot',
+      scope_id: '1',
+      title: 'Long shot without director',
+      content: {
+        number: 1,
+        title: 'Long shot without director',
+        duration: 8,
+        route_profile: 'long_previs_guided',
+        previs_mode: 'force',
+        transition_mode: 'opening',
+        action: 'Complete one continuous walk.',
+        visual: 'A stable wide composition.',
+        video_prompt: 'Complete the walk within this clip.',
+        included: true,
+      },
+      status: 'approved',
+    });
+    repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'storyboard_images',
+      scope_type: 'shot',
+      scope_id: '1',
+      title: 'Approved frame',
+      content: { source_artifact_id: shot.id, included: true },
+      status: 'approved',
+      media_path: 'images/no-director.png',
+    });
+    run = repo.updateRun(db, run.id, {
+      current_stage: 'storyboard_images',
+      current_scope_type: 'shot',
+      current_scope_id: '1',
+      status: 'waiting_review',
+    });
+    const service = createProductionService(db, {}, log);
+    const transitioned = service.transition(run.id, { next_stage_strategy: 'auto_generate' });
+    assert.equal(transitioned.run.current_stage, 'reference_bundle');
+    const skippedStages = db.prepare(`
+      SELECT stage FROM production_events
+      WHERE run_id = ? AND event_type = 'stage.skipped'
+      ORDER BY id
+    `).all(run.id).map((item) => item.stage);
+    assert.deepEqual(skippedStages, ['director_plan', 'director_preview']);
+
+    const preflight = service.preflight(run.id, { browser: { webgl: false, media_recorder: false } });
+    assert.equal(preflight.checks.find((item) => item.key === 'webgl').ok, true);
+    assert.equal(preflight.checks.find((item) => item.key === 'media_recorder').ok, true);
+
+    run = repo.updateRun(db, run.id, {
+      current_stage: 'director_plan',
+      current_scope_type: 'shot',
+      current_scope_id: '1',
+      status: 'waiting_review',
+    });
+    await assert.rejects(
+      service.addManualArtifact(run.id, {
+        stage: 'director_plan',
+        source_artifact_id: shot.id,
+        content: { scene_summary: 'Must not be accepted' },
+      }),
+      (error) => error.code === 'DIRECTOR_DISABLED'
+    );
+
+    const capture = repo.reserveAction(db, {
+      run_id: run.id,
+      action_key: 'stale-director-capture',
+      stage: 'director_preview',
+      scope_type: 'shot',
+      scope_id: '1',
+      kind: 'client_capture',
+      attempt: 1,
+      request: { client_token: 'stale-token', source_artifact_id: 999, expected_duration: 8 },
+    }).action;
+    repo.updateAction(db, capture.id, { status: 'waiting' });
+    run = repo.updateRun(db, run.id, {
+      current_stage: 'director_preview',
+      status: 'waiting_client',
+      runtime: { ...run.runtime, client_action_id: capture.id },
+    });
+    const advanced = await service.advance(run.id);
+    assert.equal(advanced.run.current_stage, 'reference_bundle');
+    assert.equal(repo.getAction(db, capture.id).status, 'cancelled');
+    assert.equal(repo.getAction(db, capture.id).result.cancelled_reason, 'director_disabled_for_run');
+    assert.equal(repo.getRun(db, run.id).runtime.client_action_id, null);
+    await assert.rejects(
+      service.acceptClientResult(run.id, {
+        action_id: capture.id,
+        token: 'stale-token',
+        media_path: 'previews/stale.webm',
+      }),
+      (error) => error.code === 'DIRECTOR_DISABLED'
+    );
+  });
+
+  it('repairs one invalid director JSON response without creating a second action', async () => {
+    const run = createRun('human');
+    const shot = repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'storyboard_plan',
+      scope_type: 'shot',
+      scope_id: '3',
+      title: 'Seal',
+      content: {
+        number: 3,
+        duration: 5,
+        action: 'Seal the dog spirit',
+        visual: 'front-side low angle',
+        camera_movement: 'fixed camera',
+        character_names: ['Lan Yin'],
+        scene_name: 'Night street',
+        prop_names: ['peachwood-sword'],
+        included: true,
+      },
+      status: 'approved',
+    });
+    repo.updateRun(db, run.id, {
+      current_stage: 'director_plan', current_scope_type: 'shot', current_scope_id: '3', status: 'running',
+    });
+    const invalid = JSON.stringify({
+      active_camera_id: 'camera-1',
+      objects: [
+        { id: 'camera-1', kind: 'camera', props: { aim_mode: 'rotation' } },
+        { id: 'actor', kind: 'character', props: { profile_id: 'human.adult.female' } },
+        {
+          id: 'peachwood-sword', kind: 'procedural',
+          props: {
+            attach_to: 'actor', attach_anchor: 'right_hand', recipe: { nodes: [{ shape: 'box' }] },
+          },
+        },
+      ],
+      timeline: { duration: 5, keyframes: [{ object_id: 'peachwood-sword', time: 0, position: [1, 2, 3] }] },
+    });
+    const valid = JSON.stringify({
+      version: 2,
+      active_camera_id: 'camera-1',
+      objects: [
+        { id: 'camera-1', kind: 'camera', props: { aim_mode: 'rotation' } },
+        { id: 'actor', kind: 'character', props: { profile_id: 'human.adult.female' } },
+        {
+          id: 'peachwood-sword', kind: 'procedural',
+          props: {
+            attach_to: 'actor', attach_anchor: 'right_hand', recipe: { nodes: [{ shape: 'box' }] },
+          },
+        },
+      ],
+      timeline: { duration: 5, keyframes: [{ object_id: 'peachwood-sword', time: 0, local_rotation: [0, 0.4, 0] }] },
+    });
+    const calls = [];
+    const service = createProductionService(db, {}, log, {
+      generateText: scriptedAdapter([invalid, valid], calls),
+    });
+    const result = await service.advance(run.id, { lease_owner: 'director-repair' });
+    assert.equal(result.state, 'progressed');
+    assert.equal(calls.length, 2);
+    assert.match(calls[1].system, /world keyframes/);
+    const action = repo.listActions(db, run.id, { page_size: 200 }).items
+      .find((item) => item.stage === 'director_plan');
+    assert.equal(action.status, 'completed');
+    assert.equal(action.result.normalization_repair_attempts, 1);
+    const artifact = repo.listArtifacts(db, run.id, { stage: 'director_plan', current: true }).items[0];
+    assert.equal(artifact.status, 'draft');
+    const swordFrame = artifact.content.document.timeline.keyframes.find((frame) => frame.object_id === 'peachwood-sword');
+    assert.deepEqual(swordFrame.local_rotation, [0, 0.4, 0]);
+    assert.equal(Object.hasOwn(swordFrame, 'position'), false);
+    assert.equal(Number(artifact.content.source_artifact_id), Number(shot.id));
+  });
+
+  it('keeps a director action failed after two invalid JSON responses', async () => {
+    const run = createRun('human');
+    repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'storyboard_plan',
+      scope_type: 'shot',
+      scope_id: '3',
+      title: 'Seal',
+      content: { number: 3, duration: 5, action: 'Seal', visual: 'front', included: true },
+      status: 'approved',
+    });
+    repo.updateRun(db, run.id, {
+      current_stage: 'director_plan', current_scope_type: 'shot', current_scope_id: '3', status: 'running',
+    });
+    const invalid = JSON.stringify({
+      active_camera_id: 'camera-1',
+      objects: [
+        { id: 'camera-1', kind: 'camera', props: {} },
+        { id: 'actor', kind: 'character', props: { profile_id: 'human.adult.female' } },
+        { id: 'sword', kind: 'procedural', props: { attach_to: 'actor', recipe: { nodes: [{ shape: 'box' }] } } },
+      ],
+      timeline: { duration: 5, keyframes: [{ object_id: 'sword', time: 0, position: [1, 2, 3] }] },
+    });
+    const calls = [];
+    const service = createProductionService(db, {}, log, {
+      generateText: scriptedAdapter([invalid, invalid], calls),
+    });
+    await assert.rejects(() => service.advance(run.id, { lease_owner: 'director-repair-fail' }), /world keyframes/);
+    assert.equal(calls.length, 2);
+    const action = repo.listActions(db, run.id, { page_size: 200 }).items
+      .find((item) => item.stage === 'director_plan');
+    assert.equal(action.status, 'failed');
+    assert.equal(repo.getRun(db, run.id).status, 'failed');
+  });
+});

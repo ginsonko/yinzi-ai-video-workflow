@@ -18,6 +18,19 @@ const ffprobeName = isWin ? 'ffprobe.exe' : 'ffprobe';
 const backendRoot = path.resolve(__dirname, '..', '..');
 const toolsFfmpegDir = path.join(backendRoot, 'tools', 'ffmpeg');
 
+function discoverProgramFilesBins(name, roots = [process.env.ProgramFiles, process.env['ProgramFiles(x86)']]) {
+  const candidates = [];
+  for (const root of [...new Set(roots.filter(Boolean))]) {
+    try {
+      for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+        if (!entry.isDirectory() || !/^ffmpeg(?:[-_].*)?$/i.test(entry.name)) continue;
+        candidates.push(path.join(root, entry.name, 'bin', name));
+      }
+    } catch (_) {}
+  }
+  return candidates;
+}
+
 /**
  * 返回所有候选查找路径（按优先级排列，不含环境变量）。
  * 打包后 process.cwd() = userData/backend；process.execPath = 实际 exe 路径。
@@ -35,16 +48,35 @@ function getCandidatePaths(name) {
   } catch (_) {}
   // 源码目录（开发时）
   candidates.push(path.join(toolsFfmpegDir, name));
+  if (isWin) candidates.push(...discoverProgramFilesBins(name));
   return candidates;
 }
 
 function resolveFfmpegBin(name) {
   const fromEnv = process.env[name === ffmpegName ? 'FFMPEG_PATH' : 'FFPROBE_PATH'];
-  if (fromEnv && fs.existsSync(fromEnv)) return fromEnv;
+  if (fromEnv && isPlausibleBinaryFile(fromEnv)) return fromEnv;
   for (const p of getCandidatePaths(name)) {
-    if (fs.existsSync(p)) return p;
+    if (isPlausibleBinaryFile(p)) return p;
   }
   return name; // 兜底：依赖系统 PATH
+}
+
+function isPlausibleBinaryFile(filePath, minBytes = 1024 * 1024) {
+  try {
+    return fs.existsSync(filePath) && fs.statSync(filePath).isFile() && fs.statSync(filePath).size >= minBytes;
+  } catch (_) {
+    return false;
+  }
+}
+
+function canExecuteVersion(filePath) {
+  try {
+    const { spawnSync } = require('child_process');
+    const res = spawnSync(filePath, ['-version'], { windowsHide: true, timeout: 10000 });
+    return res.status === 0;
+  } catch (_) {
+    return false;
+  }
 }
 
 /**
@@ -65,23 +97,19 @@ function getFfprobePath() {
  * 是否能找到本地 ffmpeg（找到任意候选路径、环境变量或系统 PATH 中存在即为 true）。
  */
 function hasLocalFfmpeg() {
-  const fromEnv = process.env.FFMPEG_PATH;
-  if (fromEnv && fs.existsSync(fromEnv)) return true;
-  if (getCandidatePaths(ffmpegName).some((p) => fs.existsSync(p))) return true;
-  
-  // 检查系统 PATH 中是否有 ffmpeg
-  try {
-    const { spawnSync } = require('child_process');
-    const res = spawnSync(ffmpegName, ['-version']);
-    if (res.status === 0) return true;
-  } catch (_) {}
-  
-  return false;
+  return canExecuteVersion(getFfmpegPath());
+}
+
+function hasLocalFfprobe() {
+  return canExecuteVersion(getFfprobePath());
 }
 
 module.exports = {
   getFfmpegPath,
   getFfprobePath,
   hasLocalFfmpeg,
+  hasLocalFfprobe,
   toolsFfmpegDir,
+  discoverProgramFilesBins,
+  isPlausibleBinaryFile,
 };

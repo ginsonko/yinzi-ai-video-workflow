@@ -6,47 +6,19 @@ const path = require('path');
 const isWin = process.platform === 'win32';
 const cwd = path.join(__dirname, '..');
 
-// 第一步：完整构建（含示例资源），前端/后端同时准备
-console.log('\n========== [1/2] 构建完整版（含示例资源）==========\n');
+console.log('\n========== 构建银子AI视频工作流 Windows x64 安装版与便携版 ==========\n');
 const full = spawnSync(isWin ? 'npm.cmd' : 'npm', ['run', 'dist'], {
   stdio: 'inherit',
   shell: isWin,
   cwd,
 });
 if (full.status !== 0) {
-  console.error('完整版构建失败，终止。');
+  console.error('Windows 发布包构建失败，终止。');
   process.exit(full.status || 1);
 }
 
-// 第二步：纯净版构建（不含示例资源），前端/后端已准备好，直接调 electron-builder
-console.log('\n========== [2/2] 构建纯净版（不含示例资源）==========\n');
-const clean = spawnSync(isWin ? 'npm.cmd' : 'npm', ['run', 'clean:unpacked'], {
-  stdio: 'inherit',
-  shell: isWin,
-  cwd,
-});
-if (clean.status !== 0) {
-  console.error('清理 win-unpacked 失败，请关闭正在运行的 exe 后重试。');
-  process.exit(clean.status || 1);
-}
-const lite = spawnSync(
-  isWin ? 'npx.cmd' : 'npx',
-  ['electron-builder', '--win', '--config', 'electron-builder-lite.json'],
-  {
-    stdio: 'inherit',
-    shell: isWin,
-    cwd,
-  }
-);
-if (lite.status !== 0) {
-  console.error('纯净版构建失败。');
-  process.exit(lite.status || 1);
-}
-
-console.log('\n========== 全部构建完成 ==========');
+console.log('\n========== 构建完成 ==========');
 console.log('输出目录：release/');
-console.log('  完整版安装包：LocalMiniDrama Setup x.x.x.exe');
-console.log('  完整版便携版：LocalMiniDrama x.x.x.exe');
-console.log('  纯净版安装包：LocalMiniDrama-Lite-Setup-x.x.x.exe');
-console.log('  纯净版便携版：LocalMiniDrama-Lite-x.x.x.exe\n');
+console.log('  安装版：银子AI视频工作流-Setup-x.x.x-x64.exe');
+console.log('  便携版：银子AI视频工作流-Portable-x.x.x-x64.exe\n');
 process.exit(0);

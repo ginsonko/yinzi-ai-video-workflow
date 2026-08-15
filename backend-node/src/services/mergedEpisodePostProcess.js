@@ -53,9 +53,19 @@ function escapeFfmpegPath(absPath) {
 
 function runFfmpeg(args, log, tag) {
   const bin = getFfmpegPath();
-  const r = spawnSync(bin, args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+  // Post-processing must never wait on an inherited console or an unbounded
+  // filter graph; a hung local encoder otherwise leaves a run looking idle.
+  const r = spawnSync(bin, ['-nostdin', ...args], {
+    encoding: 'utf8',
+    maxBuffer: 16 * 1024 * 1024,
+    timeout: 120000,
+    killSignal: 'SIGTERM',
+  });
   if (r.error) {
-    log.warn('merged post: ffmpeg spawn', { tag, error: r.error.message });
+    log.warn('merged post: ffmpeg spawn', {
+      tag,
+      error: r.error.code === 'ETIMEDOUT' ? 'ffmpeg 超时（超过 120 秒）' : r.error.message,
+    });
     return false;
   }
   if (r.status !== 0) {
@@ -179,6 +189,200 @@ function amixTwoTracks(pathA, pathB, slotSec, outPath, log) {
   );
 }
 
+function narrationShotBounds(scenes) {
+  // Keep editorial cuts on an integer-millisecond grid. Floating-point second
+  // accumulation can otherwise move later SRT cues one millisecond before a cut.
+  let sceneStartMs = 0;
+  return scenes.map((scene, sceneIndex) => {
+    const sceneDurationMs = Math.max(200, Math.round((Number(scene.duration) || 5) * 1000));
+    const row = {
+      scene,
+      sceneIndex,
+      start: sceneStartMs / 1000,
+      end: (sceneStartMs + sceneDurationMs) / 1000,
+      duration: sceneDurationMs / 1000,
+    };
+    sceneStartMs += sceneDurationMs;
+    return row;
+  });
+}
+
+function mergeDuckingIntervals(intervals, videoDur) {
+  const bounded = (intervals || []).map((item) => ({
+    start: Math.max(0, Number(item.start) - 0.08),
+    end: Math.min(videoDur, Number(item.end) + 0.25),
+  })).filter((item) => Number.isFinite(item.start) && Number.isFinite(item.end) && item.end > item.start)
+    .sort((left, right) => left.start - right.start);
+  const merged = [];
+  for (const item of bounded) {
+    const previous = merged[merged.length - 1];
+    if (previous && item.start <= previous.end + 0.02) previous.end = Math.max(previous.end, item.end);
+    else merged.push({ ...item });
+  }
+  return merged;
+}
+
+function addTimelineDuckingFilters(filters, inputLabel, intervals, videoDur) {
+  const merged = mergeDuckingIntervals(intervals, videoDur);
+  let current = inputLabel;
+  merged.forEach((item, index) => {
+    const next = `provider_duck_${index}`;
+    filters.push(
+      `[${current}]volume=0.32:enable='between(t,${item.start.toFixed(3)},${item.end.toFixed(3)})'[${next}]`
+    );
+    current = next;
+  });
+  return current;
+}
+
+function speedAudio(inputPath, factor, outputPath, log) {
+  const chain = buildAtempoChain(factor);
+  if (!chain) {
+    fs.copyFileSync(inputPath, outputPath);
+    return true;
+  }
+  return runFfmpeg(
+    ['-y', '-i', inputPath, '-af', chain, '-c:a', 'libmp3lame', '-q:a', '3', outputPath],
+    log,
+    'narration_speed'
+  );
+}
+
+function createNarrationTimeline(inputs, schedule, videoDur, outPath, log) {
+  const args = ['-y'];
+  for (const input of inputs) args.push('-i', input);
+  const filters = schedule.map((item, index) => (
+    `[${index}:a]atrim=duration=${item.slot_duration.toFixed(3)},asetpts=PTS-STARTPTS,adelay=${Math.round(item.start * 1000)}:all=1[a${index}]`
+  ));
+  const labels = schedule.map((_item, index) => `[a${index}]`).join('');
+  filters.push(`${labels}amix=inputs=${schedule.length}:duration=longest:dropout_transition=0,apad=whole_dur=${videoDur},atrim=duration=${videoDur}[narration]`);
+  args.push(
+    '-filter_complex', filters.join(';'),
+    '-map', '[narration]',
+    '-t', String(videoDur),
+    '-c:a', 'libmp3lame', '-q:a', '3',
+    outPath
+  );
+  return runFfmpeg(args, log, 'narration_timeline');
+}
+
+function narrationTtsInput(mergeOpts, scene, index, text, storageRoot) {
+  const provider = mergeOpts.narration_voice_provider || 'edge';
+  const voiceId = mergeOpts.narration_voice_id || 'zh-CN-XiaoyiNeural';
+  return {
+    text,
+    storyboard_id: null,
+    storage_base: storageRoot,
+    config: {
+      provider,
+      voice_id: voiceId,
+      ...(mergeOpts.narration_tts_model ? { default_model: mergeOpts.narration_tts_model } : {}),
+    },
+    voice_id: voiceId,
+    speed: Number(mergeOpts.narration_speed) || 1,
+    cost_context: mergeOpts.cost_run_id ? {
+      run_id: mergeOpts.cost_run_id,
+      action_id: mergeOpts.cost_action_id || null,
+      group_name: mergeOpts.narration_cost_group || '',
+      idempotency_key: `production:${mergeOpts.cost_run_id}:tts:${mergeOpts.cost_action_id || 'merge'}:${scene?.scene_id || index + 1}:${index}`,
+    } : null,
+  };
+}
+
+async function buildDirectNarrationTrack(db, log, options) {
+  const { scenes, storageRoot, tempRoot, videoDur, mergeOpts, outputBase } = options;
+  const ttsService = options.ttsService || require('./ttsService');
+  const rawFiles = [];
+  const bounds = narrationShotBounds(scenes);
+  for (let index = 0; index < scenes.length; index++) {
+    const text = String(scenes[index].narration || '').trim();
+    if (!text) continue;
+    const synth = await ttsService.synthesize(
+      db,
+      log,
+      narrationTtsInput(mergeOpts, scenes[index], index, text, storageRoot),
+    );
+    const source = path.join(storageRoot, String(synth.local_path).replace(/\//g, path.sep));
+    if (!fs.existsSync(source)) throw new Error(`镜头 ${scenes[index].scene_id || index + 1} 的旁白文件不存在`);
+    const raw = path.join(tempRoot, `narration_raw_${index}.mp3`);
+    fs.copyFileSync(source, raw);
+    const duration = ffprobeDurationSec(raw);
+    if (!duration) throw new Error(`镜头 ${scenes[index].scene_id || index + 1} 的旁白时长无法读取`);
+    rawFiles.push({
+      source: raw,
+      duration,
+      scene: scenes[index],
+      sceneIndex: index,
+      text,
+      bounds: bounds[index],
+    });
+  }
+  if (!rawFiles.length) throw new Error('已启用旁白，但没有可合成的旁白文本');
+
+  const maxSpeedRatio = Math.min(1.35, Math.max(1, Number(mergeOpts.max_narration_speed_ratio) || 1.2));
+  const timelineFiles = [];
+  const finalSchedule = [];
+  const speedFactors = [];
+  for (let index = 0; index < rawFiles.length; index++) {
+    const rawFile = rawFiles[index];
+    const slotDuration = rawFile.bounds.duration;
+    const requiredFactor = Math.max(1, rawFile.duration / slotDuration);
+    if (requiredFactor > maxSpeedRatio + 0.002) {
+      const shotId = rawFile.scene.scene_id || rawFile.sceneIndex + 1;
+      throw new Error(
+        `镜头 ${shotId} 的旁白不能在本镜头内读完：语音 ${rawFile.duration.toFixed(2)} 秒，画面 ${slotDuration.toFixed(2)} 秒，需加速 ${requiredFactor.toFixed(2)} 倍，允许上限 ${maxSpeedRatio.toFixed(2)} 倍；请精简这一镜旁白或延长镜头`
+      );
+    }
+    const output = path.join(tempRoot, `narration_timeline_input_${index}.mp3`);
+    if (!speedAudio(rawFile.source, requiredFactor, output, log)) throw new Error(`旁白加速失败 #${index + 1}`);
+    const actualDuration = ffprobeDurationSec(output);
+    if (!actualDuration) throw new Error(`镜头 ${rawFile.scene.scene_id || rawFile.sceneIndex + 1} 的旁白加速后时长无法读取`);
+    timelineFiles.push(output);
+    speedFactors.push(requiredFactor);
+    finalSchedule.push({
+      scene: rawFile.scene,
+      text: rawFile.text,
+      start: rawFile.bounds.start,
+      end: Math.min(rawFile.bounds.end, rawFile.bounds.start + actualDuration),
+      duration: Math.min(actualDuration, slotDuration),
+      slot_start: rawFile.bounds.start,
+      slot_end: rawFile.bounds.end,
+      slot_duration: slotDuration,
+      speed_factor: requiredFactor,
+    });
+  }
+
+  const narrationPath = `${outputBase}_narration.mp3`;
+  if (!createNarrationTimeline(timelineFiles, finalSchedule, videoDur, narrationPath, log)) {
+    throw new Error('旁白逐镜锁定时间轴生成失败');
+  }
+  const subtitleMode = ['off', 'sidecar', 'burn'].includes(mergeOpts.subtitle_mode)
+    ? mergeOpts.subtitle_mode
+    : 'burn';
+  let srtPath = null;
+  if (subtitleMode !== 'off') {
+    srtPath = `${outputBase}_narration.srt`;
+    const lines = [];
+    finalSchedule.forEach((item, index) => {
+      lines.push(
+        String(index + 1),
+        `${formatSrtTimestamp(item.start * 1000)} --> ${formatSrtTimestamp(item.end * 1000)}`,
+        item.text,
+        ''
+      );
+    });
+    fs.writeFileSync(srtPath, `\uFEFF${lines.join('\n')}\n`, 'utf8');
+  }
+  return {
+    narrationPath,
+    srtPath,
+    schedule: finalSchedule,
+    speedFactor: Math.max(1, ...speedFactors),
+    speedFactors,
+    timingMode: 'shot_locked',
+  };
+}
+
 function getDrawtextFontOption() {
   const candidates = [];
   if (process.platform === 'win32') {
@@ -202,9 +406,12 @@ function getDrawtextFontOption() {
  * @param {object} mergeOpts — burn_dialogue_audio, burn_narration_subtitles, watermark_text
  */
 async function runMergedEpisodePostProcess(db, log, opts) {
-  const { mergedAbsPath, storageRoot, scenes, episodeId, mergeOpts = {} } = opts;
+  const { mergedAbsPath, storageRoot, scenes, episodeId, mergeOpts = {}, ttsService: injectedTtsService } = opts;
   const wantDial = !!mergeOpts.burn_dialogue_audio;
-  const wantNarr = !!mergeOpts.burn_narration_subtitles;
+  const wantNarr = mergeOpts.narration_enabled == null
+    ? !!mergeOpts.burn_narration_subtitles
+    : !!mergeOpts.narration_enabled;
+  const directNarration = wantNarr && scenes.some((scene) => Object.prototype.hasOwnProperty.call(scene, 'narration'));
   const watermarkText = (mergeOpts.watermark_text && String(mergeOpts.watermark_text).trim())
     ? String(mergeOpts.watermark_text).trim().slice(0, 200)
     : '';
@@ -225,14 +432,26 @@ async function runMergedEpisodePostProcess(db, log, opts) {
 
   const tempRoot = path.join(require('os').tmpdir(), 'drama-merged-post', String(episodeId || 0), String(Date.now()));
   fs.mkdirSync(tempRoot, { recursive: true });
-  const ttsService = require('./ttsService');
+  const ttsService = injectedTtsService || require('./ttsService');
 
   try {
     let alignedAudioPath = null;
     let srtPath = null;
     let srtLines = [];
+    let narrationReceipt = null;
+    let narrationIntervals = [];
+    const baseName = path.basename(mergedAbsPath, path.extname(mergedAbsPath));
+    const outAbs = path.join(path.dirname(mergedAbsPath), `${baseName}_post.mp4`);
+    const outputBase = outAbs.replace(/\.mp4$/i, '');
 
-    if (needAudio) {
+    if (directNarration) {
+      narrationReceipt = await buildDirectNarrationTrack(db, log, {
+        scenes, storageRoot, tempRoot, videoDur, mergeOpts, outputBase, ttsService: injectedTtsService,
+      });
+      alignedAudioPath = narrationReceipt.narrationPath;
+      srtPath = narrationReceipt.srtPath;
+      narrationIntervals = narrationReceipt.schedule.map((item) => ({ start: item.start, end: item.end }));
+    } else if (needAudio) {
       let tMs = 0;
       let srtIdx = 1;
       const segmentFiles = [];
@@ -249,6 +468,7 @@ async function runMergedEpisodePostProcess(db, log, opts) {
         if (wantNarr && narrText) {
           const durMs = Math.round(slotSec * 1000);
           srtLines.push(String(srtIdx++), `${formatSrtTimestamp(tMs)} --> ${formatSrtTimestamp(tMs + durMs)}`, narrText, '');
+          narrationIntervals.push({ start: tMs / 1000, end: (tMs + durMs) / 1000 });
         }
         tMs += Math.round(slotSec * 1000);
 
@@ -277,11 +497,11 @@ async function runMergedEpisodePostProcess(db, log, opts) {
             const segRaw = path.join(tempRoot, `narr_raw_${i}.mp3`);
             let synth;
             try {
-              synth = await ttsService.synthesize(db, log, {
-                text: narrText,
-                storyboard_id: null,
-                storage_base: storageRoot,
-              });
+              synth = await ttsService.synthesize(
+                db,
+                log,
+                narrationTtsInput(mergeOpts, sc, i, narrText, storageRoot),
+              );
             } catch (e) {
               log.warn('merged post: narration TTS failed', { segment: i, error: e.message });
               return { ok: false, error: `解说旁白 TTS 失败：${e.message}` };
@@ -339,10 +559,10 @@ async function runMergedEpisodePostProcess(db, log, opts) {
       }
     }
 
-    const baseName = path.basename(mergedAbsPath, path.extname(mergedAbsPath));
-    const outAbs = path.join(path.dirname(mergedAbsPath), `${baseName}_post.mp4`);
-
-    const hasSubs = !!(srtPath && fs.existsSync(srtPath));
+    const shouldBurnSubtitles = mergeOpts.subtitle_mode == null
+      ? true
+      : mergeOpts.subtitle_mode === 'burn';
+    const hasSubs = shouldBurnSubtitles && !!(srtPath && fs.existsSync(srtPath));
     const hasWm = !!watermarkText;
 
     const vfParts = [];
@@ -370,15 +590,36 @@ async function runMergedEpisodePostProcess(db, log, opts) {
       if (!alignedAudioPath || !fs.existsSync(alignedAudioPath)) {
         return { ok: false, error: '内部错误：缺少对齐音轨' };
       }
-      const args = ['-y', '-i', mergedAbsPath, '-i', alignedAudioPath];
-      if (filterComplex) {
-        args.push('-filter_complex', filterComplex, '-map', '[vout]', '-map', '1:a');
+      const useDucking = mergeOpts.narration_ducking !== false && wantNarr && narrationIntervals.length > 0;
+      const args = [
+        '-y', '-filter_threads', '1', '-filter_complex_threads', '1',
+        '-i', mergedAbsPath, '-i', alignedAudioPath,
+      ];
+      const filters = filterComplex ? [filterComplex] : [];
+      const hasProviderAudio = ffprobeHasAudio(mergedAbsPath);
+      const keepProviderAudio = mergeOpts.keep_provider_audio !== false && hasProviderAudio;
+      const providerVolume = Math.min(1.5, Math.max(0, Number(mergeOpts.provider_audio_volume) || 1));
+      const narrationVolume = Math.min(2, Math.max(0, Number(mergeOpts.narration_volume) || 1));
+      if (keepProviderAudio) {
+        filters.push(`[0:a]volume=${providerVolume}[provider_base]`);
+        const providerLabel = useDucking
+          ? addTimelineDuckingFilters(filters, 'provider_base', narrationIntervals, videoDur)
+          : 'provider_base';
+        filters.push(`[1:a]volume=${narrationVolume}[narration_gain]`);
+        if (useDucking) {
+          filters.push(`[narration_gain][${providerLabel}]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,atrim=duration=${videoDur}[aout]`);
+        } else {
+          filters.push(`[narration_gain][${providerLabel}]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,atrim=duration=${videoDur}[aout]`);
+        }
       } else {
-        args.push('-map', '0:v', '-map', '1:a');
+        filters.push(`[1:a]volume=${narrationVolume},atrim=duration=${videoDur}[aout]`);
       }
+      args.push('-filter_complex', filters.join(';'));
+      args.push('-map', filterComplex ? '[vout]' : '0:v', '-map', '[aout]');
       args.push(
         '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
-        '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', '-shortest', outAbs
+        '-threads', '1',
+        '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', '-t', String(videoDur), outAbs
       );
       if (!runFfmpeg(args, log, 'mux_av')) {
         return { ok: false, error: '烧录字幕/水印或混音失败（请确认 ffmpeg 含 libx264）' };
@@ -387,13 +628,16 @@ async function runMergedEpisodePostProcess(db, log, opts) {
       if (!filterComplex) {
         return { ok: false, error: '内部错误：仅水印但无滤镜链' };
       }
-      const args = ['-y', '-i', mergedAbsPath, '-filter_complex', filterComplex, '-map', '[vout]'];
+      const args = [
+        '-y', '-filter_threads', '1', '-filter_complex_threads', '1',
+        '-i', mergedAbsPath, '-filter_complex', filterComplex, '-map', '[vout]',
+      ];
       if (ffprobeHasAudio(mergedAbsPath)) {
         args.push('-map', '0:a', '-c:a', 'copy');
       } else {
         args.push('-an');
       }
-      args.push('-c:v', 'libx264', '-preset', 'fast', '-crf', '23', '-movflags', '+faststart', outAbs);
+      args.push('-c:v', 'libx264', '-preset', 'fast', '-crf', '23', '-threads', '1', '-movflags', '+faststart', outAbs);
       if (!runFfmpeg(args, log, 'watermark_only')) {
         return { ok: false, error: '水印烧录失败' };
       }
@@ -413,8 +657,28 @@ async function runMergedEpisodePostProcess(db, log, opts) {
       log.warn('merged post: could not remove intermediate', { error: e.message });
     }
 
-    log.info('merged post: done', { episode_id: episodeId, video: relFromRoot });
-    return { ok: true, relativePath: relFromRoot };
+    const narrationRelativePath = narrationReceipt?.narrationPath
+      ? path.relative(storageRoot, narrationReceipt.narrationPath).replace(/\\/g, '/')
+      : null;
+    const subtitleRelativePath = narrationReceipt?.srtPath
+      ? path.relative(storageRoot, narrationReceipt.srtPath).replace(/\\/g, '/')
+      : null;
+    log.info('merged post: done', {
+      episode_id: episodeId,
+      video: relFromRoot,
+      narration_audio: narrationRelativePath,
+      subtitles: subtitleRelativePath,
+    });
+    return {
+      ok: true,
+      relativePath: relFromRoot,
+      narrationRelativePath,
+      subtitleRelativePath,
+      narration_speed_factor: narrationReceipt?.speedFactor || 1,
+      narration_speed_factors: narrationReceipt?.speedFactors || [],
+      narration_timing_mode: narrationReceipt?.timingMode || null,
+      narration_schedule: narrationReceipt?.schedule || [],
+    };
   } catch (e) {
     log.warn('merged post: exception', { error: e.message });
     return { ok: false, error: e.message || String(e) };
@@ -443,4 +707,5 @@ function ffprobeHasAudio(filePath) {
 module.exports = {
   runMergedEpisodePostProcess,
   ffprobeDurationSec,
+  narrationTtsInput,
 };

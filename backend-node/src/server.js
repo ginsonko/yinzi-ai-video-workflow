@@ -16,7 +16,7 @@ const { createApp } = require('./app.js');
 const { closeDb } = require('./db/index.js');
 const logger = require('./logger.js');
 
-const { app, config } = createApp();
+const { app, config, productionAutonomyRunner } = createApp();
 const port = Number(process.env.PORT) || config.server?.port || 5679;
 const host = config.server?.host || '0.0.0.0';
 
@@ -30,6 +30,7 @@ const server = app.listen(port, host, () => {
 
 function shutdown() {
   logger.info('Shutting down server...');
+  productionAutonomyRunner?.stop();
   server.close(() => {
     closeDb();
     logger.info('Server exited');

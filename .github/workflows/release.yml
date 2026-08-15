@@ -1,18 +1,18 @@
 name: Release
 
 on:
+  workflow_dispatch:
   push:
     tags:
-      - 'v*.*.*'   # 推送 vX.X.X 格式的 tag 时触发
+      - 'v*.*.*'
 
 permissions:
   contents: write
 
 jobs:
   build-windows:
-    name: Build Windows Installer
+    name: Windows x64
     runs-on: windows-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -21,61 +21,178 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: 'npm'
-          cache-dependency-path: desktop/package-lock.json
+          cache: npm
+          cache-dependency-path: |
+            backend-node/package-lock.json
+            frontweb/package-lock.json
+            desktop/package-lock.json
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install frontend dependencies
-        working-directory: frontweb
-        run: npm ci
-
-      - name: Build frontend
-        working-directory: frontweb
-        run: npm run build
-
-      - name: Install backend dependencies
+      - name: Install and test backend
         working-directory: backend-node
-        env:
-          NODE_TLS_REJECT_UNAUTHORIZED: '0'
-        run: npm ci
+        run: |
+          npm ci
+          npm test
 
-      - name: Install desktop dependencies & rebuild native modules
+      - name: Install and test frontend
+        working-directory: frontweb
+        run: |
+          npm ci
+          node --test test/*.test.js
+          npm run build
+
+      - name: Install and test desktop
         working-directory: desktop
-        env:
-          NODE_TLS_REJECT_UNAUTHORIZED: '0'
-        run: npm ci
+        run: |
+          npm ci
+          npm test
 
-      - name: Copy frontend dist
+      - name: Build Windows installer and portable package
         working-directory: desktop
-        run: node scripts/copy-front.js
+        run: npm run dist
 
-      - name: Copy backend
-        working-directory: desktop
-        run: node scripts/copy-backend.js
-
-      # 标准版（含示例数据）
-      - name: Build Standard Installer
-        working-directory: desktop
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npx electron-builder --win --publish never
-
-      - name: Upload Standard Build Artifacts
+      - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: windows-release
-          path: desktop/release/*.exe
-          retention-days: 7
+          name: windows-x64
+          path: |
+            desktop/release/*.exe
+            desktop/release/*.yml
+          if-no-files-found: error
+          retention-days: 14
 
-      - name: Create GitHub Release
+  build-macos:
+    name: macOS ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: macos-15-intel
+          - arch: arm64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    env:
+      CSC_LINK: ${{ secrets.CSC_LINK }}
+      CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify native runner architecture
+        shell: bash
+        run: |
+          test "$(uname -m)" = "${{ matrix.arch == 'arm64' && 'arm64' || 'x86_64' }}"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            backend-node/package-lock.json
+            frontweb/package-lock.json
+            desktop/package-lock.json
+
+      - name: Install and test backend
+        working-directory: backend-node
+        run: |
+          npm ci
+          npm test
+
+      - name: Install and test frontend
+        working-directory: frontweb
+        run: |
+          npm ci
+          node --test test/*.test.js
+
+      - name: Install and test desktop
+        working-directory: desktop
+        run: |
+          npm ci
+          npm test
+
+      - name: Build native DMG and ZIP
+        working-directory: desktop
+        run: npm run dist:mac:${{ matrix.arch }}
+
+      - name: Verify native macOS artifacts
+        working-directory: desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          DMG="release-mac/银子AI视频工作流-${VERSION}-mac-${{ matrix.arch }}.dmg"
+          ZIP="release-mac/银子AI视频工作流-${VERSION}-mac-${{ matrix.arch }}.zip"
+          test -s "$DMG"
+          test -s "$ZIP"
+          hdiutil verify "$DMG"
+          VERIFY_DIR=$(mktemp -d)
+          ditto -x -k "$ZIP" "$VERIFY_DIR"
+          APP=$(find "$VERIFY_DIR" -maxdepth 1 -name '*.app' -type d -print -quit)
+          test -n "$APP"
+          MAIN="$APP/Contents/MacOS/银子AI视频工作流"
+          test -x "$MAIN"
+          test "$(lipo -archs "$MAIN")" = "${{ matrix.arch == 'arm64' && 'arm64' || 'x86_64' }}"
+          test -f "$APP/Contents/Resources/app.asar"
+          test -x "$APP/Contents/Resources/ffmpeg/ffmpeg"
+          test -x "$APP/Contents/Resources/ffmpeg/ffprobe"
+          "$APP/Contents/Resources/ffmpeg/ffmpeg" -hide_banner -version
+          "$APP/Contents/Resources/ffmpeg/ffprobe" -hide_banner -version
+          SQLITE=$(find "$APP/Contents/Resources/app.asar.unpacked/node_modules/better-sqlite3" \
+            \( -name "darwin-${{ matrix.arch }}.node" -o -name 'better_sqlite3.node' \) \
+            -type f -print -quit)
+          SHARP=$(find "$APP/Contents/Resources/app.asar.unpacked" -name 'sharp-*.node' -print -quit)
+          test -n "$SQLITE"
+          test -n "$SHARP"
+          test "$(lipo -archs "$SQLITE")" = "${{ matrix.arch == 'arm64' && 'arm64' || 'x86_64' }}"
+          test "$(lipo -archs "$SHARP")" = "${{ matrix.arch == 'arm64' && 'arm64' || 'x86_64' }}"
+          if [ -n "${CSC_LINK:-}" ]; then
+            codesign --verify --deep --strict --verbose=2 "$APP"
+          else
+            echo 'Unsigned internal build: codesign/notarization acceptance intentionally pending.'
+          fi
+
+      - name: Write SHA-256 manifest
+        working-directory: desktop/release-mac
+        shell: bash
+        run: shasum -a 256 * > SHA256SUMS-${{ matrix.arch }}.txt
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: |
+            desktop/release-mac/*.dmg
+            desktop/release-mac/*.zip
+            desktop/release-mac/*.json
+            desktop/release-mac/SHA256SUMS-*.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-draft:
+    name: Publish draft release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create combined SHA-256 manifest
+        working-directory: release-assets
+        run: find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
+
+      - name: Create draft GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: desktop/release/*.exe
+          files: release-assets/*
           generate_release_notes: true
-          draft: true   # 先创建草稿，人工审核后手动发布
+          draft: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

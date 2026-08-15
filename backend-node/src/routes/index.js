@@ -21,8 +21,10 @@ const assetRoutes = require('./assets');
 const audioRoutes = require('./audio');
 const promptOverridesRoutes = require('./promptOverrides');
 const sceneModelMapRoutes = require('./sceneModelMap');
+const productionRoutes = require('./production');
+const advancedSettingsRoutes = require('./advancedSettings');
 
-function setupRouter(cfg, db, log) {
+function setupRouter(cfg, db, log, injected = {}) {
   const r = express.Router();
   const drama = dramaRoutes(db, cfg, log);
   const task = taskRoutes(db, log);
@@ -47,6 +49,46 @@ function setupRouter(cfg, db, log) {
   const assets = assetRoutes(db, log);
   const audio = audioRoutes(db, log, cfg);
   const promptOverrides = promptOverridesRoutes.routes(db, log);
+  const production = productionRoutes(db, cfg, log, injected.production || {});
+  const advancedSettings = advancedSettingsRoutes(db, cfg, log, injected.advancedSettings || {});
+
+  // ---------- production workflow ----------
+  r.get('/production-graph', production.graph);
+  r.get('/production-media', production.productionMedia);
+  r.get('/production-runs', production.listRuns);
+  r.post('/production-runs', production.createRun);
+  r.get('/production-runs/:id', production.getRun);
+  r.get('/production-runs/:id/costs', production.costs);
+  r.get('/production-runs/:id/video-routing', production.videoRouting);
+  r.patch('/production-runs/:id/video-routing', production.updateVideoRouting);
+  r.post('/production-runs/:id/preflight', production.preflight);
+  r.patch('/production-runs/:id', production.updateRun);
+  r.post('/production-runs/:id/start', production.start);
+  r.post('/production-runs/:id/advance', production.advance);
+  r.post('/production-runs/:id/final-edit/rebuild', production.rebuildFinalEdit);
+  r.post('/production-runs/:id/client-result', production.clientResult);
+  r.post('/production-runs/:id/export', production.exportRun);
+  r.post('/production-runs/:id/export.zip', production.zipRun);
+  r.post('/production-runs/:id/pause', production.pause);
+  r.post('/production-runs/:id/resume', production.resume);
+  r.post('/production-runs/:id/retry', production.retry);
+  r.post('/production-runs/:id/recover-storyboard', production.recoverStoryboard);
+  r.post('/production-runs/:id/cancel', production.cancel);
+  r.post('/production-runs/:id/transition', production.transition);
+  r.post('/production-runs/:id/return', production.returnToStage);
+  r.get('/production-runs/:id/artifacts', production.listArtifacts);
+  r.get('/production-runs/:id/reusable-media', production.reusableMedia);
+  r.post('/production-runs/:id/reusable-media/:artifactId/materialize', production.materializeReusableMedia);
+  r.post('/production-runs/:id/artifacts', production.addArtifact);
+  r.get('/production-runs/:id/events', production.events);
+  r.get('/production-runs/:id/reviews', production.reviews);
+  r.get('/production-runs/:id/actions', production.actions);
+  r.patch('/production-artifacts/:artifactId', production.updateArtifact);
+  r.post('/production-artifacts/:artifactId/review', production.reviewArtifact);
+  r.post('/production-artifacts/:artifactId/exclude', production.excludeArtifact);
+  r.post('/production-artifacts/:artifactId/restore', production.restoreArtifact);
+  r.post('/production-artifacts/:artifactId/suggest', production.suggestArtifact);
+  r.post('/production-assist', production.assist);
 
   // ---------- dramas ----------
   r.get('/dramas', drama.listDramas);
@@ -306,6 +348,29 @@ function setupRouter(cfg, db, log) {
   r.put('/settings/language', settings.updateLanguage);
   r.get('/settings/generation', settings.getGenerationSettings);
   r.put('/settings/generation', settings.updateGenerationSettings);
+
+  // ---------- advanced settings, prices, budgets and portable backups ----------
+  r.get('/settings/advanced/summary', advancedSettings.summary);
+  r.get('/settings/advanced/prompts', advancedSettings.listPrompts);
+  r.put('/settings/advanced/prompts/:promptId', advancedSettings.updatePrompt);
+  r.delete('/settings/advanced/prompts/:promptId', advancedSettings.resetPrompt);
+  r.post('/settings/advanced/prompts/export', advancedSettings.exportPrompts);
+  r.post('/settings/advanced/prompts/preview-import', advancedSettings.previewPromptImport);
+  r.post('/settings/advanced/prompts/apply-import', advancedSettings.applyPromptImport);
+  r.get('/settings/advanced/prices', advancedSettings.listPrices);
+  r.put('/settings/advanced/prices', advancedSettings.upsertPrice);
+  r.post('/settings/advanced/prices/yinzi/sync', advancedSettings.syncYinziPrices);
+  r.get('/settings/advanced/budget-defaults', advancedSettings.getBudgetDefaults);
+  r.put('/settings/advanced/budget-defaults', advancedSettings.updateBudgetDefaults);
+  r.get('/settings/advanced/automation-preferences', advancedSettings.getAutomationPreferences);
+  r.put('/settings/advanced/automation-preferences', advancedSettings.updateAutomationPreferences);
+  r.post('/settings/advanced/config-bundles/export', advancedSettings.exportBundle);
+  r.post('/settings/advanced/config-bundles/preview', advancedSettings.previewBundle);
+  r.post('/settings/advanced/config-bundles/apply', advancedSettings.applyBundle);
+  r.get('/settings/advanced/backups', advancedSettings.listBackups);
+  r.post('/settings/advanced/backups', advancedSettings.createBackup);
+  r.post('/settings/advanced/backups/:id/preview-rollback', advancedSettings.previewRollback);
+  r.post('/settings/advanced/backups/:id/rollback', advancedSettings.rollback);
 
   // ---------- prompt overrides ----------
   r.get('/settings/prompts', promptOverrides.list);

@@ -3,6 +3,12 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { spawnSync } = require('node:child_process');
+const sharp = require('sharp');
+const Database = require('better-sqlite3');
+const { runMigrationsAndEnsure } = require('../src/db/migrate');
+const aiConfigService = require('../src/services/aiConfigService');
+const { getFfmpegPath, hasLocalFfmpeg, hasLocalFfprobe } = require('../src/utils/ffmpegPath');
 const {
   buildYinziVideoRequest,
   buildYinziReferences,
@@ -10,11 +16,22 @@ const {
   buildYinziPollUrl,
   buildYinziContentUrl,
   callYinziVideoApi,
+  callVideoApi,
   pollVideoTask,
   formatVideoPostBodyForLog,
+  normalizeYinziAssetPromptReceipt,
 } = require('../src/services/videoClient');
 
 const log = { info() {}, warn() {}, error() {} };
+const mediaToolsAvailable = hasLocalFfmpeg() && hasLocalFfprobe();
+
+function makeReferenceVideo(filePath, codec = 'libx264', fps = 24, duration = 1) {
+  const result = spawnSync(getFfmpegPath(), [
+    '-v', 'error', '-f', 'lavfi', '-i', `color=c=0x24636b:s=320x180:r=${fps}:d=${duration}`,
+    '-c:v', codec, '-pix_fmt', 'yuv420p', '-r', String(fps), '-an', '-y', filePath,
+  ], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+  assert.equal(result.status, 0, result.stderr || result.error?.message);
+}
 
 describe('YinziAPI video request mapping', () => {
   it('preserves opaque model names and reference role order', () => {
@@ -98,6 +115,27 @@ describe('YinziAPI video request mapping', () => {
 });
 
 describe('YinziAPI asynchronous lifecycle', () => {
+  it('classifies the provider asset prompt receipt without trusting a UI label', () => {
+    const prompt = '固定角色；固定场景；完整动作时间线；固定道具';
+    const verified = normalizeYinziAssetPromptReceipt({
+      data: { prompt, prompt_truncated: false },
+    }, prompt, 'asset-verified', '2026-08-06T00:00:00.000Z');
+    assert.equal(verified.status, 'verified');
+    assert.equal(verified.submitted_chars, prompt.length);
+    assert.equal(verified.stored_chars, prompt.length);
+    assert.equal(verified.exact_match, true);
+
+    const truncated = normalizeYinziAssetPromptReceipt({
+      data: { prompt: prompt.slice(0, 12), prompt_truncated: true },
+    }, prompt, 'asset-truncated', '2026-08-06T00:00:00.000Z');
+    assert.equal(truncated.status, 'truncated');
+    assert.equal(truncated.prompt_truncated, true);
+    assert.equal(truncated.prefix_match, true);
+
+    const unavailable = normalizeYinziAssetPromptReceipt({}, prompt, 'asset-unknown', '2026-08-06T00:00:00.000Z');
+    assert.equal(unavailable.status, 'unverified');
+  });
+
   it('builds polling and authenticated content fallback URLs', () => {
     const config = { base_url: 'https://api.yinziapi.top/v1' };
     assert.equal(buildYinziPollUrl(config, 'task 123'), 'https://api.yinziapi.top/v1/videos/task%20123');
@@ -156,6 +194,29 @@ describe('YinziAPI asynchronous lifecycle', () => {
     }
   });
 
+  it('rejects a fake strict first frame mixed with generic AIZZZ references before upload or POST', async () => {
+    const originalFetch = global.fetch;
+    let calls = 0;
+    global.fetch = async () => {
+      calls += 1;
+      throw new Error('must not upload or submit');
+    };
+    try {
+      const result = await callYinziVideoApi(null, {
+        base_url: 'https://api.yinziapi.top/v1', api_key: 'not-a-real-key', endpoint: '/videos',
+      }, log, {
+        model: 'mg-seedance2.0 -480p mini', prompt: 'test', duration: 5,
+        aspect_ratio: '16:9', first_frame_url: 'strict.png',
+        reference_urls: ['storyboard.png'], video_gen_id: 22,
+      });
+      assert.equal(calls, 0);
+      assert.match(result.error, /不能同时把 first_frame 当作严格首帧/);
+      assert.match(result.error, /未创建上游任务/);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
   it('submits the full 4 image, 3 video, 1 audio contract with reference roles', async () => {
     const originalFetch = global.fetch;
     let submittedBody;
@@ -187,6 +248,134 @@ describe('YinziAPI asynchronous lifecycle', () => {
     }
   });
 
+  it('forwards typed references through the production Yinzi dispatcher', async () => {
+    const db = new Database(':memory:');
+    const originalLog = console.log;
+    const originalWarn = console.warn;
+    console.log = () => {};
+    console.warn = () => {};
+    try {
+      runMigrationsAndEnsure(db);
+    } finally {
+      console.log = originalLog;
+      console.warn = originalWarn;
+    }
+    aiConfigService.createConfig(db, log, {
+      service_type: 'video',
+      provider: 'yinzi',
+      api_protocol: 'yinzi',
+      name: 'dispatcher test',
+      base_url: 'https://api.yinziapi.top/v1',
+      api_key: 'test-key',
+      model: ['mg-seedance2.0 -480p mini'],
+      endpoint: '/videos',
+      is_default: true,
+    });
+
+    const originalFetch = global.fetch;
+    let submittedBody;
+    global.fetch = async (_url, init) => {
+      submittedBody = JSON.parse(init.body);
+      return new Response(JSON.stringify({ id: 'task-dispatcher', status: 'queued' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    };
+    try {
+      const result = await callVideoApi(db, log, {
+        model: 'mg-seedance2.0 -480p mini',
+        prompt: 'test',
+        duration: 5,
+        aspect_ratio: '16:9',
+        reference_urls: ['https://media.test/frame.png'],
+        reference_video_urls: ['https://media.test/motion.mp4'],
+        reference_audio_urls: ['https://media.test/voice.mp3'],
+        video_gen_id: 6,
+      });
+      assert.equal(result.task_id, 'task-dispatcher');
+      assert.deepEqual(submittedBody.references.map((ref) => ref.type), ['image', 'video', 'audio']);
+    } finally {
+      global.fetch = originalFetch;
+      db.close();
+    }
+  });
+
+  it('uses the auto-routed cc model and clamps a legacy two-second request to five seconds', async () => {
+    const db = new Database(':memory:');
+    const originalLog = console.log;
+    const originalWarn = console.warn;
+    console.log = () => {};
+    console.warn = () => {};
+    try { runMigrationsAndEnsure(db); }
+    finally { console.log = originalLog; console.warn = originalWarn; }
+    aiConfigService.createConfig(db, log, {
+      service_type: 'video',
+      provider: 'yinzi',
+      api_protocol: 'yinzi',
+      name: 'group-scoped routing test',
+      base_url: 'https://api.yinziapi.top/v1',
+      api_key: 'test-key',
+      model: ['mg-seedance2.0 -480p mini'],
+      endpoint: '/videos',
+      is_default: true,
+    });
+
+    const originalFetch = global.fetch;
+    let submittedBody;
+    global.fetch = async (_url, init) => {
+      submittedBody = JSON.parse(init.body);
+      return new Response(JSON.stringify({ id: 'task-short-two-seconds', status: 'queued' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    };
+    try {
+      const result = await callVideoApi(db, log, {
+        model: 'cc-seedance2.0 480p-fast-nsp',
+        prompt: 'A complete two-second close-up reaction.',
+        duration: 2,
+        aspect_ratio: '16:9',
+        reference_urls: ['https://media.test/close-up.png'],
+        reference_video_urls: [],
+        video_gen_id: 61,
+      });
+      assert.equal(result.task_id, 'task-short-two-seconds');
+      assert.equal(submittedBody.model, 'cc-seedance2.0 480p-fast-nsp');
+      assert.equal(submittedBody.duration, 5);
+      assert.equal(submittedBody.seconds, 5);
+      assert.deepEqual(submittedBody.references.map((item) => item.type), ['image']);
+    } finally {
+      global.fetch = originalFetch;
+      db.close();
+    }
+  });
+
+  it('rejects any video reference for a cc route before upload or submission', async () => {
+    const originalFetch = global.fetch;
+    let calls = 0;
+    global.fetch = async () => {
+      calls += 1;
+      throw new Error('provider must not be called');
+    };
+    try {
+      const result = await callYinziVideoApi(null, {
+        base_url: 'https://api.yinziapi.top/v1', api_key: 'not-a-real-key', endpoint: '/videos',
+      }, log, {
+        model: 'cc-seedance2.0 480p-fast-nsp',
+        prompt: 'A short close-up.',
+        duration: 2,
+        reference_urls: ['https://media.test/frame.png'],
+        reference_video_urls: ['local-director-preview.webm'],
+        storage_local_path: 'C:/media-that-must-not-be-read',
+        video_gen_id: 62,
+      });
+      assert.equal(calls, 0);
+      assert.match(result.error, /0 个参考视频/);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
   it('rejects media over the 4/3/1 limits before any POST', async () => {
     const originalFetch = global.fetch;
     let calls = 0;
@@ -209,8 +398,13 @@ describe('YinziAPI asynchronous lifecycle', () => {
   it('uploads local reference media to Yinzi files and submits file_id sources', async () => {
     const originalFetch = global.fetch;
     const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'yinzi-reference-test-'));
-    fs.writeFileSync(path.join(storage, 'frame.png'), Buffer.from('image'));
-    fs.writeFileSync(path.join(storage, 'motion.mp4'), Buffer.from('video'));
+    if (!mediaToolsAvailable) {
+      fs.rmSync(storage, { recursive: true, force: true });
+      return;
+    }
+    await sharp({ create: { width: 320, height: 180, channels: 3, background: '#315f73' } })
+      .png().toFile(path.join(storage, 'frame.png'));
+    makeReferenceVideo(path.join(storage, 'motion.mp4'));
     fs.writeFileSync(path.join(storage, 'voice.mp3'), Buffer.from('audio'));
     let uploadCount = 0;
     let submittedBody;
@@ -243,6 +437,211 @@ describe('YinziAPI asynchronous lifecycle', () => {
       assert.equal(result.task_id, 'task-local-files');
       assert.equal(uploadCount, 3);
       assert.deepEqual(submittedBody.references.map((ref) => ref.file_id), ['file-1', 'file-2', 'file-3']);
+    } finally {
+      global.fetch = originalFetch;
+      fs.rmSync(storage, { recursive: true, force: true });
+    }
+  });
+
+  it('uploads a bounded JPEG copy for an oversized local image and preserves the source', async () => {
+    const originalFetch = global.fetch;
+    const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'yinzi-bounded-image-upload-'));
+    const source = path.join(storage, 'large.png');
+    await sharp({ create: { width: 3000, height: 1800, channels: 3, background: '#315f73' } })
+      .png().toFile(source);
+    const sourceBytes = fs.readFileSync(source);
+    let uploadedFile;
+    global.fetch = async (url, init) => {
+      if (String(url).endsWith('/files')) {
+        uploadedFile = init.body.get('file');
+        return new Response(JSON.stringify({ id: 'bounded-image-file' }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ id: 'task-bounded-image' }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      });
+    };
+    try {
+      const result = await callYinziVideoApi(null, {
+        base_url: 'https://api.yinziapi.top/v1', api_key: 'not-a-real-key', endpoint: '/videos',
+      }, log, {
+        model: 'mg-seedance2.0 -480p mini', prompt: 'test', duration: 5, aspect_ratio: '16:9',
+        reference_urls: ['large.png'], storage_local_path: storage, video_gen_id: 10,
+      });
+      assert.equal(result.task_id, 'task-bounded-image');
+      assert.equal(uploadedFile.type, 'image/jpeg');
+      assert.match(uploadedFile.name, /yinzi-image-v1-jpeg1920-2m\.jpg$/);
+      assert.ok(uploadedFile.size <= 2 * 1024 * 1024);
+      assert.deepEqual(fs.readFileSync(source), sourceBytes);
+    } finally {
+      global.fetch = originalFetch;
+      fs.rmSync(storage, { recursive: true, force: true });
+    }
+  });
+
+  it('prepares every local image before the first provider call', async () => {
+    const originalFetch = global.fetch;
+    const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'yinzi-image-preflight-'));
+    await sharp({ create: { width: 320, height: 180, channels: 3, background: '#315f73' } })
+      .png().toFile(path.join(storage, 'valid.png'));
+    fs.writeFileSync(path.join(storage, 'invalid.png'), Buffer.from('not an image'));
+    let calls = 0;
+    global.fetch = async () => { calls += 1; throw new Error('provider must not be called'); };
+    try {
+      const result = await callYinziVideoApi(null, {
+        base_url: 'https://api.yinziapi.top/v1', api_key: 'not-a-real-key', endpoint: '/videos',
+      }, log, {
+        model: 'mg-seedance2.0 -480p mini', prompt: 'test', duration: 5, aspect_ratio: '16:9',
+        reference_urls: ['valid.png', 'invalid.png'], storage_local_path: storage, video_gen_id: 11,
+      });
+      assert.equal(calls, 0);
+      assert.match(result.error, /image|unsupported|format/i);
+    } finally {
+      global.fetch = originalFetch;
+      fs.rmSync(storage, { recursive: true, force: true });
+    }
+  });
+
+  it('normalizes a director WebM before the production dispatcher uploads 3 images and 2 videos', {
+    skip: !mediaToolsAvailable,
+  }, async () => {
+    const db = new Database(':memory:');
+    const originalLog = console.log;
+    const originalWarn = console.warn;
+    console.log = () => {};
+    console.warn = () => {};
+    try { runMigrationsAndEnsure(db); }
+    finally { console.log = originalLog; console.warn = originalWarn; }
+    aiConfigService.createConfig(db, log, {
+      service_type: 'video', provider: 'yinzi', api_protocol: 'yinzi', name: 'local dispatcher test',
+      base_url: 'https://api.yinziapi.top/v1', api_key: 'test-key',
+      model: ['mg-seedance2.0 -480p mini'], endpoint: '/videos', is_default: true,
+    });
+
+    const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'yinzi-dispatcher-media-'));
+    for (let i = 0; i < 3; i++) {
+      await sharp({ create: { width: 320, height: 180, channels: 3, background: { r: 40 + i * 20, g: 90, b: 120 } } })
+        .png().toFile(path.join(storage, `frame-${i}.png`));
+    }
+    makeReferenceVideo(path.join(storage, 'approved.mp4'), 'libx264');
+    makeReferenceVideo(path.join(storage, 'director.webm'), 'libvpx-vp9');
+
+    const originalFetch = global.fetch;
+    const uploads = [];
+    let submittedBody;
+    global.fetch = async (url, init) => {
+      if (String(url).endsWith('/files')) {
+        const file = init.body.get('file');
+        uploads.push({ name: file.name, type: file.type });
+        return new Response(JSON.stringify({ id: `file-${uploads.length}` }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      submittedBody = JSON.parse(init.body);
+      return new Response(JSON.stringify({ id: 'task-normalized-dispatcher' }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      });
+    };
+    try {
+      const result = await callVideoApi(db, log, {
+        model: 'mg-seedance2.0 -480p mini', prompt: 'test', duration: 5, aspect_ratio: '16:9',
+        reference_urls: ['frame-0.png', 'frame-1.png', 'frame-2.png'],
+        reference_video_urls: ['approved.mp4', 'director.webm'],
+        storage_local_path: storage, video_gen_id: 7,
+      });
+      assert.equal(result.task_id, 'task-normalized-dispatcher');
+      assert.deepEqual(submittedBody.references.map((ref) => ref.type), [
+        'image', 'image', 'image', 'video', 'video',
+      ]);
+      assert.deepEqual(uploads.slice(3).map((file) => file.type), ['video/mp4', 'video/mp4']);
+      assert.ok(uploads.slice(3).every((file) => file.name.endsWith('.mp4')));
+      assert.match(uploads[3].name, /yinzi-ref-v3-fps24-1280x720\.mp4$/);
+      assert.match(uploads[4].name, /yinzi-ref-v3-fps24-1280x720\.mp4$/);
+    } finally {
+      global.fetch = originalFetch;
+      db.close();
+      fs.rmSync(storage, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed before upload or video submission when a local reference video cannot be probed', async () => {
+    const originalFetch = global.fetch;
+    const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'yinzi-bad-reference-'));
+    fs.writeFileSync(path.join(storage, 'broken.webm'), Buffer.from('not a video'));
+    let calls = 0;
+    global.fetch = async () => { calls += 1; throw new Error('must not call provider'); };
+    try {
+      const result = await callYinziVideoApi(null, {
+        base_url: 'https://api.yinziapi.top/v1', api_key: 'not-a-real-key', endpoint: '/videos',
+      }, log, {
+        model: 'mg-seedance2.0 -480p mini', prompt: 'test', duration: 5, aspect_ratio: '16:9',
+        reference_video_urls: ['broken.webm'], storage_local_path: storage, video_gen_id: 8,
+      });
+      assert.equal(calls, 0);
+      assert.match(result.error, /FFprobe|reference video/i);
+    } finally {
+      global.fetch = originalFetch;
+      fs.rmSync(storage, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a prompt above the confirmed 4,096-character provider boundary before any upload', async () => {
+    const originalFetch = global.fetch;
+    let calls = 0;
+    global.fetch = async () => { calls += 1; throw new Error('provider must not be called'); };
+    try {
+      const result = await callYinziVideoApi(null, {
+        base_url: 'https://api.yinziapi.top/v1', api_key: 'not-a-real-key', endpoint: '/videos',
+      }, log, {
+        model: 'mg-seedance2.0 -480p mini', prompt: 'X'.repeat(4097), duration: 5,
+        aspect_ratio: '16:9', reference_urls: ['missing.png'], video_gen_id: 81,
+      });
+      assert.equal(calls, 0);
+      assert.match(result.error, /4097 characters.*4096-character model limit/i);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('allows exactly the confirmed hard boundary when called directly', async () => {
+    const originalFetch = global.fetch;
+    let submittedBody;
+    global.fetch = async (_url, init) => {
+      submittedBody = JSON.parse(init.body);
+      return new Response(JSON.stringify({ id: 'task-hard-boundary' }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      });
+    };
+    try {
+      const result = await callYinziVideoApi(null, {
+        base_url: 'https://api.yinziapi.top/v1', api_key: 'not-a-real-key', endpoint: '/videos',
+      }, log, {
+        model: 'mg-seedance2.0 -480p mini', prompt: 'X'.repeat(4096), duration: 5, video_gen_id: 82,
+      });
+      assert.equal(result.task_id, 'task-hard-boundary');
+      assert.equal(submittedBody.prompt.length, 4096);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('fails before any upload when known local reference videos exceed the provider duration budget', async () => {
+    const originalFetch = global.fetch;
+    const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'yinzi-over-duration-'));
+    let calls = 0;
+    makeReferenceVideo(path.join(storage, 'previous.mp4'), 'libx264', 24, 8);
+    makeReferenceVideo(path.join(storage, 'director.mp4'), 'libx264', 24, 8);
+    global.fetch = async () => { calls += 1; throw new Error('provider must not be called'); };
+    try {
+      const result = await callYinziVideoApi(null, {
+        base_url: 'https://api.yinziapi.top/v1', api_key: 'not-a-real-key', endpoint: '/videos',
+      }, log, {
+        model: 'mg-seedance2.0 -480p mini', prompt: 'test', duration: 5, aspect_ratio: '16:9',
+        reference_video_urls: ['previous.mp4', 'director.mp4'], storage_local_path: storage, video_gen_id: 9,
+      });
+      assert.equal(calls, 0);
+      assert.match(result.error, /total .* seconds.*15-second provider limit/i);
     } finally {
       global.fetch = originalFetch;
       fs.rmSync(storage, { recursive: true, force: true });

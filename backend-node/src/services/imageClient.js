@@ -70,6 +70,52 @@ async function compressImageBuffer(buffer, mimeType, targetKB = 2048, log = null
   return { buffer, mimeType };
 }
 
+async function prepareReferenceImageForTransport(value, filesBaseUrl, storageLocalPath, log = null, options = {}) {
+  const resolved = resolveImageRef(value, filesBaseUrl, storageLocalPath);
+  if (!resolved || !resolved.startsWith('data:')) return resolved;
+  const parsed = resolved.match(/^data:([\w.+/-]+);base64,(.+)$/s);
+  if (!parsed) return resolved;
+  const originalBuffer = Buffer.from(parsed[2], 'base64');
+  const sharp = getSharp();
+  if (!sharp) return resolved;
+
+  const maxLongEdge = Math.max(512, Number(options.maxLongEdge) || 1920);
+  const maxBytes = Math.max(256 * 1024, Number(options.maxBytes) || (2 * 1024 * 1024));
+  try {
+    const metadata = await sharp(originalBuffer).metadata();
+    const width = Number(metadata.width) || 0;
+    const height = Number(metadata.height) || 0;
+    if (originalBuffer.length <= maxBytes && Math.max(width, height) <= maxLongEdge) return resolved;
+
+    let quality = Math.min(95, Math.max(65, Number(options.quality) || 90));
+    let output;
+    do {
+      output = await sharp(originalBuffer)
+        .rotate()
+        .resize({ width: maxLongEdge, height: maxLongEdge, fit: 'inside', withoutEnlargement: true })
+        .flatten({ background: '#ffffff' })
+        .jpeg({ quality, chromaSubsampling: '4:4:4', mozjpeg: true })
+        .toBuffer();
+      quality -= 5;
+    } while (output.length > maxBytes && quality >= 65);
+
+    const compactMeta = await sharp(output).metadata();
+    log?.info?.('[reference transport] prepared bounded upload copy', {
+      original_bytes: originalBuffer.length,
+      output_bytes: output.length,
+      original_width: width,
+      original_height: height,
+      output_width: compactMeta.width,
+      output_height: compactMeta.height,
+      mime_type: 'image/jpeg',
+    });
+    return `data:image/jpeg;base64,${output.toString('base64')}`;
+  } catch (error) {
+    log?.warn?.('[reference transport] upload-copy preparation failed; using original', { error: error.message });
+    return resolved;
+  }
+}
+
 // 惰性加载配置，避免循环依赖与启动顺序问题
 let _appConfig = null;
 function getAppConfig() {
@@ -108,9 +154,29 @@ function inferProtocol(provider, model) {
  * @param {string} [preferredModel] - 指定模型名时，在匹配到的配置中选含该模型的
  * @param {string} [preferredProvider] - 指定供应商（如 openai / dashscope），只在该 provider 的配置中选
  * @param {string} [imageServiceType] - 'image' 文本生成图片（角色/场景/道具），'storyboard_image' 分镜图片生成（支持参考图）；缺省为 'image'
+ * @param {number} [explicitConfigId] - 工作流已选配置；存在时禁止回退到其它 Key
  */
-function getDefaultImageConfig(db, preferredModel, preferredProvider, imageServiceType) {
+function getDefaultImageConfig(db, preferredModel, preferredProvider, imageServiceType, explicitConfigId) {
   const serviceType = imageServiceType || 'image';
+  if (explicitConfigId != null && explicitConfigId !== '') {
+    const configId = Number(explicitConfigId);
+    const config = Number.isInteger(configId) && configId > 0
+      ? aiConfigService.getConfig(db, configId)
+      : null;
+    if (!config) throw new Error(`图片配置 ${explicitConfigId} 不存在，已停止生成以避免误用其它 Key`);
+    if (!config.is_active) throw new Error(`图片配置 ${configId} 已停用，已停止生成以避免误用其它 Key`);
+    if (config.service_type !== serviceType) {
+      throw new Error(`图片配置 ${configId} 类型为 ${config.service_type}，不能用于 ${serviceType}`);
+    }
+    const models = Array.isArray(config.model) ? config.model : (config.model != null ? [config.model] : []);
+    if (preferredModel && !models.includes(preferredModel)) {
+      throw new Error(`图片配置 ${configId} 不包含任务锁定模型 ${preferredModel}`);
+    }
+    if (preferredProvider && String(config.provider || '').toLowerCase() !== String(preferredProvider).trim().toLowerCase()) {
+      throw new Error(`图片配置 ${configId} 与任务锁定供应商 ${preferredProvider} 不一致`);
+    }
+    return config;
+  }
   let configs = aiConfigService.listConfigs(db, serviceType);
   if (configs.length === 0 && serviceType === 'storyboard_image') {
     configs = aiConfigService.listConfigs(db, 'image');
@@ -412,7 +478,7 @@ async function callKlingImageApi(config, log, opts) {
   const m = model || 'kling-image';
 
   const rawRefs = Array.isArray(reference_image_urls) ? reference_image_urls.filter(Boolean) : [];
-  const resolvedRefs = rawRefs.map((r) => resolveImageRef(r, files_base_url, storage_local_path)).filter(Boolean);
+  const resolvedRefs = rawRefs.map((ref) => resolveImageRef(ref, files_base_url, storage_local_path)).filter(Boolean);
 
   const body = {
     model: m,
@@ -1418,6 +1484,7 @@ async function callImageApi(db, log, opts) {
     image_type,
     image_gen_id,
     imageServiceType,
+    image_config_id,
     reference_image_urls,
     files_base_url,
     storage_local_path,
@@ -1425,7 +1492,7 @@ async function callImageApi(db, log, opts) {
     user_negative_prompt,
   } = opts;
   const preferredProvider = preferred_provider ?? opts.preferredProvider;
-  const config = getDefaultImageConfig(db, preferredModel, preferredProvider, imageServiceType);
+  const config = getDefaultImageConfig(db, preferredModel, preferredProvider, imageServiceType, image_config_id);
   if (!config) {
     throw new Error('未配置图片模型，请在「AI 配置」中添加 image 类型且已启用的配置');
   }
@@ -1461,6 +1528,7 @@ async function callImageApi(db, log, opts) {
     model,
     size,
     imageServiceType,
+    image_config_id: config.id,
     ref_count: Array.isArray(opts.reference_image_urls) ? opts.reference_image_urls.length : 0,
     ref_label_injected: effectivePrompt !== (prompt || ''),
     effectivePrompt
@@ -1520,7 +1588,12 @@ async function callImageApi(db, log, opts) {
   const isSeedream = isVolc || /seedream|doubao/i.test(model);
   // 解析参考图：本地路径/localhost URL → base64，公网 URL → 直接传
   const rawRefs = Array.isArray(reference_image_urls) ? reference_image_urls.filter(Boolean) : [];
-  const resolvedRefs = rawRefs.map((r) => resolveImageRef(r, files_base_url, storage_local_path)).filter(Boolean);
+  const resolvedRefs = (await Promise.all(rawRefs.map((ref) => prepareReferenceImageForTransport(
+    ref,
+    files_base_url,
+    storage_local_path,
+    log,
+  )))).filter(Boolean);
   if (resolvedRefs.length > 0) {
     log.info('Image API request with reference images', {
       url: url.slice(0, 60), model, image_gen_id,
@@ -1938,6 +2011,7 @@ module.exports = {
   fixAgnesImageSize,
   isAgnesImageConfig,
   fixOpenAIImageSize,
+  prepareReferenceImageForTransport,
   /** 图床 URL 缓存（image_proxy_cache），供 SD2 认证等复用 */
   getProxyCache,
   getProxyCacheValidated,

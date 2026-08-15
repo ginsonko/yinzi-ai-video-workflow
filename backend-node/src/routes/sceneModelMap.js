@@ -45,10 +45,10 @@ function create(db, log) {
         return response.badRequest(res, '场景键已存在');
       }
       
-      const result = db.prepare(`
-        INSERT INTO ai_model_map (key, service_type, config_id, model_override, description, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(key, service_type, config_id || null, model_override || null, description || '', now, now);
+      const result = require('../services/configMutationService').withAutomaticSnapshot(db, `新增模型路由 ${key}`, () => db.prepare(`
+          INSERT INTO ai_model_map (key, service_type, config_id, model_override, description, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run(key, service_type, config_id || null, model_override || null, description || '', now, now)).result;
       
       const row = db.prepare('SELECT * FROM ai_model_map WHERE id = ?').get(result.lastInsertRowid);
       response.created(res, row);
@@ -72,18 +72,18 @@ function update(db, log) {
         return response.notFound(res, '场景模型映射不存在');
       }
       
-      db.prepare(`
-        UPDATE ai_model_map 
-        SET service_type = ?, config_id = ?, model_override = ?, description = ?, updated_at = ?
-        WHERE key = ?
-      `).run(
-        service_type || 'text',
-        config_id !== undefined ? config_id : null,
-        model_override !== undefined ? model_override : null,
-        description !== undefined ? description : '',
-        now,
-        key
-      );
+      require('../services/configMutationService').withAutomaticSnapshot(db, `修改模型路由 ${key}`, () => db.prepare(`
+          UPDATE ai_model_map
+          SET service_type = ?, config_id = ?, model_override = ?, description = ?, updated_at = ?
+          WHERE key = ?
+        `).run(
+          service_type || 'text',
+          config_id !== undefined ? config_id : null,
+          model_override !== undefined ? model_override : null,
+          description !== undefined ? description : '',
+          now,
+          key
+        ));
       
       const row = db.prepare('SELECT * FROM ai_model_map WHERE key = ?').get(key);
       response.success(res, row);
@@ -103,7 +103,9 @@ function remove(db, log) {
         return response.notFound(res, '场景模型映射不存在');
       }
       
-      db.prepare('DELETE FROM ai_model_map WHERE key = ?').run(key);
+      require('../services/configMutationService').withAutomaticSnapshot(db, `删除模型路由 ${key}`, () => (
+        db.prepare('DELETE FROM ai_model_map WHERE key = ?').run(key)
+      ));
       response.success(res, { message: '删除成功' });
     } catch (err) {
       log.error('Delete scene model map failed', { error: err.message, key });

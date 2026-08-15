@@ -3,7 +3,7 @@
     <header class="header">
       <div class="header-inner">
         <h1 class="logo" @click="router.push('/')">
-          <span class="logo-main">本地短剧助手</span>
+          <span class="logo-main">银子AI视频工作流</span>
           <span class="logo-sub">画布模式</span>
         </h1>
         <span class="breadcrumb-sep">›</span>

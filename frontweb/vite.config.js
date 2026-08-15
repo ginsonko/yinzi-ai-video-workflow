@@ -2,6 +2,8 @@ import vue from '@vitejs/plugin-vue'
 import { fileURLToPath, URL } from 'node:url'
 import { defineConfig } from 'vite'
 
+const apiTarget = process.env.LOCAL_MINIDRAMA_API_TARGET || 'http://127.0.0.1:5679'
+
 export default defineConfig({
   plugins: [vue()],
   resolve: {
@@ -14,13 +16,13 @@ export default defineConfig({
     port: 3013,
     proxy: {
       '/api': {
-        target: 'http://127.0.0.1:5679',
+        target: apiTarget,
         changeOrigin: true,
         proxyTimeout: 600000,
         timeout: 600000
       },
       '/static': {
-        target: 'http://127.0.0.1:5679',
+        target: apiTarget,
         changeOrigin: true
       }
     }

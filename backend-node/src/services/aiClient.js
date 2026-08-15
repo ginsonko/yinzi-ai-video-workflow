@@ -254,36 +254,48 @@ function getConfigFromModelMap(db, sceneKey) {
   }
 }
 
-async function generateText(db, log, serviceType, userPrompt, systemPrompt, options = {}) {
-  const { model: preferredModel, temperature = 0.7, json_mode = false, min_max_tokens = null, streamCallback = null, scene_key = null } = options;
-
-  // F2: 若传入 scene_key，优先从 ai_model_map 查找对应的模型路由配置
+function resolveTextRoute(db, serviceType = 'text', options = {}) {
+  const preferredModel = options.model;
   let config = null;
   let routedModelOverride = null;
-  if (scene_key) {
-    const mapped = getConfigFromModelMap(db, scene_key);
+  if (options.scene_key) {
+    const mapped = getConfigFromModelMap(db, options.scene_key);
     if (mapped) {
       config = mapped.config;
       routedModelOverride = mapped.modelOverride;
-      log.info('AI generateText: scene_key routing', { scene_key, config_id: config.id, model_override: routedModelOverride });
     }
   }
-
   if (!config) {
     config = preferredModel
       ? getConfigForModel(db, serviceType, preferredModel)
       : getDefaultConfig(db, serviceType);
   }
-  if (!config && preferredModel === undefined) {
-    // 兜底：如果前端传了 undefined，且没找到默认，尝试重新找一下（可能 serviceType 传值问题，或者数据库问题）
-    config = getDefaultConfig(db, 'text');
-  }
+  if (!config && preferredModel === undefined) config = getDefaultConfig(db, 'text');
+  if (!config) return null;
+  const model = getModelFromConfig(config, routedModelOverride || preferredModel);
+  return {
+    config,
+    config_id: Number(config.id),
+    provider: String(config.provider || '').trim().toLowerCase(),
+    model,
+    scene_key: options.scene_key || null,
+    routed_model_override: routedModelOverride || null,
+  };
+}
+
+async function generateText(db, log, serviceType, userPrompt, systemPrompt, options = {}) {
+  const { model: preferredModel, temperature = 0.7, json_mode = false, min_max_tokens = null, streamCallback = null, scene_key = null } = options;
+  const route = resolveTextRoute(db, serviceType, { model: preferredModel, scene_key });
+  const config = route?.config || null;
   if (!config) {
     throw new Error(`未配置文本模型，请在「AI 配置」中添加 ${serviceType} 类型 且已启用的配置`);
   }
-  // scene_key 路由的模型覆盖优先级 > preferredModel
-  const effectivePreferredModel = routedModelOverride || preferredModel;
-  const model = getModelFromConfig(config, effectivePreferredModel);
+  if (route.routed_model_override) {
+    log.info('AI generateText: scene_key routing', {
+      scene_key, config_id: config.id, model_override: route.routed_model_override,
+    });
+  }
+  const model = route.model;
   const url = buildChatUrl(config);
 
   // 解析 settings 里的 max_tokens 上限（用户在 AI 配置里可设置 {"max_tokens": 8192}）
@@ -337,7 +349,10 @@ async function generateText(db, log, serviceType, userPrompt, systemPrompt, opti
   body = applyDeepSeekChatOptions(config, body);
   const startMs = Date.now();
   log.info('AI generateText request', { url: url.slice(0, 60), model, max_tokens: finalMaxTokens ?? '(model default)', json_mode, stream: true });
-  const res = await postJSONStream(url, { Authorization: 'Bearer ' + (config.api_key || '') }, body, 60000, (receivedLen, event, accumulated) => {
+  const silenceMs = options.silence_timeout_ms == null
+    ? 60000
+    : Math.min(600000, Math.max(30000, Number(options.silence_timeout_ms) || 60000));
+  const res = await postJSONStream(url, { Authorization: 'Bearer ' + (config.api_key || '') }, body, silenceMs, (receivedLen, event, accumulated) => {
     if (event === 'first_token') {
       log.info('AI stream first token', { model, ttft_ms: Date.now() - startMs });
     } else if (receivedLen > 0 && receivedLen % 500 < 20) {
@@ -700,6 +715,7 @@ module.exports = {
   getDefaultConfig,
   getConfigForModel,
   getConfigFromModelMap,
+  resolveTextRoute,
   generateText,
   streamGenerateText,
   generateTextWithVision,

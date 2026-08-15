@@ -37,19 +37,19 @@ function getGenerationSettings(db) {
 function updateGenerationSettings(db) {
   return (req, res) => {
     const { concurrency, video_concurrency } = req.body || {};
-    if (concurrency !== undefined) {
-      const n = Number(concurrency);
-      if (!Number.isInteger(n) || n < 1 || n > 20) {
-        return response.badRequest(res, '图片并发数需为 1-20 之间的整数');
-      }
-      settingsService.setGlobalSetting(db, 'pipeline_concurrency', n);
+    const imageValue = concurrency === undefined ? undefined : Number(concurrency);
+    const videoValue = video_concurrency === undefined ? undefined : Number(video_concurrency);
+    if (imageValue !== undefined && (!Number.isInteger(imageValue) || imageValue < 1 || imageValue > 20)) {
+      return response.badRequest(res, '图片并发数需为 1-20 之间的整数');
     }
-    if (video_concurrency !== undefined) {
-      const n = Number(video_concurrency);
-      if (!Number.isInteger(n) || n < 1 || n > 20) {
-        return response.badRequest(res, '视频并发数需为 1-20 之间的整数');
-      }
-      settingsService.setGlobalSetting(db, 'pipeline_video_concurrency', n);
+    if (videoValue !== undefined && (!Number.isInteger(videoValue) || videoValue < 1 || videoValue > 20)) {
+      return response.badRequest(res, '视频并发数需为 1-20 之间的整数');
+    }
+    if (imageValue !== undefined || videoValue !== undefined) {
+      require('../services/configMutationService').withAutomaticSnapshot(db, '修改生成并发配置', () => {
+        if (imageValue !== undefined) settingsService.setGlobalSetting(db, 'pipeline_concurrency', imageValue);
+        if (videoValue !== undefined) settingsService.setGlobalSetting(db, 'pipeline_video_concurrency', videoValue);
+      });
     }
     const saved = settingsService.getGlobalSetting(db, 'pipeline_concurrency', 3);
     const saved_video = settingsService.getGlobalSetting(db, 'pipeline_video_concurrency', 3);

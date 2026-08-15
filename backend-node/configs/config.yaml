@@ -1,7 +1,7 @@
 app:
-  name: LocalMiniDrama API
-  version: 1.0.0
-  debug: true
+  name: 银子AI视频工作流 API
+  version: 0.1.2-beta.1
+  debug: false
   language: zh
 server:
   port: 5679
@@ -10,7 +10,7 @@ server:
     - http://localhost:3012
   read_timeout: 600
   write_timeout: 600
-  insecure_tls: true
+  insecure_tls: false
 database:
   type: sqlite
   path: ./data/drama_generator.db

@@ -66,6 +66,16 @@ function create(db, log, req) {
   return { merge_id: info.lastInsertRowid, task_id: task.id, ...getById(db, info.lastInsertRowid) };
 }
 
+function updateOptions(db, id, patch = {}) {
+  const row = db.prepare('SELECT merge_options FROM video_merges WHERE id = ? AND deleted_at IS NULL').get(Number(id));
+  if (!row) return null;
+  let current = {};
+  try { current = JSON.parse(row.merge_options || '{}'); } catch (_) {}
+  const merged = { ...current, ...(patch && typeof patch === 'object' ? patch : {}) };
+  db.prepare('UPDATE video_merges SET merge_options = ? WHERE id = ?').run(JSON.stringify(merged), Number(id));
+  return merged;
+}
+
 function deleteById(db, log, id) {
   const now = new Date().toISOString();
   const result = db.prepare('UPDATE video_merges SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL').run(now, Number(id));
@@ -160,20 +170,112 @@ function runFfmpegConcat(localPaths, outputPath, log) {
   }
 }
 
+function ffmpegInputHasAudio(filePath) {
+  const { spawnSync } = require('child_process');
+  const result = spawnSync(getFfmpegPath(), ['-hide_banner', '-i', filePath], {
+    encoding: 'utf8',
+    maxBuffer: 4 * 1024 * 1024,
+  });
+  return /Stream\s+#\d+:\d+[^\n]*Audio:/i.test(result.stderr || '');
+}
+
+function strictTargetPixels(aspectRatio) {
+  const ratio = String(aspectRatio || '16:9').replace('：', ':');
+  if (ratio === '9:16') return { width: 720, height: 1280 };
+  if (ratio === '1:1') return { width: 960, height: 960 };
+  if (ratio === '4:3') return { width: 960, height: 720 };
+  if (ratio === '3:4') return { width: 720, height: 960 };
+  if (ratio === '21:9') return { width: 1280, height: 548 };
+  return { width: 1280, height: 720 };
+}
+
+function normalizeClipForStrictMerge(inputPath, outputPath, options, log) {
+  const { spawnSync } = require('child_process');
+  const target = strictTargetPixels(options.aspect_ratio);
+  const hasAudio = ffmpegInputHasAudio(inputPath);
+  const videoFilter = `scale=${target.width}:${target.height}:force_original_aspect_ratio=decrease,pad=${target.width}:${target.height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30,format=yuv420p`;
+  const args = ['-hide_banner', '-loglevel', 'error', '-i', inputPath];
+  if (!hasAudio) args.push('-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000');
+  args.push(
+    '-filter:v', videoFilter,
+    '-map', '0:v:0',
+    '-map', hasAudio ? '0:a:0' : '1:a:0',
+    '-c:v', 'libx264',
+    '-preset', options.preset || 'medium',
+    '-crf', String(options.crf == null ? 18 : options.crf),
+    '-c:a', 'aac',
+    '-ar', '48000',
+    '-ac', '2',
+    '-movflags', '+faststart',
+    '-shortest',
+    '-y', outputPath
+  );
+  const result = spawnSync(getFfmpegPath(), args, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+  if (result.error || result.status !== 0 || !fs.existsSync(outputPath) || fs.statSync(outputPath).size < 8192) {
+    log.warn('Video merge: strict clip normalization failed', {
+      input: inputPath,
+      error: result.error?.message,
+      stderr: result.stderr?.slice(-1000),
+    });
+    return false;
+  }
+  return true;
+}
+
+function runStrictNormalizedMerge(localPaths, outputPath, options, log, tempDir) {
+  const normalized = [];
+  try {
+    for (let index = 0; index < localPaths.length; index++) {
+      const normalizedPath = path.join(tempDir, `strict_${Date.now()}_${index}.mp4`);
+      if (!normalizeClipForStrictMerge(localPaths[index], normalizedPath, options, log)) return false;
+      normalized.push(normalizedPath);
+    }
+    return runFfmpegConcat(normalized, outputPath, log)
+      && fs.existsSync(outputPath)
+      && fs.statSync(outputPath).size >= 8192;
+  } finally {
+    for (const filePath of normalized) {
+      try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch (_) {}
+    }
+  }
+}
+
+function failMerge(db, taskService, mergeId, taskId, message) {
+  const timestamp = new Date().toISOString();
+  try {
+    db.prepare(
+      'UPDATE video_merges SET status = ?, error_msg = ?, completed_at = ?, updated_at = ? WHERE id = ?'
+    ).run('failed', String(message || '合成失败').slice(0, 500), timestamp, timestamp, mergeId);
+  } catch (error) {
+    if (!String(error.message || '').includes('updated_at')) throw error;
+    db.prepare(
+      'UPDATE video_merges SET status = ?, error_msg = ?, completed_at = ? WHERE id = ?'
+    ).run('failed', String(message || '合成失败').slice(0, 500), timestamp, mergeId);
+  }
+  if (taskId) taskService.updateTaskError(db, taskId, message || '合成失败');
+}
+
 /**
  * 异步处理视频合成：优先使用 ffmpeg 真正合并多段视频；失败或无 ffmpeg 时用首段作为 merged_url。
  */
-async function processVideoMerge(db, log, mergeId, baseUrl) {
+async function processVideoMerge(db, log, mergeId, baseUrl, storageRootOverride = null) {
   const r = db.prepare('SELECT * FROM video_merges WHERE id = ? AND deleted_at IS NULL').get(mergeId);
   if (!r) return;
   const taskId = r.task_id;
   const episodeId = r.episode_id;
   let scenes = [];
+  let mergeOpts = {};
   try {
     scenes = JSON.parse(r.scenes || '[]');
   } catch (_) {
     log.warn('video merge parse scenes failed', { merge_id: mergeId });
   }
+  try {
+    mergeOpts = JSON.parse(r.merge_options || '{}');
+  } catch (_) {
+    mergeOpts = {};
+  }
+  const strict = mergeOpts.strict === true;
   const now = new Date().toISOString();
   db.prepare('UPDATE video_merges SET status = ? WHERE id = ?').run('processing', mergeId);
   const taskService = require('./taskService');
@@ -191,7 +293,7 @@ async function processVideoMerge(db, log, mergeId, baseUrl) {
   }
 
   const totalDuration = scenes.reduce((sum, s) => sum + (Number(s.duration) || 0), 0);
-  const storageRoot = getStorageRoot();
+  const storageRoot = storageRootOverride ? path.resolve(storageRootOverride) : getStorageRoot();
   const tempDir = path.join(require('os').tmpdir(), 'drama-video-merge');
   if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
 
@@ -221,6 +323,18 @@ async function processVideoMerge(db, log, mergeId, baseUrl) {
     cwd: process.cwd(),
   });
 
+  if (strict && localPaths.length !== scenes.length) {
+    for (const p of toCleanup) {
+      try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch (_) {}
+    }
+    failMerge(db, taskService, mergeId, taskId, `严格合成要求 ${scenes.length} 段本地视频，实际仅取得 ${localPaths.length} 段`);
+    return;
+  }
+  if (strict && !ffmpegAvailable) {
+    failMerge(db, taskService, mergeId, taskId, '严格合成需要本地 FFmpeg');
+    return;
+  }
+
   let mergedRelativePath = null;
   if (localPaths.length > 0 && ffmpegAvailable && localPaths.length <= 100) {
     const projectSubdir = storageLayout.getProjectStorageSubdir(db, r.drama_id);
@@ -231,7 +345,9 @@ async function processVideoMerge(db, log, mergeId, baseUrl) {
     if (!fs.existsSync(mergedDir)) fs.mkdirSync(mergedDir, { recursive: true });
     const outputFileName = `merged_${Date.now()}.mp4`;
     const outputPath = path.join(mergedDir, outputFileName);
-    const ok = runFfmpegConcat(localPaths, outputPath, log);
+    const ok = strict
+      ? runStrictNormalizedMerge(localPaths, outputPath, mergeOpts, log, tempDir)
+      : runFfmpegConcat(localPaths, outputPath, log);
     if (ok && fs.existsSync(outputPath)) {
       mergedRelativePath = sub
         ? path.join(sub, 'videos', 'merged', outputFileName).replace(/\\/g, '/')
@@ -240,16 +356,20 @@ async function processVideoMerge(db, log, mergeId, baseUrl) {
     }
   }
 
-  let mergeOpts = {};
-  try {
-    mergeOpts = JSON.parse(r.merge_options || '{}');
-  } catch (_) {
-    mergeOpts = {};
+  if (strict && !mergedRelativePath) {
+    for (const p of toCleanup) {
+      try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch (_) {}
+    }
+    failMerge(db, taskService, mergeId, taskId, '严格合成失败，未生成有效成片文件');
+    return;
   }
   const postNeed =
     !!mergeOpts.burn_narration_subtitles
+    || !!mergeOpts.narration_enabled
     || !!mergeOpts.burn_dialogue_audio
+    || ['sidecar', 'burn'].includes(mergeOpts.subtitle_mode)
     || !!(mergeOpts.watermark_text && String(mergeOpts.watermark_text).trim());
+  let postReceipt = null;
   if (mergedRelativePath && ffmpegAvailable && postNeed) {
     const mergedAbsPath = path.join(storageRoot, mergedRelativePath.replace(/\//g, path.sep));
     if (fs.existsSync(mergedAbsPath)) {
@@ -261,11 +381,19 @@ async function processVideoMerge(db, log, mergeId, baseUrl) {
         episodeId,
         mergeOpts,
       });
+      postReceipt = post;
       if (post.ok && post.relativePath) {
         mergedRelativePath = post.relativePath;
         log.info('Video merge: merged episode post-process', { merge_id: mergeId, out: mergedRelativePath });
       } else if (post.error && post.error !== 'NO_POST_OPTS') {
         log.warn('Video merge: post-process skipped', { merge_id: mergeId, err: post.error });
+        if (mergeOpts.strict_post_process === true) {
+          for (const p of toCleanup) {
+            try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch (_) {}
+          }
+          failMerge(db, taskService, mergeId, taskId, `最终旁白/字幕处理失败：${post.error}`);
+          return;
+        }
       }
     }
   }
@@ -280,7 +408,12 @@ async function processVideoMerge(db, log, mergeId, baseUrl) {
   ).run('completed', finalMergedUrl, Math.round(totalDuration) || null, now, null, mergeId);
   db.prepare('UPDATE episodes SET video_url = ?, status = ?, updated_at = ? WHERE id = ?').run(finalMergedUrl, 'completed', now, episodeId);
   if (taskId) {
-    taskService.updateTaskResult(db, taskId, { merge_id: mergeId, video_url: finalMergedUrl, duration: Math.round(totalDuration) });
+    taskService.updateTaskResult(db, taskId, {
+      merge_id: mergeId,
+      video_url: finalMergedUrl,
+      duration: Math.round(totalDuration),
+      post_process: postReceipt,
+    });
   }
   if (!mergedRelativePath) {
     log.info('Video merge completed (first-clip fallback)', { merge_id: mergeId, episode_id: episodeId });
@@ -291,6 +424,11 @@ module.exports = {
   list,
   getById,
   create,
+  updateOptions,
   deleteById,
   processVideoMerge,
+  runFfmpegConcat,
+  runStrictNormalizedMerge,
+  normalizeClipForStrictMerge,
+  strictTargetPixels,
 };

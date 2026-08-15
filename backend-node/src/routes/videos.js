@@ -67,10 +67,13 @@ function routes(db, log) {
         const refAudiosJson = Array.isArray(body.reference_audio_urls)
           ? JSON.stringify(body.reference_audio_urls)
           : null;
+        const promptContractJson = body.prompt_contract && typeof body.prompt_contract === 'object'
+          ? JSON.stringify(body.prompt_contract)
+          : null;
         db.prepare(
-          `INSERT INTO video_generations (drama_id, storyboard_id, provider, prompt, model, duration, aspect_ratio, resolution, seed, camera_fixed, watermark, image_url, first_frame_url, last_frame_url, reference_image_urls, reference_video_urls, reference_audio_urls, status, task_id, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'processing', ?, ?, ?)`
-        ).run(dramaId, storyboardId, provider, prompt, model, duration, aspectRatio, resolution, seed, cameraFixed, watermark, imageUrl, firstFrameUrl, lastFrameUrl, refImagesJson, refVideosJson, refAudiosJson, task.id, now, now);
+          `INSERT INTO video_generations (drama_id, storyboard_id, provider, prompt, prompt_contract_json, model, duration, aspect_ratio, resolution, seed, camera_fixed, watermark, image_url, first_frame_url, last_frame_url, reference_image_urls, reference_video_urls, reference_audio_urls, status, task_id, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'processing', ?, ?, ?)`
+        ).run(dramaId, storyboardId, provider, prompt, promptContractJson, model, duration, aspectRatio, resolution, seed, cameraFixed, watermark, imageUrl, firstFrameUrl, lastFrameUrl, refImagesJson, refVideosJson, refAudiosJson, task.id, now, now);
         const videoGenId = db.prepare('SELECT last_insert_rowid() as id').get().id;
         setImmediate(() => {
           videoService.processVideoGeneration(db, log, videoGenId);

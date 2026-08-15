@@ -36,6 +36,8 @@ function rowToItem(r) {
     provider: r.provider,
     prompt: r.prompt,
     model: r.model,
+    image_service_type: r.image_service_type ?? undefined,
+    image_config_id: r.image_config_id ?? undefined,
     image_url: r.image_url,
     local_path: r.local_path,
     status: r.status,
@@ -556,8 +558,8 @@ function create(db, log, req) {
   }
   const useFirstFrameLayoutLock = resolveUseFirstFrameLayoutLock(req, frameType);
   const info = db.prepare(
-    `INSERT INTO image_generations (storyboard_id, drama_id, scene_id, provider, prompt, negative_prompt, model, frame_type, reference_images, use_first_frame_layout_lock, size, status, task_id, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`
+    `INSERT INTO image_generations (storyboard_id, drama_id, scene_id, provider, prompt, negative_prompt, model, image_service_type, image_config_id, frame_type, reference_images, use_first_frame_layout_lock, size, status, task_id, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`
   ).run(
     req.storyboard_id ?? null,
     Number(req.drama_id) || 0,
@@ -566,6 +568,8 @@ function create(db, log, req) {
     mergedPrompt,
     req.negative_prompt ?? null,
     req.model ?? null,
+    req.image_service_type || null,
+    req.image_config_id == null ? null : Number(req.image_config_id),
     frameType,
     refImagesJson,
     useFirstFrameLayoutLock,
@@ -611,7 +615,7 @@ async function processImageGeneration(db, log, imageGenId) {
   const now = new Date().toISOString();
   try {
     db.prepare('UPDATE image_generations SET status = ?, updated_at = ? WHERE id = ?').run('processing', now, imageGenId);
-    const imageServiceType = row.storyboard_id ? 'storyboard_image' : 'image';
+    const imageServiceType = row.image_service_type || (row.storyboard_id ? 'storyboard_image' : 'image');
 
     // ── 四宫格模式：先生成4帧提示词，再拼装组合提示词 ──────────────────
     if (row.frame_type === 'quad_grid' && row.storyboard_id) {
@@ -696,7 +700,7 @@ async function processImageGeneration(db, log, imageGenId) {
     }
 
     // ── Step 1: 获取 AI 配置 ──────────────────────────────────────────
-    const config = imageClient.getDefaultImageConfig(db, row.model, null, imageServiceType);
+    const config = imageClient.getDefaultImageConfig(db, row.model, null, imageServiceType, row.image_config_id);
     if (!config) {
       log.error('[图生] ✗ 未找到图片 AI 配置', { id: imageGenId, imageServiceType, elapsed: elapsed() });
       db.prepare('UPDATE image_generations SET status = ?, error_msg = ?, updated_at = ? WHERE id = ?').run(
@@ -1404,11 +1408,12 @@ async function processImageGeneration(db, log, imageGenId) {
       character_id: row.character_id,
       image_gen_id: imageGenId,
       imageServiceType,
+      image_config_id: row.image_config_id,
       reference_image_urls: reference_image_urls || undefined,
       files_base_url: filesBaseUrl,
       storage_local_path: storageLocalPath,
       system_prompt: apiSystemPrompt,
-      negative_prompt: row.negative_prompt || undefined,
+      user_negative_prompt: row.negative_prompt || undefined,
       frame_identity_lock: isFrameIdentityLock,
     });
     log.info('[图生] Step4 图生 API 返回', { id: imageGenId, api_ms: Date.now() - tApi, has_error: !!result.error, elapsed: elapsed() });

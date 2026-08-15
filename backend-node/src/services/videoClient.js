@@ -7,8 +7,11 @@ const { uploadLocalImageToProxy, uploadToImageProxy } = require('./uploadService
 const imageClient = require('./imageClient');
 const {
   getYinziVideoCapability,
+  capabilitySupportsRole,
   clampYinziVideoDuration,
 } = require('./yinziVideoCapabilities');
+const { prepareYinziReferenceVideo, probeReferenceVideo } = require('./yinziReferenceMedia');
+const { prepareYinziReferenceImage } = require('./yinziReferenceImage');
 const {
   clampToGeminiImageAspectRatio,
   clampToViduAspectRatio,
@@ -1007,6 +1010,93 @@ function buildYinziContentUrl(config, pollId) {
   return `${buildYinziPollUrl(config, pollId)}/content`;
 }
 
+function normalizeYinziAssetPromptReceipt(payload, expectedPrompt, assetId, checkedAt = new Date().toISOString()) {
+  const metadata = payload?.data && typeof payload.data === 'object' ? payload.data : payload;
+  const storedPrompt = typeof metadata?.prompt === 'string' ? metadata.prompt : null;
+  const expectedAvailable = typeof expectedPrompt === 'string';
+  const submittedChars = expectedAvailable ? expectedPrompt.length : null;
+  const storedChars = storedPrompt == null ? null : storedPrompt.length;
+  const exactMatch = expectedAvailable && storedPrompt != null ? storedPrompt === expectedPrompt : null;
+  const prefixMatch = expectedAvailable && storedPrompt != null
+    ? expectedPrompt.startsWith(storedPrompt)
+    : null;
+  const providerFlag = metadata?.prompt_truncated === true;
+  let status = 'unverified';
+  let reason = 'provider_prompt_unavailable';
+  if (providerFlag || (prefixMatch === true && storedChars < submittedChars)) {
+    status = 'truncated';
+    reason = providerFlag ? 'provider_reported_truncation' : 'shorter_prefix_returned';
+  } else if (exactMatch === true && metadata?.prompt_truncated !== true) {
+    status = 'verified';
+    reason = 'provider_prompt_matches_submission';
+  } else if (storedPrompt != null && expectedAvailable) {
+    reason = 'provider_prompt_mismatch';
+  }
+  return {
+    profile: 'yinzi-asset-prompt-v1',
+    status,
+    asset_id: assetId || metadata?.asset?.id || null,
+    submitted_chars: submittedChars,
+    stored_chars: storedChars,
+    prompt_truncated: providerFlag,
+    exact_match: exactMatch,
+    prefix_match: prefixMatch,
+    checked_at: checkedAt,
+    reason,
+  };
+}
+
+async function inspectYinziAssetPromptReceipt(config, taskData, expectedPrompt, log, videoGenId) {
+  const artifacts = Array.isArray(taskData?.artifacts) ? taskData.artifacts : [];
+  const primary = artifacts.find((item) => item?.type === 'video' && item?.role === 'primary')
+    || artifacts.find((item) => item?.type === 'video')
+    || artifacts[0];
+  const assetId = String(primary?.id || '').trim();
+  if (!assetId) {
+    return normalizeYinziAssetPromptReceipt({}, expectedPrompt, null);
+  }
+  const root = getAgnesApiRoot(config.base_url);
+  const url = `${root}/v1/assets/${encodeURIComponent(assetId)}`;
+  try {
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: { Authorization: 'Bearer ' + (config.api_key || '') },
+      signal: AbortSignal.timeout(20000),
+    });
+    const raw = await res.text();
+    if (!res.ok) {
+      return {
+        ...normalizeYinziAssetPromptReceipt({}, expectedPrompt, assetId),
+        reason: `asset_metadata_http_${res.status}`,
+      };
+    }
+    let payload;
+    try {
+      payload = JSON.parse(raw);
+    } catch (error) {
+      return {
+        ...normalizeYinziAssetPromptReceipt({}, expectedPrompt, assetId),
+        reason: `asset_metadata_invalid_json:${error.message}`.slice(0, 180),
+      };
+    }
+    const receipt = normalizeYinziAssetPromptReceipt(payload, expectedPrompt, assetId);
+    log.info('[YinziAPI] Prompt integrity receipt', {
+      video_gen_id: videoGenId,
+      asset_id: assetId,
+      status: receipt.status,
+      submitted_chars: receipt.submitted_chars,
+      stored_chars: receipt.stored_chars,
+      prompt_truncated: receipt.prompt_truncated,
+    });
+    return receipt;
+  } catch (error) {
+    return {
+      ...normalizeYinziAssetPromptReceipt({}, expectedPrompt, assetId),
+      reason: `asset_metadata_unavailable:${error.message || 'network_error'}`.slice(0, 180),
+    };
+  }
+}
+
 /**
  * 对齐 new-api：extractVideoURL + taskcommon.ExtractVideoURLFromJSON，
  * 并兼容当前 Agnes 完成态把直链放在 metadata.url（实测 2026-07）。
@@ -1096,6 +1186,11 @@ function normalizeVolcModel(name) {
 function getModelFromConfig(config, preferredModel) {
   const models = Array.isArray(config.model) ? config.model : (config.model != null ? [config.model] : []);
   if (preferredModel && models.includes(preferredModel)) return preferredModel;
+  // A Yinzi credential is group-scoped rather than model-scoped. The live
+  // catalog/router has already verified the selected model belongs to that
+  // group, so allow the opaque per-shot model without mutating the saved
+  // configuration list. Other providers remain strictly configuration-bound.
+  if (preferredModel && String(config.provider || '').toLowerCase() === 'yinzi') return preferredModel;
   if (config.default_model && models.includes(config.default_model)) return config.default_model;
   return models[0] || '';
 }
@@ -2707,11 +2802,27 @@ function yinziReference(type, role, source) {
 function buildYinziReferences(input, resolved = {}) {
   const refs = [];
   const rawImages = Array.isArray(input?.reference_urls) ? input.reference_urls.filter(Boolean) : [];
+  const capability = getYinziVideoCapability(input?.model);
+  const strictFirstSupported = capabilitySupportsRole(capability, 'image', 'first_frame');
+  const strictLastSupported = capabilitySupportsRole(capability, 'image', 'last_frame');
   if (rawImages.length) {
+    if (strictFirstSupported) {
+      const first = yinziReference('image', 'first_frame', resolved.first);
+      if (first) refs.push(first);
+    }
     for (const source of resolved.images || resolved.references || []) {
       const reference = yinziReference('image', 'reference', source);
       if (reference) refs.push(reference);
     }
+    if (strictLastSupported) {
+      const last = yinziReference('image', 'last_frame', resolved.last);
+      if (last) refs.push(last);
+    }
+  } else if (strictFirstSupported || strictLastSupported) {
+    const first = yinziReference('image', 'first_frame', resolved.first);
+    const last = yinziReference('image', 'last_frame', resolved.last);
+    if (first) refs.push(first);
+    if (last && JSON.stringify(last) !== JSON.stringify(first)) refs.push(last);
   } else if (isYinziAizzzVideoModel(input?.model)) {
     const reference = yinziReference('image', 'reference', resolved.first);
     if (reference) refs.push(reference);
@@ -2783,6 +2894,35 @@ function localReferencePath(raw, storageLocalPath) {
   return fs.existsSync(candidate) && fs.statSync(candidate).isFile() ? candidate : null;
 }
 
+function validateLocalYinziReferenceVideoDurationBudget(values, storageLocalPath, capability) {
+  const maximum = Number(capability?.max_reference_video_seconds_total);
+  if (!Number.isFinite(maximum) || maximum <= 0) return { ok: true, known_total_seconds: 0, unknown_count: 0 };
+  let knownTotal = 0;
+  let unknownCount = 0;
+  const durations = [];
+  for (const value of Array.isArray(values) ? values : []) {
+    const filePath = localReferencePath(value, storageLocalPath);
+    if (!filePath) {
+      unknownCount += 1;
+      durations.push(null);
+      continue;
+    }
+    const duration = probeReferenceVideo(filePath).duration;
+    knownTotal += duration;
+    durations.push(duration);
+  }
+  if (knownTotal > maximum + 0.001) {
+    return {
+      ok: false,
+      error: `YinziAPI reference videos total ${knownTotal.toFixed(3)} seconds, above the ${maximum}-second provider limit; stopped before upload`,
+      known_total_seconds: knownTotal,
+      unknown_count: unknownCount,
+      durations,
+    };
+  }
+  return { ok: true, known_total_seconds: knownTotal, unknown_count: unknownCount, durations };
+}
+
 function mimeTypeForReference(filePath, type) {
   const ext = path.extname(filePath).toLowerCase();
   const mime = {
@@ -2793,8 +2933,28 @@ function mimeTypeForReference(filePath, type) {
   return mime || `${type}/octet-stream`;
 }
 
-async function uploadYinziReferenceFile(config, filePath, type, capability, log, videoGenId, index) {
-  const size = fs.statSync(filePath).size;
+async function uploadYinziReferenceFile(config, filePath, type, capability, log, videoGenId, index, storageRoot, aspectRatio) {
+  let prepared;
+  if (type === 'video') {
+    prepared = prepareYinziReferenceVideo(filePath, {
+      storage_root: storageRoot,
+      log,
+      video_gen_id: videoGenId,
+      index,
+      aspect_ratio: aspectRatio,
+    });
+  } else if (type === 'image') {
+    prepared = await prepareYinziReferenceImage(filePath, {
+      storage_root: storageRoot,
+      log,
+      video_gen_id: videoGenId,
+      index,
+    });
+  } else {
+    prepared = { file_path: filePath };
+  }
+  const uploadPath = prepared.file_path;
+  const size = fs.statSync(uploadPath).size;
   const maxBytes = capability?.[`max_${type}_bytes`];
   if (maxBytes && size > maxBytes) {
     throw new Error(`参考${type}文件超过 ${(maxBytes / 1024 / 1024).toFixed(0)}MB 限制`);
@@ -2802,7 +2962,7 @@ async function uploadYinziReferenceFile(config, filePath, type, capability, log,
   const base = String(config.base_url || 'https://api.yinziapi.top/v1').replace(/\/$/, '');
   const form = new FormData();
   form.append('purpose', 'user_data');
-  form.append('file', new Blob([fs.readFileSync(filePath)], { type: mimeTypeForReference(filePath, type) }), path.basename(filePath));
+  form.append('file', new Blob([fs.readFileSync(uploadPath)], { type: mimeTypeForReference(uploadPath, type) }), path.basename(uploadPath));
   const response = await fetch(`${base}/files`, {
     method: 'POST',
     headers: { Authorization: 'Bearer ' + (config.api_key || '') },
@@ -2834,7 +2994,10 @@ async function resolveYinziReferenceSource(config, raw, type, capability, opts, 
   }
   const filePath = localReferencePath(value, opts.storage_local_path);
   if (!filePath) throw new Error(`本地参考${type}文件不存在或不在媒体目录中`);
-  return uploadYinziReferenceFile(config, filePath, type, capability, log, opts.video_gen_id, index);
+  return uploadYinziReferenceFile(
+    config, filePath, type, capability, log, opts.video_gen_id, index,
+    opts.storage_local_path, opts.aspect_ratio
+  );
 }
 
 async function callYinziVideoApi(db, config, log, opts) {
@@ -2844,11 +3007,28 @@ async function callYinziVideoApi(db, config, log, opts) {
   const url = base + endpoint;
 
   const capability = getYinziVideoCapability(opts.model);
+  const prompt = String(opts.prompt || '');
+  const maxPromptChars = Number(
+    capability?.provider_prompt_hard_max_chars ?? capability?.max_prompt_chars
+  );
+  if (Number.isFinite(maxPromptChars) && prompt.length > maxPromptChars) {
+    return {
+      error: `YinziAPI prompt has ${prompt.length} characters, above the ${maxPromptChars}-character model limit; stopped before reference upload`,
+    };
+  }
   const rawReferenceUrls = dedupeReferenceInputs(opts.reference_urls);
   const rawVideoUrls = dedupeReferenceInputs(opts.reference_video_urls);
   const rawAudioUrls = dedupeReferenceInputs(opts.reference_audio_urls);
   const legacyFirst = String(opts.first_frame_url || opts.image_url || '').trim();
-  const rawImageCount = rawReferenceUrls.length || (legacyFirst ? 1 : 0);
+  const legacyLast = String(opts.last_frame_url || '').trim();
+  const strictFirstSupported = capabilitySupportsRole(capability, 'image', 'first_frame');
+  const strictLastSupported = capabilitySupportsRole(capability, 'image', 'last_frame');
+  if (legacyFirst && rawReferenceUrls.length && isYinziAizzzVideoModel(opts.model) && !strictFirstSupported) {
+    return { error: '该 YinziAPI Seedance 路由只有通用 reference，不能同时把 first_frame 当作严格首帧；已在提交前停止，未创建上游任务。' };
+  }
+  const rawImageCount = rawReferenceUrls.length
+    + (legacyFirst && (strictFirstSupported || !rawReferenceUrls.length) ? 1 : 0)
+    + (legacyLast && strictLastSupported ? 1 : 0);
   const countError = validateYinziReferenceCounts(
     opts.model,
     { length: rawImageCount },
@@ -2856,8 +3036,46 @@ async function callYinziVideoApi(db, config, log, opts) {
     rawAudioUrls
   );
   if (countError) return { error: countError };
+  try {
+    const durationBudget = validateLocalYinziReferenceVideoDurationBudget(
+      rawVideoUrls,
+      opts.storage_local_path,
+      capability
+    );
+    if (!durationBudget.ok) return { error: durationBudget.error };
+    if (rawVideoUrls.length) {
+      log.info('[YinziAPI] Local reference-video duration preflight', {
+        video_gen_id: opts.video_gen_id,
+        known_total_seconds: Number(durationBudget.known_total_seconds.toFixed(3)),
+        unknown_count: durationBudget.unknown_count,
+        maximum_seconds: capability?.max_reference_video_seconds_total || null,
+      });
+    }
+  } catch (error) {
+    return { error: error.message };
+  }
 
-  if (String(opts.last_frame_url || '').trim() && isYinziAizzzVideoModel(opts.model)) {
+  try {
+    const localImages = [...new Set([
+      ...rawReferenceUrls,
+      legacyFirst,
+      legacyLast,
+    ].filter(Boolean))];
+    for (let index = 0; index < localImages.length; index += 1) {
+      const filePath = localReferencePath(localImages[index], opts.storage_local_path);
+      if (!filePath) continue;
+      await prepareYinziReferenceImage(filePath, {
+        storage_root: opts.storage_local_path,
+        log,
+        video_gen_id: opts.video_gen_id,
+        index,
+      });
+    }
+  } catch (error) {
+    return { error: error.message };
+  }
+
+  if (legacyLast && isYinziAizzzVideoModel(opts.model) && !strictLastSupported) {
     return { error: '该 YinziAPI Seedance 路由使用通用 reference，不支持 last_frame 角色；已在提交前停止，未创建上游任务。' };
   }
 
@@ -2894,17 +3112,17 @@ async function callYinziVideoApi(db, config, log, opts) {
 
   let first = null;
   let last = null;
-  if (!rawReferenceUrls.length) {
+  if (!rawReferenceUrls.length || strictFirstSupported || strictLastSupported) {
     const rawFirst = legacyFirst;
-    const rawLast = String(opts.last_frame_url || '').trim();
-    if (rawFirst) {
+    const rawLast = legacyLast;
+    if (rawFirst && (!rawReferenceUrls.length || strictFirstSupported)) {
       try {
         first = await resolveYinziReferenceSource(config, rawFirst, 'image', capability, opts, log, 'first');
       } catch (error) {
         return { error: error.message };
       }
     }
-    if (rawLast) {
+    if (rawLast && (!rawReferenceUrls.length || strictLastSupported)) {
       try {
         last = await resolveYinziReferenceSource(config, rawLast, 'image', capability, opts, log, 'last');
       } catch (error) {
@@ -4041,6 +4259,8 @@ async function callVideoApi(db, log, opts) {
       first_frame_url: opts.first_frame_url,
       last_frame_url: opts.last_frame_url,
       reference_urls: opts.reference_urls,
+      reference_video_urls: opts.reference_video_urls,
+      reference_audio_urls: opts.reference_audio_urls,
       files_base_url: opts.files_base_url,
       storage_local_path: opts.storage_local_path,
       video_gen_id: opts.video_gen_id,
@@ -4212,7 +4432,16 @@ async function callVideoApi(db, log, opts) {
 /**
  * ??????????????????/ChatFire ? ???? DashScope?
  */
-async function pollVideoTask(db, log, videoGenId, taskId, config, maxAttempts = 300, intervalMs = 10000) {
+async function pollVideoTask(
+  db,
+  log,
+  videoGenId,
+  taskId,
+  config,
+  maxAttempts = 300,
+  intervalMs = 10000,
+  expectedPrompt = null
+) {
   const provider = (config.provider || '').toLowerCase();
   const protocol = resolveVideoProtocol(config);
   const isDashScope = protocol === 'dashscope';
@@ -4441,9 +4670,20 @@ async function pollVideoTask(db, log, videoGenId, taskId, config, maxAttempts = 
           return { error: String(message).slice(0, 500) };
         }
         const videoUrl = extractYinziVideoUrl(data);
-        if (videoUrl) return { video_url: videoUrl };
+        if (videoUrl) {
+          const providerPromptReceipt = await inspectYinziAssetPromptReceipt(
+            config, data, expectedPrompt, log, videoGenId
+          );
+          return { video_url: videoUrl, provider_prompt_receipt: providerPromptReceipt };
+        }
         if (status === 'succeeded' || status === 'completed' || status === 'done') {
-          return { content_url: buildYinziContentUrl(config, pollTaskId) };
+          const providerPromptReceipt = await inspectYinziAssetPromptReceipt(
+            config, data, expectedPrompt, log, videoGenId
+          );
+          return {
+            content_url: buildYinziContentUrl(config, pollTaskId),
+            provider_prompt_receipt: providerPromptReceipt,
+          };
         }
         continue;
       }
@@ -4595,6 +4835,8 @@ module.exports = {
   buildAgnesPollUrl,
   buildYinziPollUrl,
   buildYinziContentUrl,
+  normalizeYinziAssetPromptReceipt,
+  inspectYinziAssetPromptReceipt,
   getAgnesApiRoot,
   buildAgnesVideoImagePayload,
   buildYinziVideoRequest,
@@ -4605,4 +4847,5 @@ module.exports = {
   formatVideoPostBodyForLog,
   isSeedance2FamilyModel,
   normalizeVolcengineDuration,
+  validateLocalYinziReferenceVideoDurationBudget,
 };

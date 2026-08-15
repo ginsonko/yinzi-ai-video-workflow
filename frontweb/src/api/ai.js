@@ -16,8 +16,10 @@ export const aiAPI = {
   delete(id) {
     return request.delete(`/ai-configs/${id}`)
   },
-  testConnection(body) {
-    return request.post('/ai-configs/test', body)
+  testConnection(body, options = {}) {
+    return request.post('/ai-configs/test', body, {
+      suppressGlobalError: options.suppressGlobalError === true,
+    })
   },
   /** 即梦2角色认证：GET /api/business/v1/assets（body: base_url, api_key, limit?, cursor?） */
   listJimeng2MaterialAssets(body) {

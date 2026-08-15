@@ -51,6 +51,16 @@ function list(db, query) {
 }
 
 function rowToItem(r) {
+  const parseObject = (value) => {
+    if (!value) return null;
+    if (typeof value === 'object') return value;
+    try {
+      const parsed = JSON.parse(value);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+    } catch (_) {
+      return null;
+    }
+  };
   return {
     id: r.id,
     storyboard_id: r.storyboard_id,
@@ -76,10 +86,30 @@ function rowToItem(r) {
     status: r.status,
     task_id: r.task_id,
     provider_task_id: r.provider_task_id,
+    prompt_contract: parseObject(r.prompt_contract_json),
+    provider_prompt_receipt: parseObject(r.provider_prompt_receipt_json),
     error_msg: r.error_msg,
     created_at: r.created_at,
     updated_at: r.updated_at,
     completed_at: r.completed_at,
+  };
+}
+
+function buildReferenceTransport(row, lists = {}) {
+  const referenceUrls = Array.isArray(lists.images) ? lists.images : [];
+  const referenceVideoUrls = Array.isArray(lists.videos) ? lists.videos : [];
+  const referenceAudioUrls = Array.isArray(lists.audios) ? lists.audios : [];
+  const referenceCount = referenceUrls.length + referenceVideoUrls.length + referenceAudioUrls.length
+    + (row.first_frame_url ? 1 : 0) + (row.last_frame_url ? 1 : 0);
+  const hasReferences = referenceCount > 0;
+  return {
+    reference_count: referenceCount,
+    image_url: hasReferences ? undefined : row.image_url,
+    first_frame_url: row.first_frame_url || undefined,
+    last_frame_url: row.last_frame_url || undefined,
+    reference_urls: referenceUrls,
+    reference_video_urls: referenceVideoUrls,
+    reference_audio_urls: referenceAudioUrls,
   };
 }
 
@@ -251,12 +281,19 @@ async function finalizeSuccessfulVideo(db, log, videoGenId, row, rowForAspect, v
   const persistedVideoUrl = options.prefer_local_url && localPath
     ? `/static/${localPath}`
     : videoUrl;
+  const providerPromptReceiptJson = options.provider_prompt_receipt
+    ? JSON.stringify(options.provider_prompt_receipt)
+    : null;
   try {
     db.prepare(
-      'UPDATE video_generations SET status = ?, video_url = ?, local_path = ?, completed_at = ?, updated_at = ? WHERE id = ?'
-    ).run('completed', persistedVideoUrl, localPath, now, now, videoGenId);
+      'UPDATE video_generations SET status = ?, video_url = ?, local_path = ?, provider_prompt_receipt_json = COALESCE(?, provider_prompt_receipt_json), completed_at = ?, updated_at = ? WHERE id = ?'
+    ).run('completed', persistedVideoUrl, localPath, providerPromptReceiptJson, now, now, videoGenId);
   } catch (e) {
-    if ((e.message || '').includes('completed_at')) {
+    if ((e.message || '').includes('provider_prompt_receipt_json')) {
+      db.prepare(
+        'UPDATE video_generations SET status = ?, video_url = ?, local_path = ?, completed_at = ?, updated_at = ? WHERE id = ?'
+      ).run('completed', persistedVideoUrl, localPath, now, now, videoGenId);
+    } else if ((e.message || '').includes('completed_at')) {
       db.prepare(
         'UPDATE video_generations SET status = ?, video_url = ?, local_path = ?, updated_at = ? WHERE id = ?'
       ).run('completed', persistedVideoUrl, localPath, now, videoGenId);
@@ -278,6 +315,7 @@ async function finalizeSuccessfulVideo(db, log, videoGenId, row, rowForAspect, v
       video_generation_id: videoGenId,
       video_url: persistedVideoUrl,
       status: 'completed',
+      provider_prompt_receipt: options.provider_prompt_receipt || undefined,
     });
   }
   log.info('Video generation completed' + (logLabel ? ` (${logLabel})` : ''), {
@@ -303,14 +341,18 @@ async function pollProviderTaskAndFinalize(db, log, videoGenId, row, rowForAspec
     providerTaskId,
     config,
     pollMaxAttempts,
-    POLL_INTERVAL_MS
+    POLL_INTERVAL_MS,
+    row.prompt
   );
   const now = new Date().toISOString();
   const polledVideo = resolveRemoteVideoUrl(pollResult.video_url, pollResult.error);
   if (polledVideo.ok) {
     await finalizeSuccessfulVideo(
       db, log, videoGenId, row, rowForAspect, polledVideo.video_url, 'after poll',
-      { require_local: videoClient.resolveVideoProtocol(config) === 'yinzi' }
+      {
+        require_local: videoClient.resolveVideoProtocol(config) === 'yinzi',
+        provider_prompt_receipt: pollResult.provider_prompt_receipt,
+      }
     );
   } else if (pollResult.content_url) {
     await finalizeSuccessfulVideo(
@@ -326,6 +368,7 @@ async function pollProviderTaskAndFinalize(db, log, videoGenId, row, rowForAspec
         headers: { Authorization: 'Bearer ' + (config.api_key || '') },
         require_local: true,
         prefer_local_url: true,
+        provider_prompt_receipt: pollResult.provider_prompt_receipt,
       }
     );
   } else if (pollResult.pending) {
@@ -506,15 +549,16 @@ async function processVideoGeneration(db, log, videoGenId) {
       } catch (_) {}
     }
     const rowForAspect = { ...row, aspect_ratio: aspectForVideo || row.aspect_ratio };
-    const referenceCount = reference_urls.length + reference_video_urls.length + reference_audio_urls.length;
-    const hasOmniRefs = referenceCount > 0;
-    if (row.task_id && hasOmniRefs) {
+    const referenceTransport = buildReferenceTransport(row, {
+      images: reference_urls, videos: reference_video_urls, audios: reference_audio_urls,
+    });
+    if (row.task_id && referenceTransport.reference_count > 0) {
       taskService.updateTaskStatus(
         db,
         row.task_id,
         'processing',
         5,
-        `正在准备 ${referenceCount} 个参考媒体…`
+        `正在准备 ${referenceTransport.reference_count} 个参考媒体…`
       );
     }
     const result = await videoClient.callVideoApi(db, log, {
@@ -529,12 +573,12 @@ async function processVideoGeneration(db, log, videoGenId) {
       provider: row.provider,
       drama_id: row.drama_id,
       storyboard_id: row.storyboard_id || undefined,
-      image_url: hasOmniRefs ? undefined : row.image_url,
-      first_frame_url: hasOmniRefs ? undefined : row.first_frame_url,
-      last_frame_url: hasOmniRefs ? undefined : row.last_frame_url,
-      reference_urls,
-      reference_video_urls,
-      reference_audio_urls,
+      image_url: referenceTransport.image_url,
+      first_frame_url: referenceTransport.first_frame_url,
+      last_frame_url: referenceTransport.last_frame_url,
+      reference_urls: referenceTransport.reference_urls,
+      reference_video_urls: referenceTransport.reference_video_urls,
+      reference_audio_urls: referenceTransport.reference_audio_urls,
       files_base_url: filesBaseUrl,
       storage_local_path: storageLocalPath,
       video_gen_id: videoGenId,
@@ -593,4 +637,5 @@ module.exports = {
   resumeProcessingVideoGenerations,
   downloadVideoToLocal,
   _rowToItem: rowToItem,
+  _buildReferenceTransport: buildReferenceTransport,
 };

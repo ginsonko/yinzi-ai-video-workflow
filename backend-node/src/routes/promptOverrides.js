@@ -94,8 +94,10 @@ function routes(db, log) {
         return response.badRequest(res, 'content 不能为空');
       }
       try {
-        promptOverridesService.setOverride(db, key, content.trim());
-        promptI18n.setOverrideInMemory(key, content.trim());
+        require('../services/configMutationService').withAutomaticSnapshot(db, `修改兼容提示词 ${key}`, () => {
+          promptOverridesService.setOverride(db, key, content.trim());
+          promptI18n.setOverrideInMemory(key, content.trim());
+        });
         log.info('prompt override updated', { key });
         response.success(res, { ok: true, key });
       } catch (err) {
@@ -110,8 +112,10 @@ function routes(db, log) {
         return response.badRequest(res, `未知的提示词 key: ${key}`);
       }
       try {
-        promptOverridesService.deleteOverride(db, key);
-        promptI18n.clearOverrideInMemory(key);
+        require('../services/configMutationService').withAutomaticSnapshot(db, `恢复兼容提示词 ${key} 默认值`, () => {
+          promptOverridesService.deleteOverride(db, key);
+          promptI18n.clearOverrideInMemory(key);
+        });
         log.info('prompt override reset', { key });
         response.success(res, { ok: true, key });
       } catch (err) {

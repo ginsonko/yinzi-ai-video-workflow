@@ -18,6 +18,10 @@
                 <el-icon><Upload /></el-icon>
                 导入配置
               </el-button>
+              <el-button plain @click="$router.push('/advanced-settings')">
+                <el-icon><Setting /></el-icon>
+                高级设置
+              </el-button>
               <input ref="importFileRef" type="file" accept=".json" style="display:none" @change="importConfigs" />
               <el-button type="primary" plain @click="openOneKeyYinzi">
                 <el-icon><MagicStick /></el-icon>
@@ -66,6 +70,9 @@
               <el-icon><Key /></el-icon>
               一键换Key
             </el-button>
+            <el-button size="small" @click="$router.push('/advanced-settings')">
+              <el-icon><Setting /></el-icon>高级设置
+            </el-button>
           </div>
           <p class="default-tip">每种服务类型仅有一个默认配置：文本用于生成故事；文本生成图片用于角色/场景/道具图；分镜图片生成用于分镜图（支持参考图）；视频用于生成视频；语音合成 TTS 用于分镜配音；即梦2角色认证用于创作页 SD2 认证（网关 Token）；SD2 资产库用于官方 ModelArk 私有资产（在未配置即梦2角色认证时供 SD2 认证使用）。</p>
           <el-table
@@ -108,7 +115,13 @@
             </el-table-column>
             <el-table-column label="操作" width="180" fixed="right">
               <template #default="{ row }">
-                <el-button link type="primary" size="small" @click="openTest(row)">测试</el-button>
+                <el-button
+                  link
+                  type="primary"
+                  size="small"
+                  :loading="testingConfigId === row.id"
+                  @click="openTest(row)"
+                >测试</el-button>
                 <el-button link type="primary" size="small" @click="onRowEdit(row)">{{ vendorLock.enabled ? '修改Key' : '编辑' }}</el-button>
                 <el-button v-if="!vendorLock.enabled" link type="danger" size="small" @click="onDelete(row)">删除</el-button>
               </template>
@@ -855,6 +868,11 @@ input_reference = (图片文件，可选)</pre>
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
+        <el-button
+          v-if="form.service_type !== 'jimeng2_character_auth' && form.service_type !== 'model_ark_asset'"
+          :loading="testingDraft"
+          @click="testCurrentDraft"
+        >测试当前填写</el-button>
         <el-button type="primary" :loading="saving" @click="submit">确定</el-button>
       </template>
     </el-dialog>
@@ -1108,24 +1126,25 @@ input_reference = (图片文件，可选)</pre>
 
     <!-- 测试连接 -->
     <el-dialog v-model="testVisible" title="测试连接" width="420px">
-      <p v-if="testResult === null">正在测试…</p>
+      <div v-if="testTargetName" class="connection-test-target">
+        <span>正在验证</span>
+        <strong>{{ testTargetName }}</strong>
+        <small>保存配置会在本机后端读取 Key，浏览器不会取得明文密钥。</small>
+      </div>
+      <p v-if="testResult === null">正在进行低成本连接探针，不会生成图片、视频或音频…</p>
       <template v-else-if="testResult">
         <el-alert
-          v-if="testServiceType === 'image' || testServiceType === 'storyboard_image' || testServiceType === 'video'"
           type="success"
-          title="连接成功"
-          description="API Key 有效，网络已连通。提示：测试仅验证 Key 合法性，不实际生成图片/视频，模型名填错、账号未开通该功能或配额不足时实际生成仍可能报错。"
+          :title="testDetails.authenticated ? '连接与凭据验证成功' : '服务地址已连通'"
+          :description="testSuccessDescription"
           show-icon
           :closable="false"
         />
-        <el-alert
-          v-else
-          type="success"
-          title="连接成功"
-          description="文本生成接口已正常响应。"
-          show-icon
-          :closable="false"
-        />
+        <div class="connection-test-receipt">
+          <span>模型：{{ testDetails.model || '由服务端自动选择' }}</span>
+          <span>凭据：{{ testDetails.credential_source === 'saved' ? '本机已保存 Key' : '当前临时填写' }}</span>
+          <span>{{ testDetails.probe === 'minimal_text_response' ? '测试用量：极少文本' : '媒体生成费用：无' }}</span>
+        </div>
       </template>
       <el-alert v-else type="error" :title="testError || '连接失败'" show-icon :closable="false" />
       <template #footer>
@@ -1164,12 +1183,21 @@ input_reference = (图片文件，可选)</pre>
 <script setup>
 import { ref, computed, onMounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, MagicStick, QuestionFilled, Download, Upload, Delete, ChatDotRound, Picture, Film, VideoCamera, Key, Microphone, Folder, Refresh } from '@element-plus/icons-vue'
+import { Plus, MagicStick, QuestionFilled, Download, Upload, Delete, ChatDotRound, Picture, Film, VideoCamera, Key, Microphone, Folder, Refresh, Setting } from '@element-plus/icons-vue'
 import { aiAPI } from '@/api/ai'
+import {
+  buildDraftConfigTestRequest,
+  buildSavedConfigTestRequest,
+  configTestSuccessCopy,
+} from '@/utils/aiConfigTest'
 import { generationSettingsAPI } from '@/api/prompts'
 import PromptEditor from '@/components/PromptEditor.vue'
 import SceneModelMap from '@/components/SceneModelMap.vue'
 import Sd2AssetManagement from '@/components/Sd2AssetManagement.vue'
+
+const props = defineProps({
+  initialAction: { type: String, default: '' },
+})
 
 const activeTab = ref('configs')
 const importFileRef = ref(null)
@@ -1352,8 +1380,12 @@ const rules = computed(() => ({
 }))
 const testVisible = ref(false)
 const testResult = ref(null)
-const testServiceType = ref('')
 const testError = ref('')
+const testDetails = ref({})
+const testTargetName = ref('')
+const testingConfigId = ref(null)
+const testingDraft = ref(false)
+const testSuccessDescription = computed(() => configTestSuccessCopy(testDetails.value))
 const oneKeyTongyiVisible = ref(false)
 const oneKeyTongyiKey = ref('')
 const oneKeyTongyiSaving = ref(false)
@@ -1373,7 +1405,7 @@ const oneKeyYinziForm = ref({
   text_api_key: '',
   image_api_key: '',
   video_api_key: '',
-  text_model: '',
+  text_model: 'gpt-5.6-sol',
   image_model: '',
   video_model: '',
 })
@@ -1397,7 +1429,7 @@ const yinziCatalogMessage = computed(() => {
 /** 预设厂商与模型（与参考前端一致） */
 const providerConfigs = {
   text: [
-    { id: 'yinzi', name: 'YinziAPI', models: ['gpt-5.4-mini', 'deepseek-v4-flash'] },
+    { id: 'yinzi', name: 'YinziAPI', models: ['gpt-5.6-sol', 'gpt-5.4-mini', 'deepseek-v4-flash'] },
     { id: 'openai', name: 'OpenAI', models: ['gpt-4o', 'gpt-4', 'gpt-3.5-turbo'] },
     { id: 'volcengine', name: '火山引擎', models: ['deepseek-v3-2-251201', 'doubao-1-5-pro-32k-250115', 'kimi-k2-thinking-251104'] },
     // { id: 'chatfire', name: 'Chatfire', models: ['gemini-3-flash-preview', 'claude-sonnet-4-5-20250929', 'doubao-seed-1-8-251228'] },
@@ -1865,8 +1897,11 @@ function resetForm() {
   formRef.value?.resetFields?.()
 }
 
-function openAdd() {
+function openAdd(serviceType = 'text') {
   resetForm()
+  if (typeof serviceType === 'string' && serviceTypeLabel(serviceType) !== serviceType) {
+    form.value.service_type = serviceType
+  }
   dialogVisible.value = true
 }
 
@@ -2077,24 +2112,44 @@ async function openTest(row) {
     ElMessage.info('SD2 资产库请在「SD2 资产管理」标签页使用「刷新列表」验证连接。')
     return
   }
+  testingConfigId.value = row.id
+  try {
+    await runConnectionTest(
+      buildSavedConfigTestRequest(row),
+      row.name || serviceTypeLabel(row.service_type),
+    )
+  } finally {
+    testingConfigId.value = null
+  }
+}
+
+async function testCurrentDraft() {
+  testingDraft.value = true
+  try {
+    await runConnectionTest(
+      buildDraftConfigTestRequest(form.value, editingId.value),
+      `${form.value.name?.trim() || '尚未保存的配置'}（当前填写）`,
+    )
+  } finally {
+    testingDraft.value = false
+  }
+}
+
+async function runConnectionTest(payload, targetName) {
   testVisible.value = true
   testResult.value = null
   testError.value = ''
-  testServiceType.value = row.service_type || 'text'
+  testDetails.value = {}
+  testTargetName.value = targetName
   try {
-    await aiAPI.testConnection({
-      base_url: row.base_url,
-      api_key: row.api_key,
-      model: Array.isArray(row.model) ? row.model[0] : row.model,
-      provider: row.provider,
-      endpoint: row.endpoint,
-      service_type: row.service_type,
-      settings: row.settings
-    })
+    const result = await aiAPI.testConnection(payload, { suppressGlobalError: true })
+    testDetails.value = result || {}
     testResult.value = true
-  } catch (e) {
+    return true
+  } catch (error) {
     testResult.value = false
-    testError.value = e?.message || '请求失败'
+    testError.value = error?.message || '连接测试失败'
+    return false
   }
 }
 
@@ -2151,7 +2206,7 @@ function catalogOptionLabel(item) {
 function applyYinziCatalogDefaults() {
   const form = oneKeyYinziForm.value
   const catalog = yinziCatalog.value
-  if (!form.text_model && catalog.text.length) form.text_model = catalog.text[0].model
+  if (!form.text_model) form.text_model = catalog.text.find((item) => item.model === 'gpt-5.6-sol')?.model || catalog.text[0]?.model || 'gpt-5.6-sol'
   if (!form.image_model && catalog.image.length) form.image_model = catalog.image[0].model
   if (!form.video_model && catalog.video.length) form.video_model = catalog.video[0].model
 }
@@ -2386,10 +2441,17 @@ async function loadVendorLock() {
   }
 }
 
-onMounted(() => {
-  loadVendorLock()
-  loadList()
-  loadGenerationSettings()
+onMounted(async () => {
+  await Promise.all([
+    loadVendorLock(),
+    loadList(),
+    loadGenerationSettings(),
+  ])
+  if (props.initialAction === 'yinzi') {
+    openOneKeyYinzi()
+  } else if (props.initialAction.startsWith('service:')) {
+    openAdd(props.initialAction.slice('service:'.length))
+  }
 })
 </script>
 
@@ -2499,6 +2561,37 @@ onMounted(() => {
   min-width: 200px;
   margin: 0;
   line-height: 1.5;
+}
+
+.connection-test-target {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 4px 10px;
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--el-border-color-light, #e4e7ed);
+  background: var(--el-fill-color-light, #f5f7fa);
+}
+.connection-test-target span,
+.connection-test-target small {
+  color: var(--el-text-color-secondary, #909399);
+  font-size: 12px;
+}
+.connection-test-target strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+.connection-test-target small {
+  grid-column: 1 / -1;
+  line-height: 1.5;
+}
+.connection-test-receipt {
+  display: grid;
+  gap: 5px;
+  margin-top: 10px;
+  color: var(--el-text-color-regular, #606266);
+  font-size: 12px;
 }
 
 .type-jimeng2_character_auth {

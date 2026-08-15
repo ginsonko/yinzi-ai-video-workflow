@@ -3,8 +3,8 @@
     <header class="header">
       <div class="header-inner">
         <h1 class="logo" @click="goList">
-          <span class="logo-main">本地短剧助手</span>
-          <span class="logo-sub">LocalMiniDrama</span>
+          <span class="logo-main">银子AI视频工作流</span>
+          <span class="logo-sub">Yinzi AI Video Studio</span>
         </h1>
         <span class="page-title">AI 配置</span>
         <el-button class="btn-back" @click="goList">

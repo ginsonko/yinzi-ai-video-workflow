@@ -20,7 +20,7 @@ function downloadBufferViaNodeHttp(url, timeoutMs = 30000, redirectCount = 0) {
       path: parsed.pathname + parsed.search,
       method: 'GET',
       headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; LocalMiniDrama/1.0)',
+        'User-Agent': 'Mozilla/5.0 (compatible; YinziAIVideoWorkflow/1.0)',
         'Accept': 'image/*,*/*',
       },
       timeout: timeoutMs,

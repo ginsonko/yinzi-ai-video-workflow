@@ -252,10 +252,107 @@ function toPublicConfig(config) {
   };
 }
 
+const CONNECTION_TEST_FIELDS = [
+  'base_url',
+  'api_key',
+  'model',
+  'default_model',
+  'provider',
+  'api_protocol',
+  'endpoint',
+  'service_type',
+  'settings',
+];
+
+function hasOwn(object, key) {
+  return Object.prototype.hasOwnProperty.call(object || {}, key);
+}
+
+function normalizeConfigId(value) {
+  if (value == null || value === '') return null;
+  const id = Number(value);
+  return Number.isSafeInteger(id) && id > 0 ? id : NaN;
+}
+
+function pickConnectionTestDraft(body) {
+  const source = body?.draft && typeof body.draft === 'object' && !Array.isArray(body.draft)
+    ? body.draft
+    : body || {};
+  const draft = {};
+  for (const field of CONNECTION_TEST_FIELDS) {
+    if (hasOwn(source, field)) draft[field] = source[field];
+  }
+  return draft;
+}
+
+/**
+ * Resolve a connection-test request without exposing persisted credentials to the browser.
+ * Draft fields override the stored row. An empty draft api_key means "reuse the saved key".
+ */
+function resolveConnectionTestConfig(db, body = {}) {
+  const configId = normalizeConfigId(body.config_id);
+  if (Number.isNaN(configId)) {
+    const error = new Error('无效的配置 ID');
+    error.code = 'INVALID_CONFIG_ID';
+    throw error;
+  }
+  const stored = configId == null ? null : getConfig(db, configId);
+  if (configId != null && !stored) {
+    const error = new Error('配置不存在或已删除，请刷新配置列表后重试');
+    error.code = 'CONFIG_NOT_FOUND';
+    throw error;
+  }
+
+  const draft = pickConnectionTestDraft(body);
+  const resolved = stored ? { ...stored } : {};
+  for (const field of CONNECTION_TEST_FIELDS) {
+    if (!hasOwn(draft, field)) continue;
+    if (field === 'api_key' && stored && !String(draft.api_key || '').trim()) continue;
+    resolved[field] = draft[field];
+  }
+  resolved.base_url = String(resolved.base_url || '').trim().replace(/\/$/, '');
+  resolved.api_key = String(resolved.api_key || '').trim();
+  const preferredModel = String(resolved.default_model || '').trim();
+  const models = Array.isArray(resolved.model)
+    ? resolved.model.map((item) => String(item || '').trim()).filter(Boolean)
+    : String(resolved.model || '').trim() ? [String(resolved.model).trim()] : [];
+  resolved.model = preferredModel || models[0] || '';
+
+  if (!resolved.base_url) {
+    const error = new Error('缺少 Base URL，请填写后再测试');
+    error.code = 'BASE_URL_REQUIRED';
+    throw error;
+  }
+  if (!resolved.api_key) {
+    const error = new Error(configId == null
+      ? '缺少 API Key，请填写后再测试'
+      : '此配置尚未保存 API Key，请编辑配置并填写后再测试');
+    error.code = 'API_KEY_REQUIRED';
+    throw error;
+  }
+  return {
+    config: resolved,
+    config_id: configId,
+    credential_source: stored && !String(draft.api_key || '').trim() ? 'saved' : 'draft',
+  };
+}
+
+function redactConnectionTestError(value, secrets = []) {
+  let message = String(value?.message || value || '未知错误');
+  for (const secret of secrets) {
+    const normalized = String(secret || '').trim();
+    if (normalized) message = message.split(normalized).join('[REDACTED]');
+  }
+  return message
+    .replace(/Bearer\s+[A-Za-z0-9._~-]{8,}/gi, 'Bearer [REDACTED]')
+    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, '[REDACTED]')
+    .slice(0, 800);
+}
+
 /**
  * 测试连接：与 Go AIService.TestConnection 对齐，根据 provider 发最小请求验证 base_url + api_key
  * @param opts { base_url, api_key, model (string|string[]), provider?, endpoint?, settings? }
- * @returns Promise<void> 成功 resolve，失败 reject(error)
+ * @returns Promise<{ probe, authenticated, generated_media }> 成功 resolve，失败 reject(error)
  */
 async function testConnection(opts) {
   const base = (opts.base_url || '').replace(/\/$/, '');
@@ -270,7 +367,7 @@ async function testConnection(opts) {
 
   // YinziAPI 图片/视频固定分组不保证能枚举 /models；视频连接使用无副作用的不存在任务查询。
   // 图片连接测试不能调用 /images/generations，否则一次“测试”就会真实扣费。
-  if (provider === 'yinzi') {
+  if (provider === 'yinzi' && serviceType !== 'text') {
     const probePath = serviceType === 'video'
       ? '/videos/codex-connectivity-check-does-not-exist'
       : '/models';
@@ -278,9 +375,13 @@ async function testConnection(opts) {
       method: 'GET',
       headers: { Authorization: 'Bearer ' + (opts.api_key || '') },
     });
-    if (res.status === 401) throw new Error('API Key 无效 (401)');
+    if (res.status === 401 || res.status === 403) throw new Error(`API Key 无效 (${res.status})`);
     if (res.status >= 500) throw new Error(`YinziAPI 服务暂时不可用 (${res.status})`);
-    return;
+    return {
+      probe: serviceType === 'video' ? 'read_only_task_lookup' : 'read_only_model_catalog',
+      authenticated: true,
+      generated_media: false,
+    };
   }
 
   // --- NanoBanana ---
@@ -297,7 +398,7 @@ async function testConnection(opts) {
       try { const j = JSON.parse(text); errMsg = j.msg || j.message || errMsg; } catch {}
       throw new Error(errMsg);
     }
-    return;
+    return { probe: 'read_only_task_lookup', authenticated: true, generated_media: false };
   }
 
   // --- Gemini ---
@@ -319,21 +420,15 @@ async function testConnection(opts) {
     if (data.candidates == null && data.error != null) {
       throw new Error(data.error.message || data.error || 'Gemini 返回错误');
     }
-    return;
+    return { probe: 'minimal_text_response', authenticated: true, generated_media: false };
   }
 
-  // --- TTS 语音合成 ---
+  // --- TTS 语音合成：只读模型目录，不合成测试音频 ---
   if (serviceType === 'tts') {
-    // MiniMax T2A：用 /v1/models 或直接对 chat 端点做轻量探针
-    const ttsBase = base.includes('minimaxi.com') || base.includes('minimax') ? base : base;
-    // 尝试调用一个极简的 MiniMax T2A 请求（1 字，验证 key 合法性）
-    // 为避免真实扣费，使用非计费的 list-voices 或 models 接口
-    const probeUrl = ttsBase + '/text_to_speech';
-    const probeBody = JSON.stringify({ model: model || 'speech-02-hd', text: 'hi', stream: false });
+    const probeUrl = base + '/models';
     const res = await fetch(probeUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + (opts.api_key || '') },
-      body: probeBody,
+      method: 'GET',
+      headers: { Authorization: 'Bearer ' + (opts.api_key || '') },
     });
     if (res.status === 401 || res.status === 403) {
       const text = await res.text();
@@ -341,8 +436,12 @@ async function testConnection(opts) {
       try { const j = JSON.parse(text); errMsg = j.base_resp?.status_msg || j.error?.message || j.message || errMsg; } catch {}
       throw new Error(errMsg);
     }
-    // 其他状态（400 缺参数、404 端点不对等）说明网络通、key 疑似有效
-    return;
+    return {
+      probe: 'read_only_model_catalog',
+      authenticated: res.ok,
+      reachable_only: !res.ok,
+      generated_media: false,
+    };
   }
 
   // service_type 作为主要判断信号
@@ -384,7 +483,7 @@ async function testConnection(opts) {
       try { const j = JSON.parse(text); errMsg = j.error?.message || j.message || errMsg; } catch {}
       throw new Error(errMsg);
     }
-    return;
+    return { probe: 'minimal_text_response', authenticated: true, generated_media: false };
   }
 
   // --- 视频生成服务（非 DashScope）：通过 chat/completions 验证 key 合法性 ---
@@ -406,25 +505,22 @@ async function testConnection(opts) {
       try { const j = JSON.parse(text); errMsg = j.error?.message || j.message || errMsg; } catch {}
       throw new Error(errMsg);
     }
-    return;
+    return {
+      probe: 'minimal_text_response',
+      authenticated: res.ok,
+      reachable_only: !res.ok,
+      generated_media: false,
+    };
   }
 
-  // --- OpenAI 兼容图片生成（volcengine、OpenAI DALL·E、其他）---
+  // --- OpenAI 兼容图片生成：只读模型目录探针，绝不创建图片 ---
   if (treatAsImage) {
-    endpoint = endpoint || '/images/generations';
-    const path = endpoint.startsWith('/') ? endpoint : '/' + endpoint;
-    const url = base + path;
-    const body = { model: model || '', prompt: 'test connectivity', n: 1 };
-    console.log('[testConnection] 图片服务', { url, serviceType, model, body });
+    const url = base + '/models';
+    console.log('[testConnection] 图片服务只读探针', { url, serviceType, model });
     const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: 'Bearer ' + (opts.api_key || ''),
-      },
-      body: JSON.stringify(body),
+      method: 'GET',
+      headers: { Authorization: 'Bearer ' + (opts.api_key || '') },
     });
-    // 401/403 = key 无效；其他状态（含 400 参数错误、429 限流等）表示已联通
     if (res.status === 401 || res.status === 403) {
       const text = await res.text();
       let errMsg = `API Key 无效 (${res.status})`;
@@ -434,20 +530,12 @@ async function testConnection(opts) {
       } catch {}
       throw new Error(errMsg);
     }
-    if (!res.ok) {
-      // 其他 4xx/5xx：如果能解析出明确的 auth 错误才拒绝，否则视为联通
-      const text = await res.text();
-      let parsed = null;
-      try { parsed = JSON.parse(text); } catch {}
-      const msg = parsed?.error?.message || parsed?.message || '';
-      const lmsg = msg.toLowerCase();
-      const isAuthErr = lmsg.includes('unauthorized') || lmsg.includes('invalid api key')
-        || lmsg.includes('authentication') || lmsg.includes('forbidden');
-      if (isAuthErr) throw new Error(`API Key 无效: ${msg || res.status}`);
-      // 其他错误（如模型不支持某个 API 参数）说明网络通、key 有效
-      return;
-    }
-    return;
+    return {
+      probe: 'read_only_model_catalog',
+      authenticated: res.ok,
+      reachable_only: !res.ok,
+      generated_media: false,
+    };
   }
 
   // --- OpenAI / 默认：chat completions ---
@@ -487,6 +575,7 @@ async function testConnection(opts) {
   if (data.choices == null && data.error != null) {
     throw new Error(data.error.message || data.error || '接口返回错误');
   }
+  return { probe: 'minimal_text_response', authenticated: true, generated_media: false };
 }
 
 /**
@@ -600,6 +689,8 @@ module.exports = {
   updateConfig,
   deleteConfig,
   testConnection,
+  resolveConnectionTestConfig,
+  redactConnectionTestError,
   getVendorLockStatus,
   applyVendorLock,
   bulkUpdateApiKey,
