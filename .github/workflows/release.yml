@@ -197,7 +197,14 @@ jobs:
       - name: Write SHA-256 manifest
         working-directory: desktop/release-mac
         shell: bash
-        run: shasum -a 256 * > SHA256SUMS-${{ matrix.arch }}.txt
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('../package.json').version")
+          ARCH="${{ matrix.arch }}"
+          DMG="银子AI视频工作流-${VERSION}-mac-${ARCH}.dmg"
+          ZIP="银子AI视频工作流-${VERSION}-mac-${ARCH}.zip"
+          RECEIPT="native-mac-build-${ARCH}.json"
+          shasum -a 256 "$DMG" "$ZIP" "$RECEIPT" > "SHA256SUMS-${ARCH}.txt"
 
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4

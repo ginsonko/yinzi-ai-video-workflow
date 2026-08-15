@@ -16,7 +16,7 @@
     "prepare:media": "node scripts/prepare-media-tools.js",
     "verify:release": "node scripts/verify-release-inputs.js",
     "pack": "npm run prepare-backend && npm run build:front && npm run copy-front && npm run prepare:icon && npm run prepare:media && npm run verify:release && npm run clean:unpacked && electron-builder --dir",
-    "dist": "npm run prepare-backend && npm run build:front && npm run copy-front && npm run prepare:icon && npm run prepare:media && npm run verify:release && npm run clean:unpacked && electron-builder --win --x64",
+    "dist": "npm run prepare-backend && npm run build:front && npm run copy-front && npm run prepare:icon && npm run prepare:media && npm run verify:release && npm run clean:unpacked && electron-builder --win --x64 --publish never",
     "dist:cn": "node scripts/dist-cn.js",
     "prepare:mac-resources": "node scripts/prepare-mac-resources.js",
     "dist:mac": "node scripts/dist-mac.js",
@@ -52,7 +52,7 @@
   },
   "build": {
     "npmRebuild": false,
-    "electronDist": "node_modules/electron/dist",
+    "electronVersion": "43.4.0",
     "appId": "top.yinziapi.ai-video-workflow",
     "productName": "银子AI视频工作流",
     "executableName": "银子AI视频工作流",
