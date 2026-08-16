@@ -1,5 +1,5 @@
 param(
-  [string]$ProfileName = 'portable-v012-beta1',
+  [string]$ProfileName = 'portable-v013-beta4',
   [ValidateRange(0, 65535)]
   [int]$RemoteDebuggingPort = 9226
 )
@@ -15,9 +15,15 @@ if (-not $profileRoot.StartsWith($allowedRoot + [IO.Path]::DirectorySeparatorCha
 $appData = Join-Path $profileRoot 'AppData\Roaming'
 $localAppData = Join-Path $profileRoot 'AppData\Local'
 $releaseDir = Join-Path $desktopDir 'release'
-$portableItem = Get-ChildItem -LiteralPath $releaseDir -Filter '*Portable-0.1.2-beta.1-x64.exe' -File | Select-Object -First 1
-if (-not $portableItem) { throw "Portable release not found in: $releaseDir" }
-$portable = $portableItem.FullName
+$packageFile = Join-Path $desktopDir 'package.json'
+$packageJsonText = [IO.File]::ReadAllText($packageFile, [Text.Encoding]::UTF8)
+$packageJson = $packageJsonText | ConvertFrom-Json
+$packageVersion = [string]$packageJson.version
+$productName = [string]$packageJson.build.productName
+if ([string]::IsNullOrWhiteSpace($packageVersion)) { throw "Package version is missing: $packageFile" }
+if ([string]::IsNullOrWhiteSpace($productName)) { throw "Package product name is missing: $packageFile" }
+$portable = Join-Path $releaseDir "${productName}-Portable-$packageVersion-x64.exe"
+if (-not (Test-Path -LiteralPath $portable -PathType Leaf)) { throw "Portable release not found: $portable" }
 New-Item -ItemType Directory -Path $appData -Force | Out-Null
 New-Item -ItemType Directory -Path $localAppData -Force | Out-Null
 $env:APPDATA = $appData

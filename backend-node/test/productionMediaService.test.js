@@ -910,6 +910,74 @@ describe('production media executor', () => {
     assert.equal(repo.listArtifacts(db, run.id, { stage: 'reference_bundle', page_size: 20 }).items.length, 2);
   });
 
+  it('keeps a manually cleared bundle empty across polling and submits it with advisory warnings', async () => {
+    let run = makeRun('empty-user-reference-bundle');
+    run = repo.updateRun(db, run.id, {
+      policy: {
+        ...run.policy,
+        video_routing_mode: 'auto',
+        video_group: '特价视频分组(即梦)',
+      },
+    });
+    const shot = addApproved(run, 'storyboard_plan', 'shot', '1', 'Text-only opening', {
+      number: 1,
+      duration: 5,
+      action: 'The heroine enters frame and stops.',
+      visual: 'Stable medium shot.',
+      video_prompt: 'Create the complete five-second beat.',
+      previs_mode: 'skip',
+      transition_mode: 'opening',
+    });
+    const storyboard = addApproved(run, 'storyboard_images', 'shot', '1', 'Suggested opening frame', {
+      source_artifact_id: shot.id,
+    }, [shot.id]);
+    db.prepare('UPDATE production_artifacts SET media_path = ? WHERE id = ?')
+      .run('images/text-only-opening.png', storyboard.id);
+    const requests = [];
+    const service = createProductionMediaService(db, cfg, log, {
+      fetchVideoCatalog: async () => routedCatalog(),
+      createVideo: async (request) => {
+        requests.push(structuredClone(request));
+        return { id: 904, task_id: 'empty-reference-task', model: request.model };
+      },
+    });
+
+    const generated = await service.ensureReferenceBundles(run);
+    assert.equal(generated.state, 'progressed');
+    const edited = repo.editArtifact(db, generated.artifact.id, {
+      content: {
+        ...generated.artifact.content,
+        bundle_origin: 'manual_revision',
+        revision_source: { type: 'user_edit', source_artifact_id: generated.artifact.id },
+        images: [],
+        videos: [],
+        audios: [],
+      },
+    });
+
+    const draftCheck = await service.ensureReferenceBundles(repo.getRun(db, run.id));
+    assert.equal(draftCheck.state, 'stage_ready');
+    assert.equal(draftCheck.artifacts[0].id, edited.id);
+    assert.deepEqual(draftCheck.artifacts[0].content.images, []);
+    const approved = repo.reviewArtifact(db, edited.id, {
+      reviewer_type: 'human', decision: 'approved', reason: 'Submit without reference media',
+    }).artifact;
+    const approvedCheck = await service.ensureReferenceBundles(repo.getRun(db, run.id));
+    assert.equal(approvedCheck.state, 'stage_ready');
+    assert.equal(approvedCheck.artifacts[0].id, approved.id);
+    assert.equal(repo.listArtifacts(db, run.id, { stage: 'reference_bundle', page_size: 20 }).items.length, 2);
+
+    const submitted = await service.ensureShotVideos(repo.getRun(db, run.id));
+    assert.equal(submitted.state, 'waiting_provider');
+    assert.equal(requests.length, 1);
+    assert.deepEqual(requests[0].reference_image_urls, []);
+    assert.deepEqual(requests[0].reference_video_urls, []);
+    assert.deepEqual(requests[0].reference_audio_urls, []);
+    assert.equal(requests[0].contract_validation_mode, 'advisory');
+    assert.ok(requests[0].reference_warnings.includes('reference_image_missing'));
+    assert.ok(submitted.action.result.dispatch_receipt.reference_warnings.includes('reference_image_missing'));
+  });
+
   it('excludes a rejected storyboard frame when approved visual authorities exist', async () => {
     const run = makeRun('rejected-storyboard-reference-exclusion');
     const character = addApproved(run, 'asset_text', 'character', 'character-1', 'Lan Yin', {
@@ -1232,7 +1300,8 @@ describe('production media executor', () => {
     const bundled = await service.ensureReferenceBundles(currentRun);
     assert.equal(bundled.state, 'progressed');
     assert.equal(bundled.artifact.status, 'draft');
-    assert.equal(bundled.artifact.content.routing_receipt.model, 'cc-seedance2.0 480p-fast-nsp');
+    assert.equal(bundled.artifact.content.routing_receipt.model, 'mg-seedance2.0 -480p mini');
+    assert.equal(bundled.artifact.content.routing_receipt.estimated_price, 1.002);
     assert.equal(bundled.artifact.content.routing_receipt.planned_duration, 2);
     assert.equal(bundled.artifact.content.routing_receipt.duration, 5);
     assert.equal(bundled.artifact.content.routing_receipt.duration_adjusted, true);
@@ -1245,7 +1314,7 @@ describe('production media executor', () => {
     const submitted = await service.ensureShotVideos(repo.getRun(db, run.id));
     assert.equal(submitted.state, 'waiting_provider');
     assert.equal(requests.length, 1);
-    assert.equal(requests[0].model, 'cc-seedance2.0 480p-fast-nsp');
+    assert.equal(requests[0].model, 'mg-seedance2.0 -480p mini');
     assert.equal(requests[0].duration, 5);
     assert.deepEqual(requests[0].reference_video_urls, []);
     assert.deepEqual(repo.getRun(db, run.id).usage, {
@@ -1255,6 +1324,76 @@ describe('production media executor', () => {
     assert.equal(
       repo.listActions(db, run.id, { page_size: 200 }).items.filter((item) => item.kind === 'client_capture').length,
       0
+    );
+  });
+
+  it('releases local cost and duration after a definitive provider rejection with no task ID', async () => {
+    const run = makeRun('provider-rejected-video');
+    const policy = {
+      ...run.policy,
+      shot_video_models: { '1': 'mg-seedance2.0 -480p mini' },
+      video_model: 'mg-seedance2.0 -480p mini',
+      video_provider: 'yinzi',
+      video_group: '特价视频分组(即梦)',
+      video_quality: 'balanced',
+    };
+    repo.updateRun(db, run.id, { policy });
+    const currentRun = repo.getRun(db, run.id);
+    const shot = addApproved(currentRun, 'storyboard_plan', 'shot', '1', 'Rejected shot', {
+      number: 1, duration: 5, route_profile: 'short_image_guided', previs_mode: 'auto',
+      transition_mode: 'opening', boundary_prompt: 'One complete shot.',
+      cut_in: 'Opening composition.', action: 'The subject turns toward camera.',
+      visual: 'Stable medium shot.', shot_type: 'medium shot', camera_angle: 'eye level',
+      camera_movement: 'locked camera', lighting: 'stable', continuity_in: 'Opening state.',
+      continuity_out: 'Turn completed.', cut_out: 'Cut after the action.',
+      video_prompt: 'Complete the turn.', character_names: [], prop_names: [],
+    });
+    const frame = addApproved(currentRun, 'storyboard_images', 'shot', '1', 'Rejected frame', {
+      source_artifact_id: shot.id,
+    }, [shot.id]);
+    db.prepare('UPDATE production_artifacts SET media_path = ? WHERE id = ?')
+      .run('images/rejected-shot.png', frame.id);
+
+    const service = createProductionMediaService(db, cfg, log, {
+      fetchVideoCatalog: async () => routedCatalog(),
+      createVideo: async () => ({ id: 102, task_id: 'local-video-task-102' }),
+      getVideo: async () => ({
+        id: 102,
+        task_id: 'local-video-task-102',
+        status: 'failed',
+        generation_status: 'failed',
+        submission_status: 'rejected',
+        submission_http_status: 400,
+        submission_receipt: {
+          error_code: 'unsupported_media_reference',
+          request_id: 'request-rejected-102',
+        },
+        provider_task_id: null,
+        error_msg: 'HTTP 400 - this route supports at most 1 reference images',
+      }),
+    });
+    const bundled = await service.ensureReferenceBundles(currentRun);
+    repo.reviewArtifact(db, bundled.artifact.id, {
+      reviewer_type: 'human', decision: 'approved', reason: 'Approved for rejection accounting test',
+    });
+
+    assert.equal((await service.ensureShotVideos(repo.getRun(db, run.id))).state, 'waiting_provider');
+    assert.deepEqual(repo.getRun(db, run.id).usage, {
+      video_attempts_reserved: 1,
+      video_seconds_reserved: 5,
+    });
+    const reconciled = await service.ensureShotVideos(repo.getRun(db, run.id));
+    assert.equal(reconciled.state, 'waiting_review');
+    assert.equal(reconciled.action.status, 'failed');
+    assert.equal(reconciled.action.result.reservation_released, true);
+    assert.equal(reconciled.action.result.submission_status, 'rejected');
+    assert.deepEqual(repo.getRun(db, run.id).usage, {
+      video_attempts_reserved: 0,
+      video_seconds_reserved: 0,
+    });
+    assert.equal(
+      db.prepare('SELECT status FROM cost_ledger WHERE action_id = ?').get(reconciled.action.id).status,
+      'released'
     );
   });
 
@@ -1318,7 +1457,14 @@ describe('production media executor', () => {
         videoRequests.push(structuredClone(request));
         return { id: 91, task_id: 'video-task-91' };
       },
-      getVideo: async () => ({ id: 91, task_id: 'video-task-91', status: videoStatus, local_path: 'videos/shot-1.mp4' }),
+      getVideo: async () => ({
+        id: 91,
+        task_id: 'video-task-91',
+        provider_task_id: 'provider-video-91',
+        submission_status: 'accepted',
+        status: videoStatus,
+        local_path: 'videos/shot-1.mp4',
+      }),
       validateVideo: async () => videoReceipt('videos/shot-1.mp4'),
       generateText: async (user, _system) => {
         plannerCalls += 1;
@@ -1805,7 +1951,7 @@ describe('production media executor', () => {
     assert.equal(repo.listUpstreamArtifactIds(db, result.artifact.id).includes(preview.id), false);
   });
 
-  it('gates strict continuation by capability and transports a locked derived tail frame', async () => {
+  it('warns on unknown strict-first-frame capability and transports a derived frame when available', async () => {
     let run = makeRun('strict-first-frame-run');
     run = repo.updateRun(db, run.id, {
       policy: { ...run.policy, video_model: 'strict-test-model' },
@@ -1872,10 +2018,10 @@ describe('production media executor', () => {
     }, [shots[0].id, firstBundle.artifact.id]);
     db.prepare('UPDATE production_artifacts SET media_path = ? WHERE id = ?')
       .run('videos/strict-previous.mp4', previousVideo.id);
-    await assert.rejects(
-      unsupported.ensureReferenceBundles(repo.getRun(db, run.id)),
-      (error) => error.code === 'STRICT_FIRST_FRAME_UNSUPPORTED'
-    );
+    const unsupportedBundle = await unsupported.ensureReferenceBundles(repo.getRun(db, run.id));
+    assert.equal(unsupportedBundle.state, 'progressed');
+    assert.ok(unsupportedBundle.artifact.content.reference_warnings.includes('strict_first_frame_unsupported'));
+    assert.ok(unsupportedBundle.artifact.content.reference_warnings.includes('continuity_frame_unavailable'));
     assert.deepEqual(repo.getRun(db, run.id).usage, { video_attempts_reserved: 0, video_seconds_reserved: 0 });
 
     const requests = [];
@@ -1915,8 +2061,7 @@ describe('production media executor', () => {
 
     const supportedFirstPass = await supported.ensureReferenceBundles(repo.getRun(db, run.id));
     assert.equal(supportedFirstPass.state, 'progressed');
-    const strictBundle = await supported.ensureReferenceBundles(repo.getRun(db, run.id));
-    assert.equal(strictBundle.state, 'progressed');
+    const strictBundle = supportedFirstPass;
     assert.equal(extracted, 1);
     assert.equal(strictBundle.artifact.content.images.length, 4);
     assert.equal(strictBundle.artifact.content.images[0].role, 'first_frame');

@@ -5,7 +5,9 @@ const {
   listYinziVideoCapabilities,
   capabilitySupportsRole,
   capabilityAcceptsDuration,
+  CURRENT_YINZI_JIMENG_MODELS,
 } = require('../src/services/yinziVideoCapabilities');
+const { getDefaultYinziVideoPrice } = require('../src/services/yinziVideoDefaults');
 
 const CURRENT_YINZI_VIDEO_MODELS = [
   'af-seedance-2.0',
@@ -100,5 +102,47 @@ describe('Yinzi video capability contract', () => {
       assert.equal(capability.max_audios, 0);
       assert.equal(capabilitySupportsRole(capability, 'image', 'first_frame'), false);
     }
+  });
+
+  it('matches the current ten-model YinziAPI offer matrix and local CNY prices', () => {
+    const expected = {
+      '官转-seedance2.0 720p-fast': { media: [9, 3, 3], duration: ['free', 5, 15], price: ['per_second', 1.014] },
+      '官转-seedance2.0 720p-pro': { media: [9, 3, 3], duration: ['free', 5, 15], price: ['per_second', 1.17] },
+      '破甲seedance 720p-fast': { media: [9, 3, 3], duration: ['free', 5, 15], price: ['per_second', 2.1528] },
+      'cm-seedance2.0 -720p-15s': { media: [9, 3, 3], duration: ['free', 5, 15], price: ['per_request', 8.0808] },
+      'cm-seedance2.0特价fast-720p-gz-15s': { media: [9, 3, 3], duration: ['fixed', 15, 15], price: ['per_request', 4.68] },
+      'seedance-2.5-720p': { media: [30, 0, 10], duration: ['range', 4, 30], price: ['per_second', 0.672] },
+      'seedance2.0 -720p-fast-15s': { media: [9, 3, 3], duration: ['free', 5, 15], price: ['per_request', 5.58] },
+      'seedance2.0 720p-pro-nv-nsp': { media: [9, 0, 3], duration: ['free', 5, 15], price: ['per_request', 0.44928] },
+      'seedance2.0特价pro-720p-gz-15s': { media: [9, 3, 3], duration: ['fixed', 15, 15], price: ['fixed_duration', 6.24] },
+      'seedance2.0特价pro-720p-gz-15s-nsp': { media: [9, 0, 3], duration: ['fixed', 15, 15], price: ['per_request', 5.16] },
+    };
+
+    assert.deepEqual([...CURRENT_YINZI_JIMENG_MODELS], Object.keys(expected));
+    for (const [model, contract] of Object.entries(expected)) {
+      const capability = getYinziVideoCapability(model);
+      const price = getDefaultYinziVideoPrice(model);
+      assert.ok(capability, `missing capability: ${model}`);
+      assert.ok(price, `missing price: ${model}`);
+      assert.deepEqual(
+        [capability.max_images, capability.max_videos, capability.max_audios],
+        contract.media,
+        `media mismatch: ${model}`,
+      );
+      assert.deepEqual(
+        [capability.duration_mode, capability.duration_min, capability.duration_max],
+        contract.duration,
+        `duration mismatch: ${model}`,
+      );
+      assert.deepEqual([price.billing_unit, price.effective_price], contract.price, `price mismatch: ${model}`);
+      assert.equal(price.currency, 'CNY');
+    }
+
+    const seedance25 = getYinziVideoCapability('seedance-2.5-720p');
+    assert.equal(capabilityAcceptsDuration(seedance25, 4), true);
+    assert.equal(capabilityAcceptsDuration(seedance25, 4, { automatic: true }), false);
+    assert.equal(capabilityAcceptsDuration(seedance25, 15, { automatic: true }), true);
+    assert.equal(capabilityAcceptsDuration(seedance25, 16, { automatic: true }), false);
+    assert.equal(getYinziVideoCapability('破甲seedance 720p-fast').automatic_eligible, false);
   });
 });

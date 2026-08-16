@@ -1,6 +1,6 @@
 {
   "name": "yinzi-ai-video-workflow-backend",
-  "version": "0.1.2-beta.1",
+  "version": "0.1.3-beta.4",
   "description": "Node.js backend for 银子AI视频工作流",
   "main": "src/server.js",
   "scripts": {

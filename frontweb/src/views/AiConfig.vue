@@ -15,17 +15,19 @@
     </header>
 
     <main class="main">
-      <AIConfigContent />
+      <AIConfigContent :initial-action="initialAction" />
     </main>
   </div>
 </template>
 
 <script setup>
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { ArrowLeft } from '@element-plus/icons-vue'
 import AIConfigContent from '@/components/AIConfigContent.vue'
 
 const router = useRouter()
+const route = useRoute()
+const initialAction = String(route.query.action || '')
 
 function goList() {
   router.push({ name: 'list' })

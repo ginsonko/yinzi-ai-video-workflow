@@ -15,6 +15,7 @@ function sendError(res, log, label, error) {
   log.error(label, { error: error.message, code: error.code });
   const code = error.code || 'BAD_REQUEST';
   if (code === 'VERSION_CONFLICT') return response.error(res, 409, code, error.message);
+  if (code === 'SHOT_OPERATION_BUSY') return response.error(res, 409, code, error.message);
   if (code === 'PRODUCTION_ASPECT_RATIO_LOCKED') return response.error(res, 409, code, error.message, error.details);
   if (code === 'STAGE_INCOMPLETE') return response.error(res, 409, code, error.message, error.details);
   if (code.includes('BUDGET')) return response.error(res, 409, code, error.message, error.details);
@@ -173,10 +174,17 @@ function routes(db, cfg, log, injected = {}) {
     },
     resume: (req, res) => {
       try {
-        const run = repo.updateRun(db, req.params.id, { status: 'running', waiting_reason: null, error_code: null, error_message: null }, req.body?.expected_version);
-        if (!run) return response.notFound(res, '制作任务不存在');
-        repo.appendEvent(db, run.id, 'run.resumed', { stage: run.current_stage });
-        response.success(res, repo.getRunSummary(db, run.id));
+        const summary = service.updateRunControl(req.params.id, {
+          status: 'running',
+          waiting_reason: null,
+          error_code: null,
+          error_message: null,
+          resolve_intervention: true,
+          expected_version: req.body?.expected_version,
+        });
+        if (!summary) return response.notFound(res, '制作任务不存在');
+        repo.appendEvent(db, summary.run.id, 'run.resumed', { stage: summary.run.current_stage });
+        response.success(res, summary);
       } catch (error) { sendError(res, log, 'production resume', error); }
     },
     retry: (req, res) => {
@@ -186,6 +194,26 @@ function routes(db, cfg, log, injected = {}) {
     recoverStoryboard: (req, res) => {
       try { response.success(res, service.recoverScopedShotRevision(req.params.id, req.body || {})); }
       catch (error) { sendError(res, log, 'production storyboard recovery', error); }
+    },
+    skipShot: async (req, res) => {
+      try { response.success(res, await service.skipShot(req.params.id, req.params.shotId, req.body || {})); }
+      catch (error) { sendError(res, log, 'production shot skip', error); }
+    },
+    restoreShot: async (req, res) => {
+      try { response.success(res, await service.restoreShot(req.params.id, req.params.shotId, req.body || {})); }
+      catch (error) { sendError(res, log, 'production shot restore', error); }
+    },
+    reviseShot: async (req, res) => {
+      try { response.success(res, await service.reviseShot(req.params.id, req.params.shotId, req.body || {})); }
+      catch (error) { sendError(res, log, 'production shot revise', error); }
+    },
+    splitShot: async (req, res) => {
+      try { response.success(res, await service.splitShot(req.params.id, req.params.shotId, req.body || {})); }
+      catch (error) { sendError(res, log, 'production shot split', error); }
+    },
+    pickupShot: async (req, res) => {
+      try { response.success(res, await service.pickupShot(req.params.id, req.body || {})); }
+      catch (error) { sendError(res, log, 'production shot pickup', error); }
     },
     cancel: (req, res) => {
       try {
@@ -284,12 +312,32 @@ function routes(db, cfg, log, injected = {}) {
       try { response.success(res, await service.reviewArtifact(req.params.artifactId, { reviewer_type: 'human', ...(req.body || {}) })); }
       catch (error) { sendError(res, log, 'production artifact review', error); }
     },
-    excludeArtifact: (req, res) => {
-      try { response.success(res, repo.excludeArtifact(db, req.params.artifactId, req.body || {})); }
+    excludeArtifact: async (req, res) => {
+      try {
+        const artifact = repo.getArtifact(db, req.params.artifactId);
+        if (artifact?.stage === 'storyboard_plan' && artifact.scope_type === 'shot') {
+          return response.success(res, await service.skipShot(
+            artifact.run_id,
+            artifact.scope_id,
+            req.body || {},
+          ));
+        }
+        response.success(res, repo.excludeArtifact(db, req.params.artifactId, req.body || {}));
+      }
       catch (error) { sendError(res, log, 'production artifact exclude', error); }
     },
-    restoreArtifact: (req, res) => {
-      try { response.success(res, repo.restoreArtifact(db, req.params.artifactId, req.body || {})); }
+    restoreArtifact: async (req, res) => {
+      try {
+        const artifact = repo.getArtifact(db, req.params.artifactId);
+        if (artifact?.stage === 'storyboard_plan' && artifact.scope_type === 'shot') {
+          return response.success(res, await service.restoreShot(
+            artifact.run_id,
+            artifact.scope_id,
+            req.body || {},
+          ));
+        }
+        response.success(res, repo.restoreArtifact(db, req.params.artifactId, req.body || {}));
+      }
       catch (error) { sendError(res, log, 'production artifact restore', error); }
     },
     suggestArtifact: async (req, res) => {

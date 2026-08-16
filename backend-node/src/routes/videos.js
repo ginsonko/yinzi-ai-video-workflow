@@ -1,7 +1,21 @@
 const response = require('../response');
 const videoService = require('../services/videoService');
 const taskService = require('../services/taskService');
-const { normalizeAspectRatioForApi } = require('../services/videoClient');
+const videoClient = require('../services/videoClient');
+const { normalizeAspectRatioForApi } = videoClient;
+
+function publicVideoConfigSnapshot(config, model) {
+  if (!config) return null;
+  return {
+    config_id: config.id,
+    provider: config.provider || null,
+    api_protocol: config.api_protocol || null,
+    base_url: config.base_url || null,
+    endpoint: config.endpoint || null,
+    query_endpoint: config.query_endpoint || null,
+    model: model || config.default_model || null,
+  };
+}
 
 function routes(db, log) {
   return {
@@ -33,6 +47,10 @@ function routes(db, log) {
           }
         }
         const model = body.model ?? null;
+        const videoConfig = videoClient.getDefaultVideoConfig(db, model, body.video_config_id);
+        const videoConfigId = videoConfig?.id || null;
+        const providerProtocol = videoConfig ? videoClient.resolveVideoProtocol(videoConfig, model) : null;
+        const providerConfigSnapshot = publicVideoConfigSnapshot(videoConfig, model);
         const duration = body.duration ?? null;
         // 画幅：请求体归一化（全角冒号等）后写入 DB；未传则从 drama.metadata 读取并同样归一化
         let aspectRatio = null;
@@ -70,10 +88,24 @@ function routes(db, log) {
         const promptContractJson = body.prompt_contract && typeof body.prompt_contract === 'object'
           ? JSON.stringify(body.prompt_contract)
           : null;
+        const contractValidationMode = videoClient.normalizeContractValidationMode(body.contract_validation_mode);
         db.prepare(
-          `INSERT INTO video_generations (drama_id, storyboard_id, provider, prompt, prompt_contract_json, model, duration, aspect_ratio, resolution, seed, camera_fixed, watermark, image_url, first_frame_url, last_frame_url, reference_image_urls, reference_video_urls, reference_audio_urls, status, task_id, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'processing', ?, ?, ?)`
-        ).run(dramaId, storyboardId, provider, prompt, promptContractJson, model, duration, aspectRatio, resolution, seed, cameraFixed, watermark, imageUrl, firstFrameUrl, lastFrameUrl, refImagesJson, refVideosJson, refAudiosJson, task.id, now, now);
+          `INSERT INTO video_generations (
+             drama_id, storyboard_id, provider, prompt, prompt_contract_json, model, duration, aspect_ratio,
+             resolution, seed, camera_fixed, watermark, image_url, first_frame_url, last_frame_url,
+             reference_image_urls, reference_video_urls, reference_audio_urls, status, generation_status,
+             download_status, video_config_id, provider_protocol, provider_config_snapshot_json,
+             contract_validation_mode,
+             task_id, created_at, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'processing', 'processing',
+             'pending', ?, ?, ?, ?, ?, ?, ?)`
+        ).run(
+          dramaId, storyboardId, provider, prompt, promptContractJson, model, duration, aspectRatio,
+          resolution, seed, cameraFixed, watermark, imageUrl, firstFrameUrl, lastFrameUrl,
+          refImagesJson, refVideosJson, refAudiosJson, videoConfigId, providerProtocol,
+          providerConfigSnapshot ? JSON.stringify(providerConfigSnapshot) : null,
+          contractValidationMode, task.id, now, now
+        );
         const videoGenId = db.prepare('SELECT last_insert_rowid() as id').get().id;
         setImmediate(() => {
           videoService.processVideoGeneration(db, log, videoGenId);
@@ -92,6 +124,20 @@ function routes(db, log) {
         response.success(res, item);
       } catch (err) {
         log.error('videos get', { error: err.message });
+        response.internalError(res, err.message);
+      }
+    },
+    retryDownload: async (req, res) => {
+      try {
+        const item = videoService.getById(db, req.params.id);
+        if (!item) return response.notFound(res, '记录不存在');
+        if (item.generation_status !== 'completed') {
+          return response.badRequest(res, '上游视频尚未完成，不能进入下载恢复');
+        }
+        const result = await videoService.resumeDownloadForVideoGeneration(db, log, req.params.id);
+        response.success(res, { result, video: videoService.getById(db, req.params.id) });
+      } catch (err) {
+        log.error('videos retry download', { error: err.message });
         response.internalError(res, err.message);
       }
     },

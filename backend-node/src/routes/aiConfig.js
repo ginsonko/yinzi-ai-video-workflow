@@ -108,6 +108,50 @@ function bulkUpdateKey(db, log, cfg) {
   };
 }
 
+function modelCapabilities(db) {
+  return (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (isNaN(id)) return response.badRequest(res, '无效的配置ID');
+    const config = aiConfigService.getConfig(db, id);
+    if (!config) return response.notFound(res, '配置不存在');
+    response.success(res, {
+      config_id: id,
+      service_type: config.service_type,
+      models: aiConfigService.modelCapabilityStates(config),
+    });
+  };
+}
+
+function updateModelCapabilities(db, log) {
+  return (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (isNaN(id)) return response.badRequest(res, '无效的配置ID');
+    const body = req.body || {};
+    const model = String(body.model || '').trim();
+    if (!model) return response.badRequest(res, '模型名不能为空');
+    try {
+      const result = require('../services/configMutationService').withAutomaticSnapshot(
+        db,
+        `${body.reset ? '恢复' : '保存'}模型能力提示 #${id}`,
+        () => body.reset
+          ? aiConfigService.resetModelCapabilityOverride(db, log, id, model)
+          : aiConfigService.updateModelCapabilityOverride(db, log, id, model, body.capability || {})
+      ).result;
+      if (!result) return response.notFound(res, '配置不存在');
+      response.success(res, {
+        config_id: id,
+        model,
+        reset: body.reset === true,
+        config: aiConfigService.toPublicConfig(result),
+        models: aiConfigService.modelCapabilityStates(result),
+      });
+    } catch (err) {
+      log.error('Update model capability override failed', { config_id: id, model, error: err.message });
+      response.badRequest(res, err.message || '模型能力提示保存失败');
+    }
+  };
+}
+
 function testConnection(db, log) {
   return async (req, res) => {
     const body = req.body || {};
@@ -149,20 +193,63 @@ function yinziCatalog(log) {
   };
 }
 
+function discoverModels(db, log) {
+  return async (req, res) => {
+    const body = req.body || {};
+    let resolved;
+    try {
+      resolved = aiConfigService.resolveConnectionTestConfig(db, body);
+      const discovery = await aiConfigService.discoverModels(resolved.config, {
+        db,
+        catalog_path: body.catalog_path,
+      });
+      let pricing = null;
+      if (String(resolved.config.provider || '').toLowerCase() === 'yinzi') {
+        try { pricing = await require('../services/yinziService').fetchYinziCatalogForConfig(resolved.config); } catch (_) { pricing = null; }
+      }
+      const catalog = aiConfigService.mergeDiscoveredCatalog(discovery, pricing, {
+        provider: resolved.config.provider,
+        service_type: body.service_type || resolved.config.service_type || 'video',
+        group: body.group || '',
+        capability_overrides: aiConfigService.getModelCapabilityOverrides(resolved.config),
+      });
+      response.success(res, {
+        ...discovery,
+        catalog,
+        config_id: resolved.config_id,
+        credential_source: resolved.credential_source,
+      });
+    } catch (err) {
+      const safeMessage = aiConfigService.redactConnectionTestError(err, [resolved?.config?.api_key]);
+      log.error('Discover AI models failed', { config_id: resolved?.config_id ?? body.config_id ?? null, error: safeMessage });
+      response.badRequest(res, '模型目录读取失败: ' + safeMessage);
+    }
+  };
+}
+
 function setupYinzi(db, log, cfg) {
-  return (req, res) => {
+  return async (req, res) => {
     if (aiConfigService.getVendorLockStatus(cfg).enabled) {
       return response.badRequest(res, '厂商锁定模式下不能创建 YinziAPI 配置');
     }
+    const body = req.body || {};
     try {
-      const { upsertYinziConfigs } = require('../services/yinziService');
+      const { prepareYinziSetupInput, upsertYinziConfigs } = require('../services/yinziService');
+      const prepared = await prepareYinziSetupInput(body);
       const result = require('../services/configMutationService').withAutomaticSnapshot(db, '一键配置 YinziAPI', () => (
-        upsertYinziConfigs(db, log, req.body || {})
+        upsertYinziConfigs(db, log, prepared)
       )).result;
       response.success(res, result);
     } catch (err) {
-      log.error('Setup Yinzi configs failed', { error: err.message });
-      response.badRequest(res, err.message || 'YinziAPI 配置失败');
+      const safeMessage = aiConfigService.redactConnectionTestError(err, [
+        body.api_key,
+        body.universal_api_key,
+        body.text_api_key,
+        body.image_api_key,
+        body.video_api_key,
+      ]);
+      log.error('Setup Yinzi configs failed', { error: safeMessage });
+      response.badRequest(res, safeMessage || 'YinziAPI 配置失败');
     }
   };
 }
@@ -231,10 +318,13 @@ module.exports = function aiConfigRoutes(db, log, cfg) {
     update: update(db, log, cfg),
     delete: remove(db, log, cfg),
     testConnection: testConnection(db, log),
+    discoverModels: discoverModels(db, log),
     yinziCatalog: yinziCatalog(log),
     setupYinzi: setupYinzi(db, log, cfg),
     listJimeng2MaterialAssets: listJimeng2MaterialAssets(log),
     modelArkAsset: modelArkAsset(log),
     bulkUpdateKey: bulkUpdateKey(db, log, cfg),
+    modelCapabilities: modelCapabilities(db),
+    updateModelCapabilities: updateModelCapabilities(db, log),
   };
 };

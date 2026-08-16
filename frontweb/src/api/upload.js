@@ -14,14 +14,16 @@ export const uploadAPI = {
       form.append('drama_id', String(did))
     }
     return request.post('/upload/image', form, {
-      headers: { 'Content-Type': 'multipart/form-data' }
+      headers: { 'Content-Type': 'multipart/form-data' },
+      onUploadProgress: opts.onUploadProgress,
     })
   },
-  uploadReferenceMedia(file) {
+  uploadReferenceMedia(file, opts = {}) {
     const form = new FormData()
     form.append('file', file)
     return request.post('/upload/reference-media', form, {
-      headers: { 'Content-Type': 'multipart/form-data' }
+      headers: { 'Content-Type': 'multipart/form-data' },
+      onUploadProgress: opts.onUploadProgress,
     })
   },
   /**

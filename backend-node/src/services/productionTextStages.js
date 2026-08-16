@@ -243,6 +243,75 @@ function normalizeShotRevision(raw, log, expectedNumber, options = {}) {
   return normalized.shots[0];
 }
 
+function shotRevisionPrompts(input = {}) {
+  return {
+    system: 'You are a film continuity editor revising one production shot from a user instruction. Preserve explicit story facts, approved identities, scene geometry, props, timing constraints, and honest editorial boundaries. Return one production-ready shot.',
+    user: `User revision request:\n${cleanText(input.instruction, 4000)}
+
+Current shot:\n${JSON.stringify(input.shot || {}).slice(0, 18000)}
+
+Previous planned shot:\n${JSON.stringify(input.previous_shot || null).slice(0, 8000)}
+
+Next planned shot:\n${JSON.stringify(input.next_shot || null).slice(0, 8000)}
+
+Approved assets:\n${JSON.stringify(input.assets || []).slice(0, 20000)}
+
+Rewrite exactly one complete camera shot. Keep the same shot number, finish the action inside this clip, and keep duration within ${Number(input.duration_min) || 5} to ${Number(input.duration_max) || 15} seconds. Do not add a transition effect merely to hide a cut.`,
+  };
+}
+
+function shotSplitPrompts(input = {}) {
+  return {
+    system: 'You are a film editor splitting one overloaded production shot into two independent camera shots at a real editorial cut. Preserve explicit story facts and approved asset identities.',
+    user: `User split request:\n${cleanText(input.instruction, 4000)}
+
+Shot to split:\n${JSON.stringify(input.shot || {}).slice(0, 18000)}
+
+Previous planned shot:\n${JSON.stringify(input.previous_shot || null).slice(0, 8000)}
+
+Following planned shot:\n${JSON.stringify(input.next_shot || null).slice(0, 8000)}
+
+Approved assets:\n${JSON.stringify(input.assets || []).slice(0, 20000)}
+
+Return two complete camera shots. The first keeps number ${input.current_number}; the inserted second uses number ${input.next_number}. Each must last ${Number(input.duration_min) || 5} to ${Number(input.duration_max) || 15} seconds and end in a stable editable state. Put the split at action completion, reaction, information change, eyeline, or a meaningful shot-size/angle change. Use a normal hard cut unless continuity genuinely requires an ordinary tail-frame reference.`,
+  };
+}
+
+function shotPickupPrompts(input = {}) {
+  return {
+    system: 'You are a film director adding one purposeful pickup shot to an existing sequence. Preserve approved asset identities and build an honest cut-in and cut-out.',
+    user: `User pickup request:\n${cleanText(input.instruction, 4000)}
+
+Previous planned shot:\n${JSON.stringify(input.previous_shot || null).slice(0, 12000)}
+
+Following planned shot:\n${JSON.stringify(input.next_shot || null).slice(0, 12000)}
+
+Screenplay context:\n${cleanText(input.script, 20000)}
+
+Approved assets:\n${JSON.stringify(input.assets || []).slice(0, 20000)}
+
+Create one new complete camera shot numbered ${input.number}. It must add clear narrative value rather than duplicate adjacent coverage, last ${Number(input.duration_min) || 5} to ${Number(input.duration_max) || 15} seconds, and form a normal editable cut boundary.`,
+  };
+}
+
+function normalizeShotSplit(raw, log, currentNumber, nextNumber, options = {}) {
+  const parsed = parseJson(raw, log);
+  const current = normalizeShotRevision(
+    { shot: parsed?.current_shot || parsed?.first_shot || parsed?.shots?.[0] },
+    log,
+    currentNumber,
+    options
+  );
+  const next = normalizeShotRevision(
+    { shot: parsed?.next_shot || parsed?.second_shot || parsed?.shots?.[1] },
+    log,
+    nextNumber,
+    options
+  );
+  if (!current || !next) throw new Error('镜头拆分结果必须包含两个完整镜头');
+  return { current_shot: current, next_shot: next };
+}
+
 function recoverShotRevisionFromApprovedRough(roughShot, previousShot, options = {}) {
   const expectedNumber = Math.max(1, Number(roughShot?.number || options.expected_number) || 1);
   const strictSupported = options.strict_first_frame_supported === true;
@@ -385,12 +454,16 @@ module.exports = {
   normalizeScript,
   normalizeResources,
   normalizeShots,
+  normalizeShotRevision,
+  normalizeShotSplit,
   normalizeReview,
   scriptPrompts,
   resourcePrompts,
   storyboardPrompts,
+  shotRevisionPrompts,
+  shotSplitPrompts,
+  shotPickupPrompts,
   shotContinuityRevisionPrompts,
-  normalizeShotRevision,
   recoverShotRevisionFromApprovedRough,
   videoRetryPlannerPrompts,
   normalizeVideoRetryPlan,

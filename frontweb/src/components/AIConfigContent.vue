@@ -113,7 +113,7 @@
                 <span v-else class="no-default">—</span>
               </template>
             </el-table-column>
-            <el-table-column label="操作" width="180" fixed="right">
+            <el-table-column label="操作" width="250" fixed="right">
               <template #default="{ row }">
                 <el-button
                   link
@@ -122,6 +122,14 @@
                   :loading="testingConfigId === row.id"
                   @click="openTest(row)"
                 >测试</el-button>
+                <el-button
+                  v-if="row.service_type === 'video'"
+                  link
+                  type="primary"
+                  size="small"
+                  :loading="discoveringConfigId === row.id"
+                  @click="discoverConfigModels(row)"
+                >模型与能力</el-button>
                 <el-button link type="primary" size="small" @click="onRowEdit(row)">{{ vendorLock.enabled ? '修改Key' : '编辑' }}</el-button>
                 <el-button v-if="!vendorLock.enabled" link type="danger" size="small" @click="onDelete(row)">删除</el-button>
               </template>
@@ -217,6 +225,125 @@
         </div>
       </el-tab-pane>
     </el-tabs>
+
+    <el-dialog v-model="modelDiscoveryVisible" title="视频模型与能力提示" width="min(820px, 94vw)">
+      <el-alert
+        v-if="modelDiscoveryError"
+        type="warning"
+        :closable="false"
+        show-icon
+        :title="modelDiscoveryError"
+      />
+      <div class="model-discovery-body">
+        <div class="model-discovery-summary">
+          <span><small>配置</small><strong>{{ modelDiscoveryTarget?.name || '视频配置' }}</strong></span>
+          <span><small>Base URL</small><strong>{{ modelDiscoveryTarget?.base_url || '未填写' }}</strong></span>
+          <span><small>读取结果</small><strong>{{ modelDiscoveryRows.length }} 个模型</strong></span>
+        </div>
+        <div class="capability-manual-entry">
+          <el-input v-model="modelCapabilityManualName" clearable placeholder="目录没有返回时，也可直接输入模型名维护本地能力提示" @keyup.enter="openManualCapabilityEditor" />
+          <el-button type="primary" plain :disabled="!modelCapabilityManualName.trim()" @click="openManualCapabilityEditor">编辑此模型提示</el-button>
+        </div>
+        <el-table :data="modelDiscoveryRows" stripe max-height="56vh">
+          <el-table-column prop="model" label="模型" min-width="260" show-overflow-tooltip />
+          <el-table-column label="能力状态" width="120">
+            <template #default="{ row }">
+              <el-tag size="small" effect="plain" :type="row.contract_status === 'known' ? 'success' : row.contract_status === 'local' ? 'primary' : 'warning'">
+                {{ row.contract_status === 'known' ? '内置' : row.contract_status === 'local' ? '本地提示' : '待补充' }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="自动选模" width="105">
+            <template #default="{ row }">{{ row.automatic_eligible ? '可用' : '手动选择' }}</template>
+          </el-table-column>
+          <el-table-column label="分组 / 价格" min-width="180">
+            <template #default="{ row }">
+              {{ Array.isArray(row.groups) && row.groups.length ? row.groups.join('、') : '当前 Key 范围' }}
+            </template>
+          </el-table-column>
+          <el-table-column label="本地能力提示" width="180" fixed="right">
+            <template #default="{ row }">
+              <div class="capability-actions">
+                <el-tag size="small" effect="plain" :type="row.local_capability_override ? 'success' : 'info'">
+                  {{ row.local_capability_override ? '已配置本地提示' : '使用默认提示' }}
+                </el-tag>
+                <span>
+                  <el-button link type="primary" size="small" @click="openCapabilityEditor(row)">编辑</el-button>
+                  <el-button v-if="row.local_capability_override" link type="warning" size="small" @click="resetCapability(row)">恢复默认</el-button>
+                </span>
+              </div>
+            </template>
+          </el-table-column>
+        </el-table>
+      </div>
+      <template #footer><el-button @click="modelDiscoveryVisible = false">关闭</el-button></template>
+    </el-dialog>
+
+    <el-dialog v-model="capabilityEditorVisible" title="编辑模型能力提示" width="min(760px, 94vw)" :close-on-click-modal="false">
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        :title="`${capabilityEditorTarget?.model || '当前模型'}：这些是本地提示，不会限制手动选择或强制携带参考素材。只有勾选自动路由授权后，自动模式才会使用它。`"
+      />
+      <el-form label-position="top" class="capability-editor-form">
+        <div class="capability-editor-grid">
+          <el-form-item label="时长模式">
+            <el-select v-model="capabilityEditorForm.duration_mode" clearable>
+              <el-option label="自由时长" value="free" />
+              <el-option label="范围时长" value="range" />
+              <el-option label="固定时长" value="fixed" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="分辨率提示">
+            <el-input v-model="capabilityEditorForm.resolution" clearable placeholder="例如 480p、720p、2k" />
+          </el-form-item>
+          <el-form-item label="最短秒数">
+            <el-input-number v-model="capabilityEditorForm.duration_min" :min="0" :max="3600" :precision="2" controls-position="right" />
+          </el-form-item>
+          <el-form-item label="最长秒数">
+            <el-input-number v-model="capabilityEditorForm.duration_max" :min="0" :max="3600" :precision="2" controls-position="right" />
+          </el-form-item>
+          <el-form-item label="固定秒数">
+            <el-input-number v-model="capabilityEditorForm.fixed_duration_seconds" :min="0" :max="3600" :precision="2" controls-position="right" />
+          </el-form-item>
+          <el-form-item label="最大参考图片数">
+            <el-input-number v-model="capabilityEditorForm.max_images" :min="0" :max="1000" controls-position="right" />
+          </el-form-item>
+          <el-form-item label="最大参考视频数">
+            <el-input-number v-model="capabilityEditorForm.max_videos" :min="0" :max="1000" controls-position="right" />
+          </el-form-item>
+          <el-form-item label="最大参考音频数">
+            <el-input-number v-model="capabilityEditorForm.max_audios" :min="0" :max="1000" controls-position="right" />
+          </el-form-item>
+          <el-form-item label="最大参考总数">
+            <el-input-number v-model="capabilityEditorForm.max_total_references" :min="0" :max="2000" controls-position="right" />
+          </el-form-item>
+          <el-form-item label="参考视频总秒数上限">
+            <el-input-number v-model="capabilityEditorForm.max_reference_video_seconds_total" :min="0" :max="3600" :precision="2" controls-position="right" />
+          </el-form-item>
+          <el-form-item label="自动路由授权">
+            <el-checkbox v-model="capabilityEditorForm.automatic_eligible">允许自动模式把它作为候选</el-checkbox>
+          </el-form-item>
+          <el-form-item label="昂贵模型标记">
+            <el-checkbox v-model="capabilityEditorForm.expensive_bypass">需要单独确认费用</el-checkbox>
+          </el-form-item>
+        </div>
+        <el-form-item label="自动路由适用镜头类型">
+          <el-checkbox-group v-model="capabilityEditorForm.route_profiles">
+            <el-checkbox label="short_image_guided">短镜头 / 图片引导</el-checkbox>
+            <el-checkbox label="long_previs_guided">长镜头 / 连续动作</el-checkbox>
+          </el-checkbox-group>
+        </el-form-item>
+        <el-form-item label="媒体角色（高级，可选 JSON）">
+          <el-input v-model="capabilityEditorForm.roles_json" type="textarea" :rows="3" placeholder='例如 {"image":["reference"],"video":["reference"],"audio":["reference"]}' />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="capabilityEditorVisible = false">取消</el-button>
+        <el-button type="primary" :loading="capabilityEditorSaving" @click="saveCapabilityEditor">保存本地提示</el-button>
+      </template>
+    </el-dialog>
 
     <!-- 添加/编辑 -->
     <el-dialog
@@ -1045,38 +1172,52 @@ input_reference = (图片文件，可选)</pre>
           <el-input v-model="oneKeyYinziForm.base_url" placeholder="https://api.yinziapi.top/v1" clearable />
         </el-form-item>
 
-        <div class="yinzi-field-grid">
-          <el-form-item label="文本 API Key" required>
-            <el-input v-model="oneKeyYinziForm.text_api_key" type="password" show-password clearable autocomplete="new-password" />
-          </el-form-item>
-          <el-form-item label="文本模型" required>
-            <el-select v-model="oneKeyYinziForm.text_model" filterable allow-create default-first-option placeholder="选择或输入模型">
-              <el-option v-for="item in yinziCatalog.text" :key="item.model" :label="catalogOptionLabel(item)" :value="item.model" />
-            </el-select>
-          </el-form-item>
+        <el-form-item label="通用 API Key" required>
+          <el-input v-model="oneKeyYinziForm.api_key" type="password" show-password clearable autocomplete="new-password" placeholder="填写一次即可；不同分组再展开高级设置" />
+        </el-form-item>
 
-          <el-form-item label="生图 API Key" required>
-            <el-input v-model="oneKeyYinziForm.image_api_key" type="password" show-password clearable autocomplete="new-password" />
-          </el-form-item>
-          <el-form-item label="生图模型" required>
-            <el-select v-model="oneKeyYinziForm.image_model" filterable allow-create default-first-option placeholder="选择或输入模型">
-              <el-option v-for="item in yinziCatalog.image" :key="item.model" :label="catalogOptionLabel(item)" :value="item.model" />
-            </el-select>
-          </el-form-item>
-
-          <el-form-item label="视频 API Key" required>
-            <el-input v-model="oneKeyYinziForm.video_api_key" type="password" show-password clearable autocomplete="new-password" />
-          </el-form-item>
-          <el-form-item label="视频模型" required>
-            <el-select v-model="oneKeyYinziForm.video_model" filterable allow-create default-first-option placeholder="选择或输入模型">
-              <el-option v-for="item in yinziCatalog.video" :key="item.model" :label="catalogOptionLabel(item)" :value="item.model" />
-            </el-select>
-          </el-form-item>
+        <div class="yinzi-auto-summary">
+          <span><small>文本</small><strong>{{ oneKeyYinziForm.text_model || 'gpt-5.6-sol' }}</strong></span>
+          <span><small>生图</small><strong>{{ oneKeyYinziForm.image_model || 'gpt-image-2' }}</strong></span>
+          <span><small>视频</small><strong>{{ oneKeyYinziForm.video_model || '按镜头预计总价自动选择' }}</strong></span>
         </div>
+
+        <el-collapse v-model="oneKeyYinziAdvanced" class="yinzi-advanced">
+          <el-collapse-item title="高级设置：分组 Key 与模型覆盖" name="advanced">
+            <div class="yinzi-field-grid">
+              <el-form-item label="文本 Key 覆盖">
+                <el-input v-model="oneKeyYinziForm.text_api_key" type="password" show-password clearable autocomplete="new-password" placeholder="留空使用通用 Key" />
+              </el-form-item>
+              <el-form-item label="文本模型">
+                <el-select v-model="oneKeyYinziForm.text_model" filterable allow-create default-first-option clearable placeholder="自动选择">
+                  <el-option v-for="item in yinziCatalog.text" :key="item.model" :label="catalogOptionLabel(item)" :value="item.model" />
+                </el-select>
+              </el-form-item>
+
+              <el-form-item label="生图 Key 覆盖">
+                <el-input v-model="oneKeyYinziForm.image_api_key" type="password" show-password clearable autocomplete="new-password" placeholder="留空使用通用 Key" />
+              </el-form-item>
+              <el-form-item label="生图模型">
+                <el-select v-model="oneKeyYinziForm.image_model" filterable allow-create default-first-option clearable placeholder="自动选择">
+                  <el-option v-for="item in yinziCatalog.image" :key="item.model" :label="catalogOptionLabel(item)" :value="item.model" />
+                </el-select>
+              </el-form-item>
+
+              <el-form-item label="视频 Key 覆盖">
+                <el-input v-model="oneKeyYinziForm.video_api_key" type="password" show-password clearable autocomplete="new-password" placeholder="留空使用通用 Key" />
+              </el-form-item>
+              <el-form-item label="固定视频模型">
+                <el-select v-model="oneKeyYinziForm.video_model" filterable allow-create default-first-option clearable placeholder="留空：每个镜头自动选择最便宜的合格模型">
+                  <el-option v-for="item in yinziCatalog.video" :key="item.model" :label="catalogOptionLabel(item)" :value="item.model" />
+                </el-select>
+              </el-form-item>
+            </div>
+          </el-collapse-item>
+        </el-collapse>
       </el-form>
 
       <div class="yinzi-local-note">
-        Key 仅提交到本机后端并保存在本地 SQLite，不写入前端缓存、源码或导出截图。视频提交遇到不确定超时不会自动重试。
+        保存时会只读核对当前 Key 的模型目录；不生成图片或视频。Key 仅保存在本机 SQLite，不写入前端缓存、源码或导出截图。
       </div>
 
       <template #footer>
@@ -1385,6 +1526,16 @@ const testDetails = ref({})
 const testTargetName = ref('')
 const testingConfigId = ref(null)
 const testingDraft = ref(false)
+const discoveringConfigId = ref(null)
+const modelDiscoveryVisible = ref(false)
+const modelDiscoveryTarget = ref(null)
+const modelDiscoveryRows = ref([])
+const modelDiscoveryError = ref('')
+const modelCapabilityManualName = ref('')
+const capabilityEditorVisible = ref(false)
+const capabilityEditorSaving = ref(false)
+const capabilityEditorTarget = ref(null)
+const capabilityEditorForm = ref({})
 const testSuccessDescription = computed(() => configTestSuccessCopy(testDetails.value))
 const oneKeyTongyiVisible = ref(false)
 const oneKeyTongyiKey = ref('')
@@ -1398,10 +1549,12 @@ const oneKeyAgnesSaving = ref(false)
 const oneKeyYinziVisible = ref(false)
 const oneKeyYinziSaving = ref(false)
 const oneKeyYinziCatalogLoading = ref(false)
+const oneKeyYinziAdvanced = ref([])
 const yinziCatalogError = ref('')
 const yinziCatalog = ref({ pricing_version: '', text: [], image: [], video: [] })
 const oneKeyYinziForm = ref({
   base_url: 'https://api.yinziapi.top/v1',
+  api_key: '',
   text_api_key: '',
   image_api_key: '',
   video_api_key: '',
@@ -1412,8 +1565,10 @@ const oneKeyYinziForm = ref({
 
 const oneKeyYinziReady = computed(() => {
   const form = oneKeyYinziForm.value
-  return [form.base_url, form.text_api_key, form.image_api_key, form.video_api_key, form.text_model, form.image_model, form.video_model]
+  const universalReady = String(form.api_key || '').trim()
+  const separateReady = [form.text_api_key, form.image_api_key, form.video_api_key]
     .every((value) => String(value || '').trim())
+  return Boolean(String(form.base_url || '').trim() && (universalReady || separateReady))
 })
 
 const yinziCatalogMessage = computed(() => {
@@ -2123,6 +2278,188 @@ async function openTest(row) {
   }
 }
 
+function capabilityRowsFromLocalStates(states, row) {
+  const source = Array.isArray(states) ? states : []
+  const rows = source.map((item) => ({
+    model: item.model,
+    name: item.model,
+    groups: [],
+    prices: [],
+    capabilities: item.capability || null,
+    local_capability_override: item.override || null,
+    capability_source: item.source || 'unknown',
+    contract_status: item.contract_status || (item.override ? 'local' : 'missing'),
+    automatic_eligible: item.automatic_eligible === true,
+    availability_scope: 'credential',
+    scope_verified: false,
+    catalog_verified: false,
+  })).filter((item) => String(item.model || '').trim())
+  if (rows.length) return rows
+  const configured = Array.isArray(row?.model)
+    ? row.model
+    : [row?.default_model]
+  return configured.map((model) => String(model || '').trim()).filter(Boolean).map((model) => ({
+    model,
+    name: model,
+    groups: [],
+    prices: [],
+    capabilities: null,
+    local_capability_override: null,
+    capability_source: 'unknown',
+    contract_status: 'missing',
+    automatic_eligible: false,
+    availability_scope: 'credential',
+    scope_verified: false,
+    catalog_verified: false,
+  }))
+}
+
+async function discoverConfigModels(row) {
+  discoveringConfigId.value = row.id
+  modelDiscoveryTarget.value = row
+  modelDiscoveryRows.value = []
+  modelDiscoveryError.value = ''
+  modelCapabilityManualName.value = ''
+  modelDiscoveryVisible.value = true
+  try {
+    const result = await aiAPI.discoverModels({
+      config_id: row.id,
+      service_type: row.service_type,
+    }, { suppressGlobalError: true })
+    modelDiscoveryRows.value = Array.isArray(result?.catalog?.video)
+      ? result.catalog.video
+      : Array.isArray(result?.models) ? result.models : []
+    await loadList()
+    const refreshed = list.value.find((item) => Number(item.id) === Number(row.id))
+    if (refreshed) modelDiscoveryTarget.value = refreshed
+  } catch (error) {
+    let fallbackRows = []
+    try {
+      const local = await aiAPI.getModelCapabilities(row.id)
+      fallbackRows = capabilityRowsFromLocalStates(local?.models, row)
+    } catch (_) {
+      fallbackRows = capabilityRowsFromLocalStates([], row)
+    }
+    modelDiscoveryRows.value = fallbackRows
+    modelDiscoveryError.value = fallbackRows.length
+      ? '上游模型目录暂时不可用，已加载当前配置中的模型。这里的能力提示只辅助自动模式，不会限制手动选模或参考素材；也可以直接输入任意上游模型名。'
+      : '上游模型目录暂时不可用。你仍可直接输入任意上游模型名维护能力提示，手动选模和参考素材不会被本地提示阻止。'
+  } finally {
+    discoveringConfigId.value = null
+  }
+}
+
+function capabilityEditorValue(value, fallback = null) {
+  return value == null ? fallback : value
+}
+
+function openCapabilityEditor(row) {
+  const source = row?.local_capability_override || row?.capabilities || {}
+  let rolesJson = ''
+  if (source.roles && typeof source.roles === 'object') {
+    rolesJson = JSON.stringify(source.roles)
+  }
+  capabilityEditorTarget.value = row
+  capabilityEditorForm.value = {
+    duration_mode: source.duration_mode || '',
+    resolution: source.resolution || '',
+    duration_min: capabilityEditorValue(source.duration_min),
+    duration_max: capabilityEditorValue(source.duration_max),
+    fixed_duration_seconds: capabilityEditorValue(source.fixed_duration_seconds),
+    max_images: capabilityEditorValue(source.max_images),
+    max_videos: capabilityEditorValue(source.max_videos),
+    max_audios: capabilityEditorValue(source.max_audios),
+    max_total_references: capabilityEditorValue(source.max_total_references),
+    max_reference_video_seconds_total: capabilityEditorValue(source.max_reference_video_seconds_total),
+    automatic_eligible: source.automatic_eligible === true,
+    expensive_bypass: source.expensive_bypass === true,
+    route_profiles: Array.isArray(source.route_profiles) ? [...source.route_profiles] : [],
+    roles_json: rolesJson,
+  }
+  capabilityEditorVisible.value = true
+}
+
+function openManualCapabilityEditor() {
+  const model = modelCapabilityManualName.value.trim()
+  if (!model) return
+  const existing = modelDiscoveryRows.value.find((item) => String(item.model || '').toLowerCase() === model.toLowerCase())
+  openCapabilityEditor(existing || { model, contract_status: 'missing', capabilities: null, local_capability_override: null })
+}
+
+function buildCapabilityEditorPayload() {
+  const source = capabilityEditorForm.value || {}
+  const payload = {}
+  for (const field of [
+    'duration_min', 'duration_max', 'fixed_duration_seconds',
+    'max_images', 'max_videos', 'max_audios', 'max_total_references',
+    'max_reference_video_seconds_total',
+  ]) {
+    if (source[field] != null && source[field] !== '') payload[field] = Number(source[field])
+  }
+  for (const field of ['duration_mode', 'resolution']) {
+    if (String(source[field] || '').trim()) payload[field] = String(source[field]).trim()
+  }
+  payload.automatic_eligible = source.automatic_eligible === true
+  payload.expensive_bypass = source.expensive_bypass === true
+  payload.route_profiles = Array.isArray(source.route_profiles) ? source.route_profiles : []
+  if (String(source.roles_json || '').trim()) {
+    let roles
+    try { roles = JSON.parse(source.roles_json) } catch (_) { throw new Error('媒体角色 JSON 格式不正确') }
+    if (!roles || typeof roles !== 'object' || Array.isArray(roles)) throw new Error('媒体角色必须是 JSON 对象')
+    payload.roles = roles
+  }
+  return payload
+}
+
+function applyCapabilityStateToRow(state) {
+  if (!state || !capabilityEditorTarget.value) return
+  const model = String(state.model || '').toLowerCase()
+  let row = modelDiscoveryRows.value.find((item) => String(item.model || '').toLowerCase() === model)
+  if (!row) {
+    row = { model: state.model, name: state.model, groups: [], prices: [] }
+    modelDiscoveryRows.value.push(row)
+  }
+  row.local_capability_override = state.override || null
+  row.capabilities = state.capability || null
+  row.contract_status = state.contract_status || row.contract_status
+  row.capability_source = state.source || row.capability_source
+  row.automatic_eligible = state.automatic_eligible === true
+}
+
+async function saveCapabilityEditor() {
+  const configId = Number(modelDiscoveryTarget.value?.id)
+  const model = String(capabilityEditorTarget.value?.model || '').trim()
+  if (!Number.isSafeInteger(configId) || configId <= 0 || !model) return
+  capabilityEditorSaving.value = true
+  try {
+    const capability = buildCapabilityEditorPayload()
+    const result = await aiAPI.updateModelCapabilities(configId, { model, capability })
+    applyCapabilityStateToRow(result?.models?.find((item) => String(item.model || '').toLowerCase() === model.toLowerCase()))
+    await loadList()
+    capabilityEditorVisible.value = false
+    ElMessage.success(`已保存 ${model} 的本地能力提示；手动选择仍然不受限制`)
+  } catch (error) {
+    ElMessage.error(error?.message || '模型能力提示保存失败')
+  } finally {
+    capabilityEditorSaving.value = false
+  }
+}
+
+async function resetCapability(row) {
+  const configId = Number(modelDiscoveryTarget.value?.id)
+  const model = String(row?.model || '').trim()
+  if (!Number.isSafeInteger(configId) || configId <= 0 || !model) return
+  try {
+    await ElMessageBox.confirm(`恢复“${model}”的默认能力提示？本地修改只会被移除，不会影响视频配置。`, '恢复默认提示', { type: 'warning' })
+    const result = await aiAPI.updateModelCapabilities(configId, { model, reset: true })
+    applyCapabilityStateToRow(result?.models?.find((item) => String(item.model || '').toLowerCase() === model.toLowerCase()))
+    await loadList()
+    ElMessage.success('已恢复默认提示')
+  } catch (error) {
+    if (error !== 'cancel' && error !== 'close') ElMessage.error(error?.message || '恢复默认提示失败')
+  }
+}
+
 async function testCurrentDraft() {
   testingDraft.value = true
   try {
@@ -2200,7 +2537,9 @@ function catalogOptionLabel(item) {
     fixed_duration: '固定时长',
   }
   const unit = unitMap[priced?.billing_unit] || priced?.billing_unit || '计费单位'
-  return `${item.model}  ·  ${Number(value).toFixed(4).replace(/0+$/, '').replace(/\.$/, '')}/${unit}`
+  const currency = String(priced?.currency || '').toUpperCase()
+  const symbol = currency === 'CNY' ? '¥' : currency === 'USD' ? '$' : currency ? `${currency} ` : ''
+  return `${item.model}  ·  ${symbol}${Number(value).toFixed(4).replace(/0+$/, '').replace(/\.$/, '')}/${unit}`
 }
 
 function applyYinziCatalogDefaults() {
@@ -2208,7 +2547,6 @@ function applyYinziCatalogDefaults() {
   const catalog = yinziCatalog.value
   if (!form.text_model) form.text_model = catalog.text.find((item) => item.model === 'gpt-5.6-sol')?.model || catalog.text[0]?.model || 'gpt-5.6-sol'
   if (!form.image_model && catalog.image.length) form.image_model = catalog.image[0].model
-  if (!form.video_model && catalog.video.length) form.video_model = catalog.video[0].model
 }
 
 async function loadYinziCatalog() {
@@ -2236,9 +2574,11 @@ function openOneKeyYinzi() {
 }
 
 function resetOneKeyYinzi() {
+  oneKeyYinziForm.value.api_key = ''
   oneKeyYinziForm.value.text_api_key = ''
   oneKeyYinziForm.value.image_api_key = ''
   oneKeyYinziForm.value.video_api_key = ''
+  oneKeyYinziAdvanced.value = []
 }
 
 async function submitOneKeyYinzi() {
@@ -2246,8 +2586,9 @@ async function submitOneKeyYinzi() {
   oneKeyYinziSaving.value = true
   try {
     const form = oneKeyYinziForm.value
-    await aiAPI.setupYinzi({
+    const result = await aiAPI.setupYinzi({
       base_url: form.base_url.trim(),
+      api_key: form.api_key.trim(),
       text_api_key: form.text_api_key.trim(),
       image_api_key: form.image_api_key.trim(),
       video_api_key: form.video_api_key.trim(),
@@ -2255,7 +2596,10 @@ async function submitOneKeyYinzi() {
       image_model: form.image_model,
       video_model: form.video_model,
     })
-    ElMessage.success('YinziAPI 文本、生图、分镜图和视频配置已设为默认')
+    const selectedVideo = result?.catalog?.selected_video_model
+    ElMessage.success(selectedVideo
+      ? `YinziAPI 已配置，视频将自动路由；当前最低成本首选 ${selectedVideo}`
+      : 'YinziAPI 文本、生图、分镜图和视频配置已设为默认')
     oneKeyYinziVisible.value = false
     await loadList()
   } finally {
@@ -2451,6 +2795,17 @@ onMounted(async () => {
     openOneKeyYinzi()
   } else if (props.initialAction.startsWith('service:')) {
     openAdd(props.initialAction.slice('service:'.length))
+  } else if (props.initialAction.startsWith('capability:')) {
+    const [, rawConfigId, ...encodedModel] = props.initialAction.split(':')
+    const target = list.value.find((item) => Number(item.id) === Number(rawConfigId) && item.service_type === 'video')
+    if (target) {
+      await discoverConfigModels(target)
+      const modelName = encodedModel.join(':')
+      if (modelName) {
+        const row = modelDiscoveryRows.value.find((item) => String(item.model || '').toLowerCase() === modelName.toLowerCase())
+        openCapabilityEditor(row || { model: modelName, contract_status: 'missing', capabilities: null, local_capability_override: null })
+      }
+    }
   }
 })
 </script>
@@ -2463,6 +2818,14 @@ onMounted(async () => {
   color: var(--el-color-primary, #409eff) !important;
   font-style: italic;
 }
+.capability-actions { display: grid; gap: 4px; justify-items: start; }
+.capability-actions > span { display: flex; align-items: center; gap: 2px; }
+.capability-manual-entry { display: flex; align-items: center; gap: 8px; margin: 12px 0; }
+.capability-manual-entry :deep(.el-input) { flex: 1; }
+.capability-editor-form { margin-top: 16px; }
+.capability-editor-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.capability-editor-grid :deep(.el-input-number), .capability-editor-grid :deep(.el-select) { width: 100%; }
+@media (max-width: 720px) { .capability-editor-grid { grid-template-columns: 1fr 1fr; } }
 </style>
 
 <style scoped>
@@ -2592,6 +2955,25 @@ onMounted(async () => {
   margin-top: 10px;
   color: var(--el-text-color-regular, #606266);
   font-size: 12px;
+}
+.model-discovery-summary {
+  display: grid;
+  grid-template-columns: 1fr 1.5fr .7fr;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.model-discovery-summary > span {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+  padding: 10px 12px;
+  border: 1px solid var(--el-border-color-light, #e4e7ed);
+  background: var(--el-fill-color-light, #f5f7fa);
+}
+.model-discovery-summary small { color: var(--el-text-color-secondary, #909399); font-size: 11px; }
+.model-discovery-summary strong { overflow-wrap: anywhere; font-size: 12px; }
+@media (max-width: 680px) {
+  .model-discovery-summary { grid-template-columns: 1fr; }
 }
 
 .type-jimeng2_character_auth {

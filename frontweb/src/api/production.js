@@ -52,6 +52,21 @@ export const productionAPI = {
   recoverStoryboard(id, body = {}) {
     return request.post(`/production-runs/${id}/recover-storyboard`, body)
   },
+  skipShot(id, shotId, body = {}) {
+    return request.post(`/production-runs/${id}/shots/${shotId}/skip`, body)
+  },
+  restoreShot(id, shotId, body = {}) {
+    return request.post(`/production-runs/${id}/shots/${shotId}/restore`, body)
+  },
+  reviseShot(id, shotId, body = {}) {
+    return request.post(`/production-runs/${id}/shots/${shotId}/revise`, body)
+  },
+  splitShot(id, shotId, body = {}) {
+    return request.post(`/production-runs/${id}/shots/${shotId}/split`, body)
+  },
+  pickupShot(id, body = {}) {
+    return request.post(`/production-runs/${id}/shots/pickup`, body)
+  },
   cancel(id, body = {}) {
     return request.post(`/production-runs/${id}/cancel`, body)
   },

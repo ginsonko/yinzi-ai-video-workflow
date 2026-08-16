@@ -1,7 +1,9 @@
 // AI 配置 CRUD，与 Go application/services/ai_service.go 对齐
 const fs = require('fs');
 const path = require('path');
+const crypto = require('node:crypto');
 const { normalizeMaterialHubToken } = require('./jimengMaterialHubService');
+const { getYinziVideoCapability } = require('./yinziVideoCapabilities');
 
 function normalizeApiKeyForService(serviceType, apiKey) {
   if (serviceType === 'jimeng2_character_auth' && apiKey != null) {
@@ -25,6 +27,229 @@ function modelFromDb(val) {
   } catch {
     return [String(val)];
   }
+}
+
+const CAPABILITY_STRING_FIELDS = new Set([
+  'provider_contract', 'family', 'duration_mode', 'resolution', 'quality_tier', 'exclusion_reason',
+]);
+const CAPABILITY_BOOLEAN_FIELDS = new Set([
+  'automatic_eligible', 'expensive_bypass', 'requires_director_preview',
+]);
+const CAPABILITY_NUMBER_FIELDS = new Set([
+  'duration_min', 'duration_max', 'auto_duration_min', 'auto_duration_max', 'fixed_duration_seconds',
+  'duration_step', 'max_images', 'max_videos', 'max_audios', 'max_total_references',
+  'max_reference_video_seconds_total', 'max_prompt_chars', 'provider_prompt_hard_max_chars',
+  'max_image_bytes', 'max_video_bytes', 'max_audio_bytes', 'preference_rank',
+]);
+const CAPABILITY_ARRAY_FIELDS = new Set(['route_profiles']);
+const CAPABILITY_OBJECT_FIELDS = new Set(['roles']);
+const CAPABILITY_FIELDS = new Set([
+  ...CAPABILITY_STRING_FIELDS,
+  ...CAPABILITY_BOOLEAN_FIELDS,
+  ...CAPABILITY_NUMBER_FIELDS,
+  ...CAPABILITY_ARRAY_FIELDS,
+  ...CAPABILITY_OBJECT_FIELDS,
+]);
+const CAPABILITY_ROUTE_PROFILES = new Set(['short_image_guided', 'long_previs_guided']);
+const CAPABILITY_MEDIA_TYPES = new Set(['image', 'video', 'audio']);
+
+function parseSettings(value) {
+  if (!value) return {};
+  if (typeof value === 'object' && !Array.isArray(value)) return { ...value };
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function normalizeModelCapabilityOverride(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    const error = new Error('模型能力提示必须是对象');
+    error.code = 'MODEL_CAPABILITY_INVALID';
+    throw error;
+  }
+  const unknown = Object.keys(input).filter((key) => !CAPABILITY_FIELDS.has(key));
+  if (unknown.length) {
+    const error = new Error(`模型能力提示包含未知字段：${unknown.join(', ')}`);
+    error.code = 'MODEL_CAPABILITY_UNKNOWN_FIELD';
+    throw error;
+  }
+  const output = {};
+  for (const [key, value] of Object.entries(input)) {
+    if (CAPABILITY_STRING_FIELDS.has(key)) {
+      const text = String(value ?? '').trim();
+      if (text) output[key] = text.slice(0, 200);
+      continue;
+    }
+    if (CAPABILITY_BOOLEAN_FIELDS.has(key)) {
+      if (typeof value !== 'boolean') {
+        const error = new Error(`模型能力提示字段 ${key} 必须是布尔值`);
+        error.code = 'MODEL_CAPABILITY_INVALID';
+        throw error;
+      }
+      output[key] = value;
+      continue;
+    }
+    if (CAPABILITY_NUMBER_FIELDS.has(key)) {
+      if (value === '' || value == null) continue;
+      const number = Number(value);
+      if (!Number.isFinite(number) || number < 0 || number > 1_000_000_000) {
+        const error = new Error(`模型能力提示字段 ${key} 必须是非负数字`);
+        error.code = 'MODEL_CAPABILITY_INVALID';
+        throw error;
+      }
+      output[key] = number;
+      continue;
+    }
+    if (CAPABILITY_ARRAY_FIELDS.has(key)) {
+      if (!Array.isArray(value)) {
+        const error = new Error(`模型能力提示字段 ${key} 必须是数组`);
+        error.code = 'MODEL_CAPABILITY_INVALID';
+        throw error;
+      }
+      output[key] = [...new Set(value.map((item) => String(item || '').trim()).filter(Boolean))]
+        .filter((item) => CAPABILITY_ROUTE_PROFILES.has(item));
+      continue;
+    }
+    if (CAPABILITY_OBJECT_FIELDS.has(key)) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        const error = new Error(`模型能力提示字段 ${key} 必须是对象`);
+        error.code = 'MODEL_CAPABILITY_INVALID';
+        throw error;
+      }
+      const roles = {};
+      for (const [mediaType, rolesValue] of Object.entries(value)) {
+        if (!CAPABILITY_MEDIA_TYPES.has(mediaType) || !Array.isArray(rolesValue)) continue;
+        roles[mediaType] = [...new Set(rolesValue.map((role) => String(role || '').trim()).filter(Boolean))]
+          .slice(0, 12);
+      }
+      output[key] = roles;
+    }
+  }
+  if (!Object.keys(output).length) {
+    const error = new Error('至少填写一项模型能力提示');
+    error.code = 'MODEL_CAPABILITY_EMPTY';
+    throw error;
+  }
+  return output;
+}
+
+function normalizeCapabilityOverrideMap(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const result = {};
+  for (const [model, override] of Object.entries(value)) {
+    const name = String(model || '').trim();
+    if (!name || !override || typeof override !== 'object' || Array.isArray(override)) continue;
+    try { result[name] = normalizeModelCapabilityOverride(override); } catch (_) {}
+  }
+  return result;
+}
+
+function getModelCapabilityOverrides(config) {
+  const settings = parseSettings(config?.settings);
+  return normalizeCapabilityOverrideMap(settings.model_capability_overrides);
+}
+
+function findModelCapabilityOverride(overrides, model) {
+  const target = String(model || '').trim().toLowerCase();
+  if (!target) return null;
+  const key = Object.keys(overrides || {}).find((item) => item.toLowerCase() === target);
+  return key ? overrides[key] : null;
+}
+
+function mergeModelCapability(base, override) {
+  if (!override) return base || null;
+  const fallback = {
+    provider_contract: 'local-advisory',
+    family: 'local-model',
+    duration_mode: 'range',
+    duration_min: 1,
+    duration_max: 15,
+    auto_duration_min: 1,
+    auto_duration_max: 15,
+    max_images: 0,
+    max_videos: 0,
+    max_audios: 0,
+    max_total_references: 0,
+    max_reference_video_seconds_total: 0,
+    automatic_eligible: false,
+    expensive_bypass: false,
+    requires_director_preview: false,
+    route_profiles: ['short_image_guided', 'long_previs_guided'],
+    roles: { image: ['reference'], video: [], audio: [] },
+  };
+  const merged = { ...(base || fallback), ...override };
+  if (base?.roles || override.roles) merged.roles = { ...(base?.roles || fallback.roles), ...(override.roles || {}) };
+  if (override.route_profiles) merged.route_profiles = [...override.route_profiles];
+  return merged;
+}
+
+function modelCapabilityStates(config) {
+  const overrides = getModelCapabilityOverrides(config);
+  const snapshotModels = parseSettings(config?.settings)?.model_catalog_snapshot?.models;
+  const names = new Set([
+    ...(Array.isArray(config?.model) ? config.model : []),
+    ...(Array.isArray(snapshotModels) ? snapshotModels.map((item) => item?.model || item) : []),
+    ...Object.keys(overrides),
+  ].map((item) => String(item || '').trim()).filter(Boolean));
+  return [...names].map((model) => {
+    const builtin = getYinziVideoCapability(model);
+    const override = findModelCapabilityOverride(overrides, model);
+    const effective = mergeModelCapability(builtin, override);
+    return {
+      model,
+      source: builtin && override ? 'builtin+local' : override ? 'local' : builtin ? 'builtin' : 'unknown',
+      contract_status: builtin ? 'known' : override ? 'local' : 'missing',
+      override: override || null,
+      capability: effective,
+      automatic_eligible: effective?.automatic_eligible === true,
+    };
+  });
+}
+
+function updateModelCapabilityOverride(db, log, id, model, capability) {
+  const config = getConfig(db, id);
+  if (!config) return null;
+  const name = String(model || '').trim();
+  if (!name) {
+    const error = new Error('模型名不能为空');
+    error.code = 'MODEL_CAPABILITY_MODEL_REQUIRED';
+    throw error;
+  }
+  const normalized = normalizeModelCapabilityOverride(capability);
+  const settings = parseSettings(config.settings);
+  const overrides = normalizeCapabilityOverrideMap(settings.model_capability_overrides);
+  const existingKey = Object.keys(overrides).find((item) => item.toLowerCase() === name.toLowerCase()) || name;
+  overrides[existingKey] = normalized;
+  settings.model_capability_overrides = overrides;
+  const now = new Date().toISOString();
+  db.prepare('UPDATE ai_service_configs SET settings = ?, updated_at = ? WHERE id = ?')
+    .run(JSON.stringify(settings), now, id);
+  log.info('AI model capability override updated', { config_id: id, model: existingKey });
+  return getConfig(db, id);
+}
+
+function resetModelCapabilityOverride(db, log, id, model) {
+  const config = getConfig(db, id);
+  if (!config) return null;
+  const name = String(model || '').trim();
+  if (!name) {
+    const error = new Error('模型名不能为空');
+    error.code = 'MODEL_CAPABILITY_MODEL_REQUIRED';
+    throw error;
+  }
+  const settings = parseSettings(config.settings);
+  const overrides = normalizeCapabilityOverrideMap(settings.model_capability_overrides);
+  const key = Object.keys(overrides).find((item) => item.toLowerCase() === name.toLowerCase());
+  if (key) delete overrides[key];
+  if (Object.keys(overrides).length) settings.model_capability_overrides = overrides;
+  else delete settings.model_capability_overrides;
+  db.prepare('UPDATE ai_service_configs SET settings = ?, updated_at = ? WHERE id = ?')
+    .run(JSON.stringify(settings), new Date().toISOString(), id);
+  log.info('AI model capability override reset', { config_id: id, model: name });
+  return getConfig(db, id);
 }
 
 /** 每种服务类型只保留一个默认：若有多个 is_default=1，只保留优先级最高（同优先级取 id 最小）的那条 */
@@ -238,6 +463,15 @@ function rowToConfig(r) {
       const s = JSON.parse(r.settings);
       if (s.voice_id) cfg.voice_id = s.voice_id;
       if (s.group_id) cfg.group_id = s.group_id;
+    } catch (_) {}
+  }
+  if (r.settings) {
+    try {
+      const settings = JSON.parse(r.settings);
+      if (settings?.model_catalog_snapshot) cfg.model_catalog_snapshot = settings.model_catalog_snapshot;
+      if (settings?.model_capability_overrides) {
+        cfg.model_capability_overrides = normalizeCapabilityOverrideMap(settings.model_capability_overrides);
+      }
     } catch (_) {}
   }
   return cfg;
@@ -578,6 +812,163 @@ async function testConnection(opts) {
   return { probe: 'minimal_text_response', authenticated: true, generated_media: false };
 }
 
+function normalizeCatalogPath(value) {
+  const catalogPath = String(value || '/models').trim() || '/models';
+  if (!catalogPath.startsWith('/') || catalogPath.startsWith('//') || catalogPath.includes('..')
+    || !/^\/[A-Za-z0-9_./?=&{}-]+$/.test(catalogPath)) {
+    const error = new Error('模型目录路径必须是同一 Base URL 下的安全相对路径');
+    error.code = 'MODEL_DISCOVERY_PATH_INVALID';
+    throw error;
+  }
+  return catalogPath;
+}
+
+function extractCatalogEntries(payload) {
+  const candidates = Array.isArray(payload)
+    ? payload
+    : Array.isArray(payload?.data)
+      ? payload.data
+      : Array.isArray(payload?.models)
+        ? payload.models
+        : Array.isArray(payload?.items)
+          ? payload.items
+          : Array.isArray(payload?.data?.models) ? payload.data.models : [];
+  const seen = new Set();
+  return candidates.map((item) => {
+    const model = typeof item === 'string'
+      ? item.trim()
+      : String(item?.id || item?.model || item?.model_name || item?.name || '').trim();
+    if (!model || seen.has(model)) return null;
+    seen.add(model);
+    const endpointTypes = typeof item === 'object' && item
+      ? item.endpoint_types || item.supported_endpoint_types || item.endpoints || []
+      : [];
+    return {
+      model,
+      name: typeof item === 'object' && item ? String(item.name || model) : model,
+      owned_by: typeof item === 'object' && item ? item.owned_by || item.owner || null : null,
+      endpoint_types: Array.isArray(endpointTypes) ? endpointTypes : [String(endpointTypes || '')].filter(Boolean),
+      raw_metadata: typeof item === 'object' && item ? {
+        created: item.created ?? null,
+        owned_by: item.owned_by || item.owner || null,
+      } : {},
+    };
+  }).filter(Boolean);
+}
+
+function persistModelCatalogSnapshot(db, configId, snapshot) {
+  if (!db || !Number.isSafeInteger(Number(configId)) || Number(configId) <= 0) return;
+  const row = db.prepare('SELECT settings FROM ai_service_configs WHERE id = ? AND deleted_at IS NULL').get(Number(configId));
+  if (!row) return;
+  let settings = {};
+  try { settings = row.settings ? JSON.parse(row.settings) : {}; } catch (_) { settings = {}; }
+  settings.model_catalog_snapshot = snapshot;
+  db.prepare('UPDATE ai_service_configs SET settings = ?, updated_at = ? WHERE id = ?')
+    .run(JSON.stringify(settings), new Date().toISOString(), Number(configId));
+}
+
+async function discoverModels(opts = {}, options = {}) {
+  const base = String(opts.base_url || '').trim().replace(/\/$/, '');
+  const apiKey = String(opts.api_key || '').trim();
+  if (!base) throw Object.assign(new Error('Base URL 必填'), { code: 'BASE_URL_REQUIRED' });
+  if (!apiKey) throw Object.assign(new Error('API Key 必填'), { code: 'API_KEY_REQUIRED' });
+  const catalogPath = normalizeCatalogPath(options.catalog_path || opts.catalog_path || opts.settings?.model_catalog_path);
+  const url = `${base}${catalogPath}`;
+  const fetchImpl = options.fetchImpl || fetch;
+  let response;
+  try {
+    response = await fetchImpl(url, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' },
+    });
+  } catch (error) {
+    const wrapped = new Error(`模型目录请求失败：${error.message}`);
+    wrapped.code = 'MODEL_DISCOVERY_NETWORK_ERROR';
+    throw wrapped;
+  }
+  if (response.status === 401 || response.status === 403) {
+    const error = new Error(`模型目录鉴权失败 (${response.status})`);
+    error.code = 'MODEL_DISCOVERY_AUTH_FAILED';
+    throw error;
+  }
+  if (response.status === 404 || response.status === 405) {
+    const error = new Error(`模型目录端点不存在：${catalogPath}`);
+    error.code = 'MODEL_DISCOVERY_ENDPOINT_NOT_FOUND';
+    throw error;
+  }
+  if (!response.ok) {
+    const error = new Error(`模型目录返回 HTTP ${response.status}`);
+    error.code = 'MODEL_DISCOVERY_HTTP_ERROR';
+    throw error;
+  }
+  const payload = await response.json().catch(() => ({}));
+  const models = extractCatalogEntries(payload);
+  const fetchedAt = new Date().toISOString();
+  const snapshot = {
+    version: 1,
+    config_id: Number.isSafeInteger(Number(opts.id)) ? Number(opts.id) : null,
+    source_url: url,
+    availability_scope: 'credential',
+    scope_verified: String(opts.provider || '').toLowerCase() === 'yinzi',
+    fetched_at: fetchedAt,
+    models: models.map(({ model, name, endpoint_types, owned_by }) => ({ model, name, endpoint_types, owned_by })),
+  };
+  snapshot.content_hash = crypto.createHash('sha256').update(JSON.stringify(snapshot)).digest('hex');
+  persistModelCatalogSnapshot(options.db, opts.id, snapshot);
+  return { models, snapshot, source_url: url, availability_scope: snapshot.availability_scope };
+}
+
+function mergeDiscoveredCatalog(discovery, pricingCatalog, options = {}) {
+  const discovered = Array.isArray(discovery?.models) ? discovery.models : [];
+  const priced = Array.isArray(pricingCatalog?.video) ? pricingCatalog.video : [];
+  const group = String(options.group || '').trim();
+  const serviceType = String(options.service_type || 'video').trim() || 'video';
+  const provider = String(options.provider || '').trim().toLowerCase();
+  const capabilityOverrides = normalizeCapabilityOverrideMap(options.capability_overrides);
+  const catalog = discovered.map((entry) => {
+    const model = entry.model;
+    const publicItem = priced.find((item) => String(item.model || '').toLowerCase() === model.toLowerCase()) || null;
+    // A key-scoped capability catalog is authoritative even when one model's
+    // contract is missing. Only the explicit legacy fallback may use the
+    // bundled compatibility profiles; never invent capabilities for a model
+    // that the live catalog returned as unknown.
+    const capabilityCatalogVerified = pricingCatalog?.catalog_verified === true;
+    const builtinCapability = publicItem?.capabilities
+      || (!capabilityCatalogVerified && serviceType === 'video' ? getYinziVideoCapability(model) : null);
+    const localOverride = findModelCapabilityOverride(capabilityOverrides, model);
+    const capability = mergeModelCapability(builtinCapability, localOverride);
+    const groups = group ? [group] : (publicItem?.groups || []);
+    return {
+      ...(publicItem || {}),
+      model,
+      name: entry.name || publicItem?.name || model,
+      endpoint_types: entry.endpoint_types?.length ? entry.endpoint_types : (publicItem?.endpoint_types || [serviceType === 'video' ? 'openai-video' : serviceType]),
+      groups,
+      prices: publicItem?.prices || [],
+      capabilities: capability || null,
+      capability_source: publicItem?.capability_source || (builtinCapability && localOverride ? 'builtin+local'
+        : localOverride ? 'local' : builtinCapability ? 'builtin' : 'unknown'),
+      contract_status: publicItem?.contract_status || (builtinCapability ? 'known' : localOverride ? 'local' : 'missing'),
+      local_capability_override: localOverride || null,
+      automatic_eligible: capability?.automatic_eligible === true,
+      availability_scope: discovery?.availability_scope || 'credential',
+      scope_verified: discovery?.snapshot?.scope_verified === true,
+      catalog_source: discovery?.source_url || null,
+      provider,
+      catalog_verified: capabilityCatalogVerified,
+    };
+  });
+  return {
+    version: pricingCatalog?.version || 1,
+    pricing_version: pricingCatalog?.pricing_version || '',
+    fetched_at: discovery?.snapshot?.fetched_at || pricingCatalog?.fetched_at || null,
+    source: discovery?.source_url || pricingCatalog?.source || null,
+    availability_scope: discovery?.availability_scope || 'credential',
+    scope_verified: discovery?.snapshot?.scope_verified === true,
+    video: catalog,
+  };
+}
+
 /**
  * 返回 vendor_lock 状态
  */
@@ -689,10 +1080,18 @@ module.exports = {
   updateConfig,
   deleteConfig,
   testConnection,
+  discoverModels,
+  mergeDiscoveredCatalog,
   resolveConnectionTestConfig,
   redactConnectionTestError,
   getVendorLockStatus,
   applyVendorLock,
   bulkUpdateApiKey,
+  getModelCapabilityOverrides,
+  modelCapabilityStates,
+  normalizeModelCapabilityOverride,
+  mergeModelCapability,
+  updateModelCapabilityOverride,
+  resetModelCapabilityOverride,
   toPublicConfig,
 };

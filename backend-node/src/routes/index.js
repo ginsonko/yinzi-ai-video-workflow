@@ -73,6 +73,11 @@ function setupRouter(cfg, db, log, injected = {}) {
   r.post('/production-runs/:id/resume', production.resume);
   r.post('/production-runs/:id/retry', production.retry);
   r.post('/production-runs/:id/recover-storyboard', production.recoverStoryboard);
+  r.post('/production-runs/:id/shots/:shotId/skip', production.skipShot);
+  r.post('/production-runs/:id/shots/:shotId/restore', production.restoreShot);
+  r.post('/production-runs/:id/shots/:shotId/revise', production.reviseShot);
+  r.post('/production-runs/:id/shots/:shotId/split', production.splitShot);
+  r.post('/production-runs/:id/shots/pickup', production.pickupShot);
   r.post('/production-runs/:id/cancel', production.cancel);
   r.post('/production-runs/:id/transition', production.transition);
   r.post('/production-runs/:id/return', production.returnToStage);
@@ -136,12 +141,15 @@ function setupRouter(cfg, db, log, injected = {}) {
   r.get('/ai-configs', aiConfig.list);
   r.post('/ai-configs', aiConfig.create);
   r.post('/ai-configs/test', aiConfig.testConnection);
+  r.post('/ai-configs/discover-models', aiConfig.discoverModels);
   r.get('/ai-configs/yinzi/catalog', aiConfig.yinziCatalog);
   r.post('/ai-configs/yinzi/setup', aiConfig.setupYinzi);
   r.post('/ai-configs/jimeng2-list-assets', aiConfig.listJimeng2MaterialAssets);
   r.post('/ai-configs/model-ark-asset', aiConfig.modelArkAsset);
   r.get('/ai-configs/vendor-lock', aiConfig.vendorLock);  // 必须在 /:id 之前
   r.put('/ai-configs/bulk-update-key', aiConfig.bulkUpdateKey);  // 必须在 /:id 之前
+  r.get('/ai-configs/:id/model-capabilities', aiConfig.modelCapabilities);
+  r.put('/ai-configs/:id/model-capabilities', aiConfig.updateModelCapabilities);
   r.get('/ai-configs/:id', aiConfig.get);
   r.put('/ai-configs/:id', aiConfig.update);
   r.delete('/ai-configs/:id', aiConfig.delete);
@@ -299,6 +307,7 @@ function setupRouter(cfg, db, log, injected = {}) {
   r.post('/videos/image/:image_gen_id', videos.fromImage);
   r.post('/videos/episode/:episode_id/batch', videos.episodeBatch);
   r.get('/videos/:id', videos.get);
+  r.post('/videos/:id/retry-download', videos.retryDownload);
   r.delete('/videos/:id', videos.delete);
 
   // ---------- video-merges ----------

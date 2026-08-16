@@ -6,6 +6,7 @@ const repo = require('../src/services/productionRepository');
 const { createProductionService } = require('../src/services/productionService');
 const { createProductionMediaService } = require('../src/services/productionMediaService');
 const automationPreferences = require('../src/services/productionAutomationPreferences');
+const aiConfigService = require('../src/services/aiConfigService');
 
 let db;
 const log = { info() {}, warn() {}, error() {} };
@@ -49,6 +50,55 @@ beforeEach(() => {
 afterEach(() => db.close());
 
 describe('production executor text stages', () => {
+  it('preflights the run-selected video URL and Key instead of the global default', () => {
+    const defaultConfig = aiConfigService.createConfig(db, log, {
+      service_type: 'video', provider: 'yinzi', name: 'Old default video',
+      base_url: 'https://old.example/v1', api_key: 'old-key', model: ['old-video'],
+      default_model: 'old-video', is_default: true,
+    });
+    const selectedConfig = aiConfigService.createConfig(db, log, {
+      service_type: 'video', provider: 'yinzi', name: 'Selected video',
+      base_url: 'https://selected.example/v1', api_key: 'selected-key', model: ['selected-video'],
+      default_model: 'selected-video', is_default: false,
+    });
+    let run = createRun('human');
+    run = repo.updateRun(db, run.id, {
+      policy: { ...run.policy, video_config_id: selectedConfig.id, video_model: '', video_routing_mode: 'auto' },
+    });
+    const service = createProductionService(db, {}, log, {});
+    const preflight = service.preflight(run.id, { browser: { webgl: true, media_recorder: true } });
+    const videoCheck = preflight.checks.find((item) => item.key === 'video_model');
+    assert.equal(defaultConfig.is_default, true);
+    assert.equal(videoCheck.ok, true);
+    assert.match(String(videoCheck.detail), /selected-video/);
+    assert.doesNotMatch(String(videoCheck.detail), /old-video/);
+  });
+
+  it('keeps an unregistered fixed video model advisory instead of blocking preflight', () => {
+    const config = aiConfigService.createConfig(db, log, {
+      service_type: 'video', provider: 'yinzi', name: 'Opaque upstream video',
+      base_url: 'https://selected.example/v1', api_key: 'selected-key', model: ['seedance-2.5-720p-nv'],
+      default_model: 'seedance-2.5-720p-nv', is_default: true,
+    });
+    let run = createRun('human');
+    run = repo.updateRun(db, run.id, {
+      policy: {
+        ...run.policy,
+        video_config_id: config.id,
+        video_routing_mode: 'fixed',
+        video_model: 'seedance-2.5-720p-nv',
+      },
+    });
+    const service = createProductionService(db, {}, log, {});
+    const preflight = service.preflight(run.id, { browser: { webgl: true, media_recorder: true } });
+    const contractCheck = preflight.checks.find((item) => item.key === 'provider_contract');
+    assert.equal(contractCheck.ok, true);
+    assert.equal(contractCheck.blocking, false);
+    assert.equal(contractCheck.advisory, true);
+    assert.match(contractCheck.detail, /仍可提交/);
+    assert.equal(preflight.issues.some((item) => item.key === 'provider_contract'), false);
+  });
+
   it('defers strict first-frame capability selection to automatic routing', async () => {
     let run = createRun('human');
     run = repo.updateRun(db, run.id, {
@@ -259,6 +309,56 @@ describe('production executor text stages', () => {
     assert.equal(saved.runtime.autonomy.intervention, undefined);
     assert.equal(saved.runtime.autonomy.objects[key], undefined);
     assert.equal(db.prepare("SELECT COUNT(*) AS n FROM production_events WHERE run_id = ? AND event_type = 'automation.legacy_convergence_intervention_cleared'").get(run.id).n, 1);
+  });
+
+  it('keeps a pending stage handler in scheduler wait without accumulating automatic failures', async () => {
+    let run = createRun('auto_accept');
+    const objectKey = 'reference_bundle:shot:1';
+    run = repo.updateRun(db, run.id, {
+      current_stage: 'reference_bundle',
+      current_scope_type: 'shot',
+      current_scope_id: '1',
+      status: 'running',
+      waiting_reason: null,
+      error_code: 'STAGE_HANDLER_PENDING',
+      error_message: 'stage_handler_pending',
+      runtime: {
+        ...(run.runtime || {}),
+        autonomy: {
+          objects: {
+            [objectKey]: {
+              stage: 'reference_bundle', scope_type: 'shot', scope_id: '1',
+              consecutive_generation_failures: 2,
+              last_failure: { error_code: 'STAGE_HANDLER_PENDING', reason: 'stage_handler_pending' },
+            },
+          },
+        },
+      },
+    });
+    const service = createProductionService(db, {}, log, {});
+
+    const first = await service.advance(run.id, { lease_owner: 'pending-stage-test' });
+    assert.equal(first.state, 'waiting_task', JSON.stringify({
+      state: first.state,
+      reason: first.reason,
+      intervention: first.intervention || null,
+      run_status: first.run?.status || null,
+      waiting_reason: first.run?.waiting_reason || null,
+    }));
+    assert.equal(first.reason, 'stage_handler_pending');
+    let saved = repo.getRun(db, run.id);
+    assert.equal(saved.status, 'running');
+    assert.equal(saved.waiting_reason, null);
+    assert.equal(saved.error_code, null);
+    assert.equal(saved.error_message, null);
+    assert.equal(saved.runtime.autonomy.objects[objectKey], undefined);
+    assert.equal(db.prepare("SELECT COUNT(*) AS n FROM production_events WHERE run_id = ? AND event_type = 'automation.wait_state_cleared'").get(run.id).n, 1);
+
+    const second = await service.advance(run.id, { lease_owner: 'pending-stage-test' });
+    assert.equal(second.state, 'waiting_task');
+    saved = repo.getRun(db, run.id);
+    assert.equal(saved.runtime.autonomy.objects[objectKey], undefined);
+    assert.equal(db.prepare("SELECT COUNT(*) AS n FROM production_events WHERE run_id = ? AND event_type = 'automation.wait_state_cleared'").get(run.id).n, 1);
   });
 
   it('rewrites an AI-rejected text artifact once and reviews the new revision', async () => {
@@ -623,6 +723,69 @@ describe('production executor text stages', () => {
     assert.equal(reconciled.action.status, 'cancelled');
     assert.equal(reconciled.summary.run.runtime.autonomy.intervention, undefined);
     assert.equal(reconciled.summary.run.runtime.autonomy.objects['shot_video:shot:1'], undefined);
+  });
+
+  it('recovers a stale local video-config binding failure without model switching or AI diagnosis', async () => {
+    const config = aiConfigService.createConfig(db, log, {
+      service_type: 'video', provider: 'yinzi', name: 'Bound video config',
+      base_url: 'https://api.yinziapi.top/v1', api_key: 'test-video-key',
+      model: ['old-catalog-model'], default_model: 'old-catalog-model', is_default: true,
+    });
+    let run = createRun('auto_accept');
+    run = repo.updateRun(db, run.id, {
+      policy: {
+        ...run.policy,
+        video_routing_mode: 'fixed',
+        video_model: 'seedance2.0 720p-pro-nv-nsp',
+      },
+      current_stage: 'shot_video', current_scope_type: 'shot', current_scope_id: '1',
+      status: 'failed', waiting_reason: 'resource_unavailable',
+      error_code: 'VIDEO_GENERATION_FAILED', error_message: '未配置视频模型',
+    });
+    const now = new Date().toISOString();
+    const generation = db.prepare(
+      `INSERT INTO video_generations (
+        drama_id, provider, model, status, generation_status, download_status,
+        video_config_id, provider_config_snapshot_json, created_at, updated_at
+      ) VALUES (1, 'yinzi', ?, 'failed', 'failed', 'pending', ?, ?, ?, ?)`
+    ).run(
+      'seedance2.0 720p-pro-nv-nsp',
+      config.id,
+      JSON.stringify({ config_id: config.id, provider: 'yinzi', model: 'seedance2.0 720p-pro-nv-nsp' }),
+      now,
+      now,
+    );
+    const failed = repo.reserveAction(db, {
+      run_id: run.id, action_key: 'stale-video-config-binding', stage: 'shot_video',
+      scope_type: 'shot', scope_id: '1', kind: 'video_generate', attempt: 1,
+      request: {
+        model: 'seedance2.0 720p-pro-nv-nsp',
+        video_config_id: null,
+      },
+    }).action;
+    repo.updateAction(db, failed.id, {
+      status: 'failed', generation_id: Number(generation.lastInsertRowid),
+      error_code: 'VIDEO_GENERATION_FAILED', error_message: '未配置视频模型',
+    });
+    let diagnosisCalls = 0;
+    const service = createProductionService(db, {}, log, {
+      generateText: async () => { diagnosisCalls += 1; throw new Error('diagnosis must not run'); },
+    });
+
+    const recovered = await service.advance(run.id, { lease_owner: 'binding-recovery' });
+    assert.equal(recovered.state, 'progressed');
+    assert.equal(recovered.reason, 'video_config_binding_recovered');
+    assert.equal(recovered.paid_submission, false);
+    assert.equal(diagnosisCalls, 0);
+    const action = repo.getAction(db, failed.id);
+    assert.equal(action.status, 'cancelled');
+    assert.equal(action.result.retry_authorized, true);
+    assert.equal(action.result.stale_config_binding_recovered, true);
+    const saved = repo.getRun(db, run.id);
+    assert.equal(saved.status, 'running');
+    assert.equal(saved.error_code, null);
+    assert.equal(saved.policy.video_config_id, config.id);
+    assert.equal(saved.policy.video_model, 'seedance2.0 720p-pro-nv-nsp');
   });
 
   it('switches to a compatible ordinary video model after a definite provider failure', async () => {
@@ -1543,7 +1706,7 @@ describe('production executor text stages', () => {
     assert.deepEqual(repo.listActions(db, run.id, { page_size: 200 }).items.map((item) => item.id), beforeActions);
   });
 
-  it('still returns replacement options when the configured model has disappeared from the live catalog', async () => {
+  it('keeps a disappeared configured model usable while returning replacement options', async () => {
     let run = createRun('human');
     run = repo.updateRun(db, run.id, {
       policy: {
@@ -1590,9 +1753,11 @@ describe('production executor text stages', () => {
     });
 
     const routing = await service.getVideoRouting(run.id, { shot_id: '5' });
-    assert.equal(routing.effective_route, null);
-    assert.equal(routing.effective_route_error.code, 'VIDEO_ROUTE_MODEL_UNAVAILABLE');
-    assert.match(routing.effective_route_error.message, /removed-upstream-model/);
+    assert.equal(routing.effective_route.model, 'removed-upstream-model');
+    assert.equal(routing.effective_route.catalog_verified, false);
+    assert.equal(routing.effective_route.contract_status, 'missing');
+    assert.ok(routing.effective_route.contract_warnings.includes('model_not_in_catalog'));
+    assert.equal(routing.effective_route_error, null);
     assert.equal(routing.catalog.options.some((item) => item.model === 'cc-seedance2.0 480p-nsp' && item.selectable), true);
     assert.equal(routing.run_version, run.version);
   });
@@ -1808,7 +1973,9 @@ describe('production executor text stages', () => {
       title: 'Manual image-only reference bundle',
       content: { included: true },
     });
-    assert.deepEqual(manualBundle.content.limits, { images: 9, videos: 0, audios: 3 });
+    assert.equal(manualBundle.content.limits, null);
+    assert.equal(manualBundle.content.soft_limits, true);
+    assert.equal(manualBundle.content.media_constraints.contract_status, 'unknown');
     assert.equal(manualBundle.content.uses_reference_video, false);
   });
 

@@ -18,6 +18,7 @@ const BUDGET_CODES = new Set([
 const RESOURCE_CODES = new Set([
   'VIDEO_ROUTE_NO_ELIGIBLE_MODEL', 'VIDEO_ROUTE_CATALOG_UNAVAILABLE',
   'VIDEO_ROUTE_MODEL_UNAVAILABLE', 'VIDEO_ROUTE_GROUP_UNAVAILABLE',
+  'VIDEO_CONFIG_UNAVAILABLE', 'VIDEO_CONFIG_INCOMPLETE',
   'STRICT_FIRST_FRAME_UNSUPPORTED', 'PRODUCTION_MEDIA_MISSING',
 ]);
 
@@ -25,6 +26,19 @@ const WORKFLOW_CONVERGENCE_CODES = new Set([
   'SOURCE_CHANGED_WHILE_ACTION_ACTIVE',
   'STALE_SOURCE_ARTIFACT',
   'STALE_REFERENCE_BUNDLE',
+]);
+
+const WORKFLOW_WAIT_CODES = new Set([
+  'STAGE_HANDLER_PENDING',
+  'VIDEO_PROMPT_PLAN_IN_PROGRESS',
+  'IMAGE_GENERATION',
+  'VIDEO_GENERATION',
+  'SUPERSEDED_VIDEO_WAITING',
+  'FINAL_MERGE',
+  'PROVIDER_TASK_PENDING',
+  'VIDEO_DOWNLOAD_PENDING',
+  'VIDEO_DOWNLOAD_RETRY',
+  'STATUS_CONVERGENCE_PENDING',
 ]);
 
 function clean(value, max = 800) {
@@ -57,13 +71,20 @@ function classifyFailure(input = {}) {
   if (WORKFLOW_CONVERGENCE_CODES.has(code) || /source_changed_while_action_active/i.test(message)) {
     return { category: 'workflow_convergence', recoverable: true, counts_as_failure: false, code, message };
   }
+  if (WORKFLOW_WAIT_CODES.has(code)) {
+    return { category: 'workflow_wait', recoverable: true, counts_as_failure: false, code, message };
+  }
   if (AMBIGUOUS_CODES.has(code) || /ambiguous|结果不明确|状态不明确/i.test(message)) {
     return { category: 'ambiguous_external_task', recoverable: false, stop_reason: 'ambiguous_external_task', code, message };
   }
   if (BUDGET_CODES.has(code) || /超过预算|额度不足|budget/i.test(message)) {
     return { category: 'budget_exhausted', recoverable: false, stop_reason: 'budget_exhausted', code, message };
   }
-  if (RESOURCE_CODES.has(code) || /没有可用|未配置|缺少.*配置|找不到.*模型|not configured/i.test(message)) {
+  if (/未配置视频模型|video model (?:is )?not configured/i.test(message)
+    && /VIDEO_(?:GENERATION|CREATE)_FAILED/.test(code)) {
+    return { category: 'configuration_binding_failure', recoverable: true, allow_model_switch: false, code, message };
+  }
+  if (RESOURCE_CODES.has(code) || /没有可用|找不到.*模型|no enabled video configuration/i.test(message)) {
     return { category: 'resource_unavailable', recoverable: false, stop_reason: 'resource_unavailable', code, message };
   }
   const videoFailure = stage === 'shot_video' || /^VIDEO_/.test(code);

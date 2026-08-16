@@ -36,7 +36,10 @@
           <small>目录时间</small>
           <strong>{{ formatCatalogTime(routing.catalog?.fetched_at) }}</strong>
         </div>
-        <el-button :icon="Refresh" :loading="loading" @click="$emit('refresh')">刷新目录</el-button>
+        <div class="route-tools">
+          <el-button plain :icon="Refresh" :loading="loading" @click="$emit('refresh')">同步当前 Key</el-button>
+          <el-button plain @click="$emit('manage-capabilities', model || selectedOption?.model || '')">管理能力提示</el-button>
+        </div>
       </section>
 
       <el-alert
@@ -75,7 +78,7 @@
         <p v-if="directorDisabled">项目已关闭 3D 导演台，本镜头不会生成导演台 JSON、预演视频或参考视频。</p>
         <p v-else-if="previsMode === 'skip'">跳过后直接生成图片引导参考包；参考视频上限为 0，旧导演台文件只保留在历史记录。</p>
         <p v-else-if="previsMode === 'force'">会进入本地导演台审核；只有当前视频模型支持参考视频时，审核通过的预演才会随请求携带。</p>
-        <p v-else>长镜头按连续动作自动判断是否需要导演台；遇到门控时可在这里改为跳过。</p>
+        <p v-else>长镜头按连续动作自动判断是否需要导演台；不需要时可在这里直接跳过。</p>
       </section>
 
       <template v-if="mode === 'fixed'">
@@ -84,12 +87,15 @@
           <span>{{ visibleOptions.length }} / {{ options.length }} 个模型</span>
         </div>
         <div class="model-option-list" role="listbox" aria-label="视频模型">
+          <div class="manual-model-entry">
+            <el-input v-model="manualModel" clearable placeholder="也可以直接输入上游模型名，不要求目录已登记" @keyup.enter="useManualModel" />
+            <el-button type="primary" plain :disabled="!manualModel.trim()" @click="useManualModel">使用此模型</el-button>
+          </div>
           <button
             v-for="option in visibleOptions"
             :key="option.model"
             type="button"
-            :class="['model-option', { selected: model === option.model, disabled: !option.selectable, expensive: option.requires_explicit_confirmation }]"
-            :disabled="!option.selectable"
+            :class="['model-option', { selected: model === option.model, expensive: option.requires_explicit_confirmation }]"
             :aria-selected="model === option.model"
             @click="selectModel(option)"
           >
@@ -106,8 +112,8 @@
               <small>{{ modelMediaLabel(option) }}</small>
               <small>{{ modelPriceLabel(option) }}</small>
             </span>
-            <span :class="['model-option-status', { failed: !option.selectable }]">
-              <el-icon><component :is="option.selectable ? CircleCheck : Warning" /></el-icon>
+            <span :class="['model-option-status', { advisory: option.contract_status === 'missing' || option.group_available === false }]">
+              <el-icon><component :is="option.contract_status !== 'missing' && option.group_available !== false ? CircleCheck : Warning" /></el-icon>
               {{ modelCompatibilityLabel(option) }}
             </span>
           </button>
@@ -138,7 +144,7 @@
         type="info"
         :closable="false"
         show-icon
-        title="模型出现在目录中只代表当前可配置，不代表上游此刻绝对无波动；真正提交前仍会再次核对目录和参考媒体契约。"
+        title="模型目录和本地能力提示只用于解释与自动选模；手动指定的模型和参考媒体清单会按你的选择提交，最终以上游响应为准。"
       />
     </div>
 
@@ -159,6 +165,7 @@ import { computed, ref, watch } from 'vue'
 import { CircleCheck, Refresh, VideoCamera, Warning } from '@element-plus/icons-vue'
 import {
   buildShotVideoRoutingPayload,
+  catalogModelOption,
   modelCompatibilityLabel,
   modelDurationLabel,
   modelMediaLabel,
@@ -176,15 +183,17 @@ const props = defineProps({
   saving: { type: Boolean, default: false },
 })
 
-const emit = defineEmits(['update:modelValue', 'refresh', 'save'])
+const emit = defineEmits(['update:modelValue', 'refresh', 'save', 'manage-capabilities'])
 const mode = ref('inherit')
 const model = ref('')
+const manualModel = ref('')
 const previsMode = ref('auto')
 const search = ref('')
 const confirmExpensive = ref(false)
 
 const options = computed(() => Array.isArray(props.routing?.catalog?.options) ? props.routing.catalog.options : [])
-const selectedOption = computed(() => options.value.find((option) => option.model === model.value) || null)
+const selectedOption = computed(() => options.value.find((option) => option.model === model.value)
+  || catalogModelOption(options.value, model.value, props.routing?.project?.group || ''))
 const visibleOptions = computed(() => {
   const query = search.value.trim().toLowerCase()
   const items = query
@@ -220,7 +229,7 @@ const requiresExpensiveConfirmation = computed(() => mode.value === 'fixed'
   && selectedOption.value?.requires_explicit_confirmation === true)
 const canSubmit = computed(() => {
   if (!props.routing?.shot?.id || props.saving) return false
-  if (mode.value === 'fixed' && (!selectedOption.value?.selectable)) return false
+  if (mode.value === 'fixed' && !model.value.trim()) return false
   if (requiresExpensiveConfirmation.value && !confirmExpensive.value) return false
   return true
 })
@@ -229,14 +238,22 @@ watch(() => [props.modelValue, props.routing], () => {
   if (!props.modelValue || !props.routing) return
   mode.value = props.routing.shot?.mode === 'fixed' ? 'fixed' : 'inherit'
   model.value = props.routing.shot?.model || props.routing.effective_route?.model || ''
+  manualModel.value = model.value
   previsMode.value = shotVideoPrevisMode(props.routing)
   search.value = ''
   confirmExpensive.value = false
 }, { immediate: true, deep: true })
 
 function selectModel(option) {
-  if (!option.selectable) return
   model.value = option.model
+  manualModel.value = option.model
+  confirmExpensive.value = false
+}
+
+function useManualModel() {
+  const value = manualModel.value.trim()
+  if (!value) return
+  model.value = value
   confirmExpensive.value = false
 }
 
@@ -257,6 +274,8 @@ function formatCatalogTime(value) {
 </script>
 
 <style scoped>
-.dialog-heading { display: flex; align-items: flex-start; gap: 10px; }.dialog-heading > span { width: 34px; height: 34px; flex: 0 0 auto; display: grid; place-items: center; color: #fff; background: #16766b; }.dialog-heading > div { display: grid; gap: 3px; }.dialog-heading strong { color: #263f43; font-size: 15px; }.dialog-heading small { color: #718286; font-size: 11px; }.picker-loading { min-height: 280px; display: grid; place-items: center; color: #708085; }.picker-error { min-height: 220px; display: grid; align-content: center; justify-items: center; gap: 14px; }.picker-error :deep(.el-alert) { width: min(620px, 100%); }.picker-body { display: grid; gap: 16px; }.current-route { display: grid; grid-template-columns: 1.2fr 1fr 1fr auto; align-items: center; gap: 12px; padding: 12px; border: 1px solid #d9e4e2; background: #f7fbfa; }.current-route > div { min-width: 0; display: grid; gap: 3px; }.current-route small { color: #7d8c8f; font-size: 10px; }.current-route strong { overflow-wrap: anywhere; color: #315b56; font-size: 11px; }.routing-choice { display: grid; gap: 8px; }.routing-choice > label { color: #34494d; font-size: 12px; font-weight: 700; }.routing-choice p { margin: 0; color: #708185; font-size: 11px; }.model-toolbar { display: flex; align-items: center; gap: 12px; }.model-toolbar > :deep(.el-input) { flex: 1; }.model-toolbar > span { color: #7a898d; font-size: 11px; white-space: nowrap; }.model-option-list { max-height: min(46vh, 430px); overflow: auto; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; padding: 2px; }.model-option { min-width: 0; padding: 11px 12px; display: grid; gap: 8px; border: 1px solid #dbe3e4; background: #fff; color: #304247; text-align: left; cursor: pointer; font: inherit; }.model-option:hover { border-color: #77b5ac; }.model-option.selected { border-color: #16766b; box-shadow: 0 0 0 2px rgba(22, 118, 107, .1); background: #f5fbf9; }.model-option.expensive { border-color: #e1c0b4; }.model-option.disabled { cursor: not-allowed; opacity: .62; background: #f4f6f6; }.model-option-main { min-width: 0; display: grid; gap: 2px; }.model-option-main strong, .model-option-main small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.model-option-main strong { font-size: 12px; }.model-option-main small { color: #829095; font-size: 9px; }.model-option-tags { display: flex; flex-wrap: wrap; gap: 4px; }.model-option-tags em { padding: 2px 5px; border: 1px solid #d7e1df; color: #5e7470; font-size: 9px; font-style: normal; }.model-option-meta { display: flex; justify-content: space-between; gap: 8px; color: #627578; font-size: 10px; }.model-option-status { display: flex; align-items: flex-start; gap: 5px; color: #34745b; font-size: 10px; line-height: 1.4; }.model-option-status.failed { color: #9a5648; }.selection-receipt, .retry-receipt { padding: 12px; display: grid; gap: 9px; border: 1px solid #dce4e5; background: #fafcfc; }.selection-receipt > div { display: grid; gap: 3px; }.selection-receipt strong { font-size: 12px; }.selection-receipt span { color: #708085; font-size: 10px; }.retry-receipt { border-color: #e2c8bd; background: #fff9f6; }.retry-heading { display: flex; align-items: flex-start; gap: 7px; color: #875144; }.retry-heading span { display: grid; gap: 2px; }.retry-heading small { color: #97756c; font-size: 10px; }.retry-note { color: #87685f; font-size: 10px; line-height: 1.55; }.dialog-footer { display: flex; align-items: center; justify-content: space-between; gap: 16px; }.dialog-footer > span { max-width: 520px; color: #748286; font-size: 10px; line-height: 1.5; text-align: left; }.dialog-footer > div { display: flex; gap: 8px; flex: 0 0 auto; }
+.model-option-status.advisory { color: #8a6b31; }
+.manual-model-entry { display: flex; align-items: center; gap: 8px; }.manual-model-entry :deep(.el-input) { flex: 1; }.model-option-list > .manual-model-entry { grid-column: 1 / -1; }
+.dialog-heading { display: flex; align-items: flex-start; gap: 10px; }.dialog-heading > span { width: 34px; height: 34px; flex: 0 0 auto; display: grid; place-items: center; color: #fff; background: #16766b; }.dialog-heading > div { display: grid; gap: 3px; }.dialog-heading strong { color: #263f43; font-size: 15px; }.dialog-heading small { color: #718286; font-size: 11px; }.picker-loading { min-height: 280px; display: grid; place-items: center; color: #708085; }.picker-error { min-height: 220px; display: grid; align-content: center; justify-items: center; gap: 14px; }.picker-error :deep(.el-alert) { width: min(620px, 100%); }.picker-body { display: grid; gap: 16px; }.current-route { display: grid; grid-template-columns: 1.2fr 1fr 1fr auto; align-items: center; gap: 12px; padding: 12px; border: 1px solid #d9e4e2; background: #f7fbfa; }.current-route > div { min-width: 0; display: grid; gap: 3px; }.current-route small { color: #7d8c8f; font-size: 10px; }.current-route strong { overflow-wrap: anywhere; color: #315b56; font-size: 11px; }.route-tools { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }.routing-choice { display: grid; gap: 8px; }.routing-choice > label { color: #34494d; font-size: 12px; font-weight: 700; }.routing-choice p { margin: 0; color: #708185; font-size: 11px; }.model-toolbar { display: flex; align-items: center; gap: 12px; }.model-toolbar > :deep(.el-input) { flex: 1; }.model-toolbar > span { color: #7a898d; font-size: 11px; white-space: nowrap; }.model-option-list { max-height: min(46vh, 430px); overflow: auto; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; padding: 2px; }.model-option { min-width: 0; padding: 11px 12px; display: grid; gap: 8px; border: 1px solid #dbe3e4; background: #fff; color: #304247; text-align: left; cursor: pointer; font: inherit; }.model-option:hover { border-color: #77b5ac; }.model-option.selected { border-color: #16766b; box-shadow: 0 0 0 2px rgba(22, 118, 107, .1); background: #f5fbf9; }.model-option.expensive { border-color: #e1c0b4; }.model-option.disabled { cursor: not-allowed; opacity: .62; background: #f4f6f6; }.model-option-main { min-width: 0; display: grid; gap: 2px; }.model-option-main strong, .model-option-main small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.model-option-main strong { font-size: 12px; }.model-option-main small { color: #829095; font-size: 9px; }.model-option-tags { display: flex; flex-wrap: wrap; gap: 4px; }.model-option-tags em { padding: 2px 5px; border: 1px solid #d7e1df; color: #5e7470; font-size: 9px; font-style: normal; }.model-option-meta { display: flex; justify-content: space-between; gap: 8px; color: #627578; font-size: 10px; }.model-option-status { display: flex; align-items: flex-start; gap: 5px; color: #34745b; font-size: 10px; line-height: 1.4; }.model-option-status.failed { color: #9a5648; }.selection-receipt, .retry-receipt { padding: 12px; display: grid; gap: 9px; border: 1px solid #dce4e5; background: #fafcfc; }.selection-receipt > div { display: grid; gap: 3px; }.selection-receipt strong { font-size: 12px; }.selection-receipt span { color: #708085; font-size: 10px; }.retry-receipt { border-color: #e2c8bd; background: #fff9f6; }.retry-heading { display: flex; align-items: flex-start; gap: 7px; color: #875144; }.retry-heading span { display: grid; gap: 2px; }.retry-heading small { color: #97756c; font-size: 10px; }.retry-note { color: #87685f; font-size: 10px; line-height: 1.55; }.dialog-footer { display: flex; align-items: center; justify-content: space-between; gap: 16px; }.dialog-footer > span { max-width: 520px; color: #748286; font-size: 10px; line-height: 1.5; text-align: left; }.dialog-footer > div { display: flex; gap: 8px; flex: 0 0 auto; }
 @media (max-width: 720px) { .current-route { grid-template-columns: 1fr 1fr; }.current-route :deep(.el-button) { width: 100%; }.model-option-list { grid-template-columns: 1fr; max-height: 42vh; }.dialog-footer { align-items: stretch; flex-direction: column; }.dialog-footer > div { display: grid; grid-template-columns: 1fr 1fr; }.routing-choice :deep(.el-radio-group) { display: grid; grid-template-columns: 1fr; }.routing-choice :deep(.el-radio-button__inner) { width: 100%; }.model-option-meta { align-items: flex-start; flex-direction: column; gap: 3px; } }
 </style>

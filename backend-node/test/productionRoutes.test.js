@@ -9,6 +9,7 @@ const Database = require('better-sqlite3');
 const { runMigrationsAndEnsure } = require('../src/db/migrate');
 const { setupRouter } = require('../src/routes');
 const repo = require('../src/services/productionRepository');
+const aiConfigService = require('../src/services/aiConfigService');
 const { createFallbackDirectorDocument } = require('../src/services/productionDirector');
 
 let db;
@@ -157,7 +158,137 @@ describe('production HTTP routes', () => {
     assert.equal(result.body.data.run.runtime.autonomy.intervention, undefined);
   });
 
+  it('clears a persisted automatic intervention when the run is resumed', async () => {
+    let run = repo.createRun(db, {
+      drama_id: 1, episode_id: 1, idempotency_key: 'route-resume-intervention',
+      review_owner: 'auto_accept', input: { story: '测试故事' },
+    }).run;
+    run = repo.updateRun(db, run.id, {
+      status: 'waiting_review', waiting_reason: 'automation_limit_reached',
+      error_code: 'AUTOMATION_LIMIT_REACHED', error_message: '等待人工处理',
+      runtime: { autonomy: {
+        objects: {
+          'script:run:': {
+            stage: 'script', scope_type: 'run', scope_id: '',
+            consecutive_generation_failures: 3, escalated: true,
+          },
+        },
+        intervention: {
+          object_key: 'script:run:', stage: 'script', scope_type: 'run', scope_id: '',
+          reason: 'automation_limit_reached',
+        },
+      } },
+    });
+    const result = await request(`/production-runs/${run.id}/resume`, {
+      method: 'POST', body: { expected_version: run.version },
+    });
+    assert.equal(result.status, 200);
+    assert.equal(result.body.data.run.status, 'running');
+    assert.equal(result.body.data.run.waiting_reason, null);
+    assert.equal(result.body.data.run.error_code, null);
+    assert.equal(result.body.data.run.runtime.autonomy.intervention, undefined);
+    assert.equal(result.body.data.run.runtime.autonomy.objects['script:run:'], undefined);
+  });
+
+  it('exposes atomic shot operations and routes legacy storyboard exclude and restore through them', async () => {
+    let run = repo.createRun(db, {
+      drama_id: 1,
+      episode_id: 1,
+      idempotency_key: 'route-shot-operations',
+      review_owner: 'human',
+      input: { story: '林夏完成两个连续镜头。' },
+      policy: { video_model: 'cc-seedance2.0 480p-fast-nsp' },
+      budget: { max_shots: 6, max_video_attempts: 10, max_video_seconds: 60 },
+    }).run;
+    const makeShot = (number, title) => repo.createArtifact(db, {
+      run_id: run.id,
+      stage: 'storyboard_plan',
+      scope_type: 'shot',
+      scope_id: String(number),
+      title,
+      content: {
+        number,
+        title,
+        duration: 5,
+        action: `${title}动作完整结束`,
+        visual: `${title}独立构图`,
+        video_prompt: `${title}按时间顺序完成动作`,
+        transition_mode: Number(number) === 1 ? 'opening' : 'hard_cut',
+        included: true,
+      },
+      status: 'approved',
+    });
+    const first = makeShot(1, '镜头一');
+    makeShot(2, '镜头二');
+    run = repo.updateRun(db, run.id, {
+      current_stage: 'storyboard_plan', current_scope_type: 'shot', current_scope_id: '1', status: 'running',
+      runtime: { shot_pipeline: { mode: 'sequential', current_shot_id: '1' } },
+    });
+    const content = (title) => ({
+      title,
+      duration: 5,
+      action: `${title}动作完整结束`,
+      visual: `${title}独立构图`,
+      video_prompt: `${title}按时间顺序完成动作并稳定结束`,
+      transition_mode: title.includes('开场') ? 'opening' : 'hard_cut',
+    });
+
+    const revised = await request(`/production-runs/${run.id}/shots/1/revise`, {
+      method: 'POST',
+      body: { expected_version: run.version, instruction: '把动作变得更明确', content: content('开场修订') },
+    });
+    assert.equal(revised.status, 200);
+    assert.equal(revised.body.data.operation, 'revise');
+
+    const split = await request(`/production-runs/${run.id}/shots/1/split`, {
+      method: 'POST',
+      body: {
+        instruction: '把角色反应拆成下一镜头',
+        content: { current_shot: content('开场前半'), next_shot: content('角色反应') },
+      },
+    });
+    assert.equal(split.status, 200);
+    assert.equal(split.body.data.inserted_shot.scope_id, '1.5');
+
+    const pickup = await request(`/production-runs/${run.id}/shots/pickup`, {
+      method: 'POST',
+      body: { after_shot_id: '1.5', instruction: '补拍道具特写', content: content('道具特写') },
+    });
+    assert.equal(pickup.status, 200);
+    assert.equal(pickup.body.data.shot.scope_id, '1.75');
+
+    const skipped = await request(`/production-runs/${run.id}/shots/1/skip`, {
+      method: 'POST', body: { reason: '本轮不采用开场镜头' },
+    });
+    assert.equal(skipped.status, 200);
+    assert.equal(skipped.body.data.operation, 'skip');
+    assert.equal(skipped.body.data.focus_shot_id, '1.5');
+    assert.equal(skipped.body.data.summary.run.current_scope_id, '1.5');
+
+    const skippedArtifact = repo.listArtifacts(db, run.id, {
+      stage: 'storyboard_plan', scope_type: 'shot', scope_id: '1', current: true,
+    }).items[0];
+    const restored = await request(`/production-artifacts/${skippedArtifact.id}/restore`, {
+      method: 'POST', body: { reason: '旧入口也应恢复镜头' },
+    });
+    assert.equal(restored.status, 200);
+    assert.equal(restored.body.data.operation, 'restore');
+    assert.equal(restored.body.data.summary.run.current_scope_id, '1');
+
+    const excludedAgain = await request(`/production-artifacts/${first.id}/exclude`, {
+      method: 'POST', body: { reason: '旧入口也应跳过当前镜头' },
+    });
+    assert.equal(excludedAgain.status, 200);
+    assert.equal(excludedAgain.body.data.operation, 'skip');
+  });
+
   it('exposes capability-aware video routing and atomically saves a shot override', async () => {
+    const videoConfig = aiConfigService.createConfig(db, log, {
+      service_type: 'video', provider: 'yinzi', name: 'Legacy run video Key',
+      base_url: 'https://api.yinziapi.top/v1', api_key: 'test-video-key',
+      model: ['cc-seedance2.0 480p-fast-nsp'],
+      default_model: 'cc-seedance2.0 480p-fast-nsp', is_default: true,
+    });
     let run = repo.createRun(db, {
       drama_id: 1,
       episode_id: 1,
@@ -165,6 +296,10 @@ describe('production HTTP routes', () => {
       review_owner: 'human',
       input: { story: '林夏看向月面城市。' },
       policy: {
+        // Simulate a run created before any video config was available. The
+        // editor may resolve the current default as context, but this null must
+        // remain persisted so a read-only lookup cannot rewrite dispatch state.
+        video_config_id: null,
         video_routing_mode: 'auto',
         video_group: '特价视频分组(即梦)',
         video_quality: 'balanced',
@@ -196,6 +331,8 @@ describe('production HTTP routes', () => {
 
     const routing = await request(`/production-runs/${run.id}/video-routing?shot_id=1`);
     assert.equal(routing.status, 200);
+    assert.equal(routing.body.data.project.config_id, videoConfig.id);
+    assert.equal(repo.getRun(db, run.id).policy.video_config_id, null);
     assert.equal(routing.body.data.effective_route.model, 'cc-seedance2.0 480p-fast-nsp');
     assert.equal(routing.body.data.catalog.options.length, 2);
     assert.equal(routing.body.data.catalog.options.every((item) => item.selectable), true);
@@ -209,11 +346,15 @@ describe('production HTTP routes', () => {
 
     const switched = await request(`/production-runs/${run.id}/video-routing`, {
       method: 'PATCH',
-      body: { scope: 'shot', shot_id: '1', mode: 'fixed', model: 'cc-seedance2.0 480p-nsp', expected_version: run.version },
+      body: {
+        scope: 'shot', shot_id: '1', config_id: videoConfig.id,
+        mode: 'fixed', model: 'cc-seedance2.0 480p-nsp', expected_version: run.version,
+      },
     });
     assert.equal(switched.status, 200);
     assert.equal(switched.body.data.effects.paid_submission, false);
     assert.equal(switched.body.data.effects.reference_bundle_refreshed, false);
+    assert.equal(switched.body.data.summary.run.policy.video_config_id, videoConfig.id);
     assert.equal(switched.body.data.summary.run.policy.video_model_overrides['1'], 'cc-seedance2.0 480p-nsp');
     assert.deepEqual(switched.body.data.summary.run.usage, run.usage);
 

@@ -1,9 +1,11 @@
 # 银子AI视频工作流桌面端
 
-本目录负责 Windows x64 的 Electron 安装版与便携版。普通用户无需在这里执行命令，应从项目 Release 下载：
+本目录负责 Windows x64、macOS Intel x64 与 macOS Apple Silicon arm64 的 Electron 发行包。普通用户无需在这里执行命令，应从项目 Release 下载：
 
-- `银子AI视频工作流-Setup-0.1.2-beta.1-x64.exe`
-- `银子AI视频工作流-Portable-0.1.2-beta.1-x64.exe`
+- `银子AI视频工作流-Setup-0.1.3-beta.4-x64.exe`
+- `银子AI视频工作流-Portable-0.1.3-beta.4-x64.exe`
+- `银子AI视频工作流-0.1.3-beta.4-mac-arm64.dmg` 与同名 ZIP
+- `银子AI视频工作流-0.1.3-beta.4-mac-x64.dmg` 与同名 ZIP
 
 源码打包要求 Node.js 22 或更新版本：
 
@@ -41,7 +43,7 @@ npm run dist:mac:arm64   # Apple Silicon / macos-15
 
 输出位于 `release-mac`：
 
-- `银子AI视频工作流-0.1.2-beta.1-mac-arm64.dmg` 与同名 ZIP：Apple Silicon（M1/M2/M3/M4）。
-- `银子AI视频工作流-0.1.2-beta.1-mac-x64.dmg` 与同名 ZIP：Intel Mac。
+- `银子AI视频工作流-0.1.3-beta.4-mac-arm64.dmg` 与同名 ZIP：Apple Silicon（M1/M2/M3/M4 及后续）。
+- `银子AI视频工作流-0.1.3-beta.4-mac-x64.dmg` 与同名 ZIP：Intel Mac。
 
 入口会原生安装并探测 Sharp、Better SQLite3、FFmpeg/FFprobe，再生成 DMG 和 ZIP。Windows 上执行 `dist:mac` 会明确停止；旧 V0.1.1 手工重打包入口已从公开源码移除。未配置证书时产物未签名、未公证；完整安装步骤见 `release-docs/Mac小白测试说明.md`。

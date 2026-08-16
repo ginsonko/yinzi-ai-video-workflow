@@ -5,9 +5,11 @@ const textStages = require('./productionTextStages');
 const aiClient = require('./aiClient');
 const director = require('./productionDirector');
 const { createProductionMediaService } = require('./productionMediaService');
+const { createProductionShotService } = require('./productionShotService');
 const { createFinalEditService } = require('./productionFinalEditService');
 const imageClient = require('./imageClient');
 const videoClient = require('./videoClient');
+const videoService = require('./videoService');
 const mediaValidation = require('./productionMediaValidation');
 const autonomy = require('./productionAutonomy');
 const reviewMedia = require('./productionReviewMedia');
@@ -18,6 +20,7 @@ const promptRegistry = require('./productionPromptRegistry');
 const promptRuntime = require('./productionPromptRuntime');
 const accounting = require('./productionRuntimeAccounting');
 const costLedger = require('./productionCostLedger');
+const aiConfigService = require('./aiConfigService');
 const automationPreferences = require('./productionAutomationPreferences');
 
 const PRODUCTION_TEXT_SILENCE_TIMEOUT_MS = 180000;
@@ -127,6 +130,14 @@ function createProductionService(db, cfg, log, injected = {}) {
       .sort(compareShots);
   }
 
+  function currentPlannedShots(run) {
+    return repo.listArtifacts(db, run.id, {
+      stage: 'storyboard_plan', current: true, page_size: 200,
+    }).items
+      .filter((item) => item.content?.included !== false)
+      .sort(compareShots);
+  }
+
   function routingShot(run, shotId = null, required = false) {
     const shots = orderedShots(run);
     const resolvedId = shotId ?? run.current_scope_id;
@@ -178,6 +189,34 @@ function createProductionService(db, cfg, log, injected = {}) {
     return receipt;
   }
 
+  function readOnlyVideoConfigId(preferredModel = '') {
+    const rows = db.prepare(
+      `SELECT id FROM ai_service_configs
+       WHERE deleted_at IS NULL AND is_active = 1 AND service_type = 'video'
+       ORDER BY is_default DESC, priority DESC, created_at DESC, id ASC`
+    ).all();
+    if (!rows.length) return null;
+    const configs = rows.map((row) => aiConfigService.getConfig(db, row.id)).filter(Boolean);
+    const target = String(preferredModel || '').trim();
+    if (target) {
+      const matched = configs.find((config) => {
+        const configuredModels = Array.isArray(config.model)
+          ? config.model.map((item) => String(item || '').trim())
+          : config.model ? [String(config.model).trim()] : [];
+        const discoveredModels = Array.isArray(config.model_catalog_snapshot?.models)
+          ? config.model_catalog_snapshot.models
+            .map((item) => String(item?.model || item || '').trim())
+            .filter(Boolean)
+          : [];
+        return config.default_model === target
+          || configuredModels.includes(target)
+          || discoveredModels.includes(target);
+      });
+      if (matched) return Number(matched.id);
+    }
+    return Number(configs[0].id);
+  }
+
   function routingPolicyState(run, shot) {
     const overrides = run.policy?.video_model_overrides && typeof run.policy.video_model_overrides === 'object'
       ? run.policy.video_model_overrides
@@ -192,11 +231,26 @@ function createProductionService(db, cfg, log, injected = {}) {
     const projectMode = run.policy?.video_routing_mode
       ? String(run.policy.video_routing_mode)
       : String(run.policy?.video_model || '').trim() ? 'fixed' : 'auto';
+    // Some legacy runs were created before a video Key was saved and therefore
+    // have no persisted config id. The picker still needs a concrete config
+    // context to open the advisory capability editor. Resolve that context
+    // read-only from the selected model/default; this never changes dispatch
+    // policy, credentials, or the model sent upstream.
+    let configId = run.policy?.video_config_id == null ? null : Number(run.policy.video_config_id);
+    if (configId == null || !Number.isSafeInteger(configId) || configId <= 0) {
+      const preferredModel = shotModel || (projectMode === 'fixed' ? String(run.policy?.video_model || '').trim() : '');
+      try {
+        configId = readOnlyVideoConfigId(preferredModel);
+      } catch (_) {
+        configId = null;
+      }
+    }
     return {
       project: {
         mode: projectMode === 'fixed' ? 'fixed' : 'auto',
         model: String(run.policy?.video_model || ''),
         provider: String(run.policy?.video_provider || 'yinzi'),
+        config_id: configId,
         group: String(run.policy?.video_group || ''),
         quality: String(run.policy?.video_quality || 'balanced'),
         director_mode: String(run.policy?.director_mode || 'auto') === 'off' ? 'off' : 'auto',
@@ -366,6 +420,15 @@ function createProductionService(db, cfg, log, injected = {}) {
       : routingShot(run, input.shot_id ?? run.current_scope_id) || routingPreviewShot(run);
     const targetShotApproved = targetShot.id == null || targetShot.status === 'approved';
     const nextPolicy = { ...(run.policy || {}) };
+    if (input.config_id !== undefined) {
+      const configId = Number(input.config_id);
+      if (!Number.isSafeInteger(configId) || configId <= 0) throw new Error('视频配置 ID 无效');
+      const config = aiConfigService.getConfig(db, configId);
+      if (!config || config.service_type !== 'video' || config.is_active === false) {
+        throw new Error(`视频配置 #${configId} 不存在、不是视频配置或已停用`);
+      }
+      nextPolicy.video_config_id = configId;
+    }
     if (scope === 'run') {
       const mode = input.mode === 'fixed' ? 'fixed' : 'auto';
       const model = String(input.model || '').trim();
@@ -516,6 +579,7 @@ function createProductionService(db, cfg, log, injected = {}) {
           ? (nextPolicy.video_model_overrides?.[String(targetShot.scope_id)] ? 'fixed' : 'inherit')
           : nextPolicy.video_routing_mode,
         model: selectedRoute?.model || null,
+        config_id: nextPolicy.video_config_id || null,
         previs_mode: selectedRoute?.previs_mode || null,
         reference_bundle_artifact_id: bundleResult?.artifact?.id || null,
         reference_bundle_refreshed: bundleResult?.state === 'refreshed',
@@ -634,8 +698,8 @@ function createProductionService(db, cfg, log, injected = {}) {
       error.details = completion;
       throw error;
     }
-    const shots = orderedShots(run);
-    if (!shots.length) throw new Error('没有可制作的已批准分镜');
+    const shots = currentPlannedShots(run);
+    if (!shots.length) throw new Error('没有可制作的分镜');
     const currentScopeId = run.current_scope_id == null ? null : String(run.current_scope_id);
     const currentShot = currentScopeId == null
       ? null
@@ -791,16 +855,9 @@ function createProductionService(db, cfg, log, injected = {}) {
       }
       if (transitionMode === 'strict_continuation') {
         if (!String(content.continuous_take_id || '').trim()) throw new Error('严格续拍必须填写连续镜头编号');
-        const routePolicy = routingPolicyState(artifactRun, artifact);
-        const fixedModel = routePolicy.shot?.mode === 'fixed'
-          ? routePolicy.shot.model
-          : routePolicy.project.mode === 'fixed' ? routePolicy.project.model : '';
-        const capability = fixedModel ? getYinziVideoCapability(fixedModel) : null;
-        if (fixedModel && !capabilitySupportsRole(capability, 'image', 'first_frame')) {
-          const error = new Error(`当前固定视频模型 ${fixedModel} 不支持严格首帧，请改用尾帧参考续接、独立切镜或选择支持 first_frame 的模型`);
-          error.code = 'STRICT_FIRST_FRAME_UNSUPPORTED';
-          throw error;
-        }
+        // The selected model's first-frame support is advisory.  Keep the
+        // editorial choice intact and let the provider return the actionable
+        // capability error instead of blocking a user-selected model here.
       }
     }
     if (artifact.stage === 'director_plan') {
@@ -825,28 +882,26 @@ function createProductionService(db, cfg, log, injected = {}) {
       const route = content.routing_receipt
         ? { ...content.routing_receipt, ...classified }
         : classified;
-      const limits = content.limits || route.limits || { images: 4, videos: 3, audios: 1 };
-      if (images.length < 1) throw new Error('参考包至少需要 1 张参考图');
+      const limits = content.limits || route.limits || {};
+      const warnings = [];
+      if (!images.length) warnings.push('reference_image_missing');
       if (content.transition_mode === 'reference_continuation'
-        && !images.some((item) => item.source === 'continuity_first_frame')) {
-        throw new Error('尾帧参考续接必须携带上一镜最终帧；如不需要，请把分镜改为独立切镜');
-      }
+        && !images.some((item) => item.source === 'continuity_first_frame')) warnings.push('continuity_frame_missing');
       if (content.transition_mode === 'strict_continuation'
-        && !images.some((item) => item.role === 'first_frame')) {
-        throw new Error('严格首帧续拍必须携带派生的 first_frame');
-      }
-      if (route.uses_reference_video && videos.length < 1) throw new Error('当前镜头参考包至少需要 1 个已确认的 3D 分镜视频');
-      if (!route.uses_reference_video && videos.length) {
-        throw new Error(isDirectorDisabled(artifactRun)
-          ? '本任务已关闭 3D 导演台，请移除参考视频后继续'
-          : '当前镜头已选择不携带参考视频，请移除视频文件');
-      }
-      if (images.length > Number(limits.images) || videos.length > Number(limits.videos) || audios.length > Number(limits.audios)) {
-        throw new Error(`参考包超过当前模型 ${limits.images} 图、${limits.videos} 视频、${limits.audios} 音频上限`);
-      }
+        && !images.some((item) => item.role === 'first_frame')) warnings.push('strict_first_frame_missing');
+      if (route.uses_reference_video && !videos.length) warnings.push('reference_video_missing');
+      if (!route.uses_reference_video && videos.length) warnings.push('reference_video_not_declared');
+      if (Number.isFinite(Number(limits.images)) && images.length > Number(limits.images)) warnings.push('image_count_over_contract');
+      if (Number.isFinite(Number(limits.videos)) && videos.length > Number(limits.videos)) warnings.push('video_count_over_contract');
+      if (Number.isFinite(Number(limits.audios)) && audios.length > Number(limits.audios)) warnings.push('audio_count_over_contract');
       for (const item of [...images, ...videos, ...audios]) {
         if (!String(item?.path || '').trim()) throw new Error('参考包包含无效文件项');
       }
+      // Store the advisory result on the value returned to callers.  Approval
+      // remains successful; dispatch includes the same warnings in its
+      // receipt so an upstream rejection can be fixed without losing the
+      // user's model or media choices.
+      return { reference_warnings: [...new Set(warnings)] };
     }
     if (graph.getStage(artifact.stage)?.media === 'image') {
       if (!artifact.media_path) throw new Error('缺少图片文件');
@@ -979,6 +1034,8 @@ function createProductionService(db, cfg, log, injected = {}) {
       throw error;
     }
   }
+
+  const shotOperations = createProductionShotService(db, { runTextAction });
 
   function createGeneratedArtifact(run, input) {
     return repo.createArtifact(db, {
@@ -1234,7 +1291,9 @@ function createProductionService(db, cfg, log, injected = {}) {
     const failedModel = String(failedAction?.request?.model || failedAction?.request?.routing_receipt?.model || '').trim();
     if (failedModel) attemptedModels.add(failedModel);
     const selectable = (options.options || []).filter((option) => (
-      option.selectable
+      // Manual selection is intentionally permissive.  Unattended switching
+      // still requires a locally evidenced compatible candidate.
+      option.compatible === true
       && !attemptedModels.has(option.model)
     ));
     const requestedFallback = String(preferences.moderation_fallback_model || '').trim();
@@ -1310,6 +1369,49 @@ function createProductionService(db, cfg, log, injected = {}) {
       message,
       stage: automationScope(liveRun, { ...input, action: failedAction }).stage,
     });
+    if (failure.category === 'configuration_binding_failure' && failedAction?.status === 'failed') {
+      const generation = failedAction.generation_id
+        ? videoService.getById(db, failedAction.generation_id)
+        : null;
+      const configId = Number(
+        failedAction.request?.video_config_id
+        || liveRun.policy?.video_config_id
+        || generation?.video_config_id
+        || generation?.provider_config_snapshot?.config_id
+        || 0
+      );
+      const config = Number.isSafeInteger(configId) && configId > 0
+        ? aiConfigService.getConfig(db, configId)
+        : null;
+      if (config && config.service_type === 'video' && config.is_active !== false) {
+        repo.updateAction(db, failedAction.id, {
+          status: 'cancelled',
+          result: {
+            ...(failedAction.result || {}),
+            retry_authorized: true,
+            retry_reason: '已确认视频配置仍有效；按修复后的绑定规则重试同一模型',
+            retry_authorized_by: 'production_autonomy',
+            stale_config_binding_recovered: true,
+            video_config_id: configId,
+          },
+        });
+        repo.updateRun(db, liveRun.id, {
+          policy: { ...(liveRun.policy || {}), video_config_id: configId },
+          status: 'running', waiting_reason: null, error_code: null, error_message: null,
+        });
+        repo.appendEvent(db, liveRun.id, 'automation.video_config_binding_recovered', {
+          ...automationScope(liveRun, { ...input, action: failedAction }),
+          payload: {
+            action_id: failedAction.id,
+            generation_id: failedAction.generation_id || null,
+            video_config_id: configId,
+            model: failedAction.request?.model || null,
+            paid_submission: false,
+          },
+        });
+        return { state: 'progressed', reason: 'video_config_binding_recovered', paid_submission: false };
+      }
+    }
     if (failure.counts_as_failure === false) {
       const scope = automationScope(liveRun, input);
       const runtime = resolvedAutonomyRuntime(liveRun, scope) || liveRun.runtime;
@@ -1834,17 +1936,56 @@ function createProductionService(db, cfg, log, injected = {}) {
       || run.runtime?.autonomy?.intervention?.reason === 'human_authority_required') {
       return result;
     }
+    const liveRun = repo.getRun(db, run.id);
+    const automaticWaitReasons = new Set([
+      'stage_handler_pending',
+      'video_prompt_plan_in_progress',
+      'image_generation',
+      'video_generation',
+      'superseded_video_waiting',
+      'final_merge',
+      'provider_task_pending',
+      'video_download_pending',
+      'video_download_retry',
+      'status_convergence_pending',
+    ]);
+    if (automaticWaitReasons.has(result.reason)) {
+      const scope = automationScope(liveRun, result);
+      const runtime = resolvedAutonomyRuntime(liveRun, scope);
+      const providerWait = new Set([
+        'image_generation',
+        'video_generation',
+        'superseded_video_waiting',
+        'final_merge',
+        'provider_task_pending',
+        'video_download_pending',
+        'video_download_retry',
+      ]).has(result.reason);
+      const healed = repo.updateRun(db, liveRun.id, {
+        ...(runtime ? { runtime } : {}),
+        status: providerWait ? 'waiting_provider' : 'running',
+        waiting_reason: providerWait ? result.reason : null,
+        error_code: null,
+        error_message: null,
+      });
+      if (runtime) {
+        repo.appendEvent(db, healed.id, 'automation.wait_state_cleared', {
+          ...scope,
+          payload: { reason: result.reason },
+        });
+      }
+      return {
+        ...result,
+        state: providerWait ? 'waiting_provider' : 'waiting_task',
+        run: healed,
+      };
+    }
     const normalReviewReasons = new Set([
       'reference_bundle_review_required',
       'reference_bundle_stale',
       'video_dispatch_state_changed',
       'video_route_changed',
     ]);
-    if (result.reason === 'video_prompt_plan_in_progress') {
-      repo.updateRun(db, run.id, { status: 'running', waiting_reason: null });
-      return { ...result, state: 'waiting_task' };
-    }
-    const liveRun = repo.getRun(db, run.id);
     const artifact = result.artifact ? repo.getArtifact(db, result.artifact.id) : null;
     const reviewQueued = artifact
       && ['draft', 'reviewing'].includes(artifact.status)
@@ -2442,13 +2583,13 @@ function createProductionService(db, cfg, log, injected = {}) {
       if (run.current_stage === 'asset_text') return { ...(await generateAssetText(run)), run: repo.getRun(db, run.id) };
       if (run.current_stage === 'storyboard_plan') return { ...(await generateStoryboardPlan(run)), run: repo.getRun(db, run.id) };
 
-      run = repo.updateRun(db, run.id, { status: 'waiting_review', waiting_reason: 'stage_handler_pending' });
       if (run.review_owner !== 'human') {
         const normalized = await normalizeAutomaticStageOutcome(run, {
           state: 'waiting_review', reason: 'stage_handler_pending', code: 'STAGE_HANDLER_PENDING',
         });
         return { ...normalized, run: repo.getRun(db, run.id) };
       }
+      run = repo.updateRun(db, run.id, { status: 'waiting_review', waiting_reason: 'stage_handler_pending' });
       return { state: 'waiting_review', reason: 'stage_handler_pending', run };
     } catch (error) {
       const current = repo.getRun(db, runId);
@@ -2579,11 +2720,12 @@ function createProductionService(db, cfg, log, injected = {}) {
       content = {
         images: [], videos: [], audios: [],
         ...content,
-        limits: route.uses_reference_video
-          ? { images: 4, videos: 3, audios: 1 }
-          : route.profile === 'short_image_guided'
-            ? { images: 9, videos: 0, audios: 3 }
-            : { images: 4, videos: 0, audios: 1 },
+        // Limits are advisory metadata only.  Preserve a known capability
+        // snapshot when the caller has one; otherwise leave it open for a
+        // manually selected or newly published upstream model.
+        limits: Object.prototype.hasOwnProperty.call(content, 'limits') ? content.limits : null,
+        soft_limits: content.soft_limits !== false,
+        media_constraints: content.media_constraints || { contract_status: 'unknown' },
         route_profile: route.profile,
         uses_reference_video: route.uses_reference_video,
         requires_director_preview: route.requires_director_preview,
@@ -2839,24 +2981,42 @@ function createProductionService(db, cfg, log, injected = {}) {
         db, storyboardImageModel || undefined, undefined, 'storyboard_image', run.policy?.storyboard_image_config_id
       );
     } catch (error) { storyboardImageConfigError = error; }
-    const videoConfig = videoClient.getDefaultVideoConfig(db, run.policy?.video_model || undefined);
+    const videoConfig = videoClient.getDefaultVideoConfig(
+      db,
+      run.policy?.video_model || undefined,
+      run.policy?.video_config_id,
+    );
     checks.push({ key: 'text_model', label: '文本模型', ok: !!(textConfig?.api_key && textConfig?.model), detail: textConfig ? (textConfig.model || '未选择模型') : '未配置' });
     checks.push({ key: 'image_model', label: '生图模型', ok: !!(imageConfig?.api_key && imageConfig?.model), detail: imageConfigError?.message || (imageConfig ? (imageConfig.model || '未选择模型') : '未配置') });
     checks.push({ key: 'storyboard_image_model', label: '分镜图模型', ok: !!(storyboardImageConfig?.api_key && storyboardImageConfig?.model), detail: storyboardImageConfigError?.message || (storyboardImageConfig ? (storyboardImageConfig.model || '未选择模型') : '未配置') });
-    checks.push({ key: 'video_model', label: '视频模型', ok: !!(videoConfig?.api_key && videoConfig?.model), detail: videoConfig ? (videoConfig.model || '未选择模型') : '未配置' });
+    checks.push({
+      key: 'video_model',
+      label: '视频模型',
+      ok: !!(videoConfig?.api_key && videoConfig?.base_url),
+      detail: videoConfig
+        ? (run.policy?.video_model || videoConfig.default_model || videoConfig.model || '模型将在镜头路由时选择')
+        : '未配置视频 URL / Key',
+    });
     checks.push({ key: 'ffmpeg', label: 'FFmpeg', ok: hasLocalFfmpeg(), detail: hasLocalFfmpeg() ? '可用' : '未找到' });
     checks.push({ key: 'ffprobe', label: 'FFprobe', ok: hasLocalFfprobe(), detail: hasLocalFfprobe() ? '可用' : '未找到' });
     const capability = getYinziVideoCapability(run.policy?.video_model);
     const automaticRouting = run.policy?.video_routing_mode === 'auto';
+    const contractKnown = !run.policy?.video_model || !!capability;
     checks.push({
       key: 'provider_contract',
       label: '参考媒体契约',
-      ok: !run.policy?.video_model || !!capability || input.allow_unknown_provider === true,
+      // A local capability hint is advisory. It can improve automatic route
+      // selection and explain likely provider limits, but it must never turn
+      // a user-selected model into a preflight blocker. The provider remains
+      // the final authority and its actionable error is preserved on failure.
+      ok: true,
+      blocking: false,
+      advisory: !contractKnown,
       detail: automaticRouting
         ? `自动按镜头路由：即梦统一按 5-15 秒提交；${isDirectorDisabled(run) ? '3D 导演台已关闭，只使用图片、音频与文本参考' : '连续长镜头可使用 3D 预演参考视频'}；付费前刷新实时目录`
         : capability
         ? `${capability.max_images} 图 / ${isDirectorDisabled(run) ? 0 : capability.max_videos} 视频 / ${capability.max_audios} 音频，${capability.duration_min}-${capability.duration_max} 秒；${capabilitySupportsRole(capability, 'image', 'first_frame') ? '支持严格首帧' : '不支持严格首帧，可选普通尾帧参考或真实切镜点硬切'}`
-        : '未知模型，需手动确认',
+        : '本地尚未登记该模型能力提示；仍可提交，若上游拒绝会显示原始原因并可调整参考包后重试',
     });
     if (input.browser) {
       const directorDisabled = isDirectorDisabled(run);
@@ -2986,6 +3146,11 @@ function createProductionService(db, cfg, log, injected = {}) {
     preflight,
     applyReviewPolicy,
     updateRunControl,
+    skipShot: shotOperations.skipShot,
+    restoreShot: shotOperations.restoreShot,
+    reviseShot: shotOperations.reviseShot,
+    splitShot: shotOperations.splitShot,
+    pickupShot: shotOperations.pickupShot,
   };
 }
 

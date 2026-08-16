@@ -24,12 +24,13 @@ test('normalizes the opening shot and locates the real previous storyboard', () 
   assert.equal(previousStoryboardArtifact(artifacts, artifacts[2]).id, 2)
 })
 
-test('reports missing predecessor video before a continuation bundle can be built', () => {
+test('warns without blocking when a continuation has no predecessor video', () => {
   const first = shot(1, 1)
   const second = shot(2, 2, 'reference_continuation')
   const view = buildShotContinuityView({ artifact: second, artifacts: [first, second] })
   assert.equal(view.plannedTransport.code, 'generic_image_reference')
-  assert.match(view.blocker, /上一镜正式视频/)
+  assert.equal(view.blocker, '')
+  assert.match(view.advisory, /仍可提交不带尾帧/)
   assert.equal(view.actualTransport.code, 'pending')
 })
 
@@ -57,9 +58,10 @@ test('distinguishes ordinary reference transport from strict first-frame transpo
   assert.equal(view.actualTransport.code, 'strict_first_frame')
   assert.equal(view.firstFrameSupport, true)
   assert.equal(view.blocker, '')
+  assert.equal(view.advisory, '')
 })
 
-test('blocks a fixed incompatible model without silently downgrading strict mode', () => {
+test('warns but keeps a fixed incompatible model manually submittable', () => {
   const first = shot(1, 1)
   const second = shot(2, 2, 'strict_continuation')
   const previousVideo = { id: 10, stage: 'shot_video', scope_id: '1', status: 'approved', media_path: 'prev.mp4', current: true }
@@ -68,7 +70,8 @@ test('blocks a fixed incompatible model without silently downgrading strict mode
     artifacts: [first, second, previousVideo],
     route: { model: 'reference-only', roles: { image: ['reference'] } },
   })
-  assert.match(view.blocker, /不支持 first_frame/)
+  assert.equal(view.blocker, '')
+  assert.match(view.advisory, /仍可提交/)
   assert.equal(view.plannedTransport.code, 'strict_first_frame')
   assert.equal(view.actualTransport.code, 'pending')
 })

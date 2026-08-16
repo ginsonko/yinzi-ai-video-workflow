@@ -7,6 +7,12 @@ export const aiAPI = {
   get(id) {
     return request.get(`/ai-configs/${id}`)
   },
+  getModelCapabilities(id) {
+    return request.get(`/ai-configs/${id}/model-capabilities`)
+  },
+  updateModelCapabilities(id, body) {
+    return request.put(`/ai-configs/${id}/model-capabilities`, body)
+  },
   create(body) {
     return request.post('/ai-configs', body)
   },
@@ -18,6 +24,11 @@ export const aiAPI = {
   },
   testConnection(body, options = {}) {
     return request.post('/ai-configs/test', body, {
+      suppressGlobalError: options.suppressGlobalError === true,
+    })
+  },
+  discoverModels(body, options = {}) {
+    return request.post('/ai-configs/discover-models', body, {
       suppressGlobalError: options.suppressGlobalError === true,
     })
   },

@@ -1,5 +1,5 @@
 <template>
-  <section :class="['continuity-panel', { 'has-blocker': view.blocker, 'has-mismatch': view.mismatch }]">
+  <section :class="['continuity-panel', { 'has-advisory': view.advisory, 'has-mismatch': view.mismatch }]">
     <header class="continuity-heading">
       <div>
         <el-icon><Connection /></el-icon>
@@ -61,11 +61,11 @@
     <div v-if="boundaryReceipt" class="continuity-boundary-receipt">
       <strong>边界校验</strong><span>{{ boundaryReceipt }}</span>
     </div>
-    <div v-if="view.blocker" class="continuity-blocker" role="alert">
-      <el-icon><Warning /></el-icon><span><strong>当前还不能按此方式提交</strong>{{ view.blocker }}</span>
-    </div>
-    <div v-else-if="view.mismatch" class="continuity-blocker" role="alert">
+    <div v-if="view.mismatch" class="continuity-blocker" role="alert">
       <el-icon><Warning /></el-icon><span><strong>计划与运输不一致</strong>请重新建立并审批参考包，旧结果不能作为本次镜头产物。</span>
+    </div>
+    <div v-else-if="view.advisory" class="continuity-advisory" role="status">
+      <el-icon><Warning /></el-icon><span><strong>当前选择仍可继续</strong>{{ view.advisory }}</span>
     </div>
   </section>
 </template>
@@ -97,14 +97,13 @@ const modeValue = computed({
   set: (value) => emit('update:mode', value),
 })
 const compatibilityLabel = computed(() => {
-  if (!view.value.route.model) return '等待兼容模型'
+  if (!view.value.route.model) return '能力待上游确认'
   if (view.value.firstFrameSupport === true) return '模型支持 first_frame'
-  if (view.value.firstFrameSupport === false) return '模型不支持 first_frame'
-  return '能力目录待核对'
+  if (view.value.firstFrameSupport === false) return '本地提示：可能不支持 first_frame'
+  return '能力待上游确认'
 })
 const compatibilityTone = computed(() => {
   if (view.value.firstFrameSupport === true) return 'success'
-  if (view.value.firstFrameSupport === false) return 'danger'
   return 'warning'
 })
 const frameReceipt = computed(() => {
@@ -144,7 +143,8 @@ const boundaryReceipt = computed(() => {
 
 <style scoped>
 .continuity-panel { display: grid; gap: 11px; margin: 0 0 14px; padding: 14px; border: 1px solid #d6e1df; background: #fbfdfc; color: #304a47; }
-.continuity-panel.has-blocker, .continuity-panel.has-mismatch { border-color: #e0c2b9; background: #fffaf8; }
+.continuity-panel.has-advisory { border-color: #dec78d; background: #fffdf7; }
+.continuity-panel.has-mismatch { border-color: #e0c2b9; background: #fffaf8; }
 .continuity-heading, .continuity-heading > div, .continuity-heading > div > span, .continuity-media-title, .continuity-media-title > span { display: flex; align-items: center; gap: 7px; }
 .continuity-heading { justify-content: space-between; }
 .continuity-heading > div > .el-icon { color: #16766b; font-size: 18px; }
@@ -174,11 +174,12 @@ const boundaryReceipt = computed(() => {
 .continuity-transport-grid small { color: #7f8d8a; font-size: 9px; }
 .continuity-transport-grid strong { font-size: 12px; }
 .continuity-transport-grid span { color: #687975; font-size: 10px; line-height: 1.5; }
-.continuity-dispatch-receipt, .continuity-boundary-receipt, .continuity-blocker { display: grid; grid-template-columns: 20px minmax(0, 1fr); align-items: start; gap: 6px; padding: 8px 9px; font-size: 10px; line-height: 1.5; }
+.continuity-dispatch-receipt, .continuity-boundary-receipt, .continuity-blocker, .continuity-advisory { display: grid; grid-template-columns: 20px minmax(0, 1fr); align-items: start; gap: 6px; padding: 8px 9px; font-size: 10px; line-height: 1.5; }
 .continuity-dispatch-receipt { color: #36705f; background: #eef7f3; }
-.continuity-dispatch-receipt span, .continuity-blocker span { display: grid; gap: 2px; }
+.continuity-dispatch-receipt span, .continuity-blocker span, .continuity-advisory span { display: grid; gap: 2px; }
 .continuity-boundary-receipt { grid-template-columns: auto minmax(0, 1fr); color: #536c67; background: #f3f6f5; }
 .continuity-blocker { color: #984f40; background: #fff0ec; }
+.continuity-advisory { color: #80601e; background: #fff6da; }
 @media (max-width: 560px) {
   .continuity-heading { align-items: flex-start; flex-direction: column; }
   .continuity-mode-control :deep(.el-radio-group), .continuity-media-grid, .continuity-transport-grid { grid-template-columns: 1fr; }

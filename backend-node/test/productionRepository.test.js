@@ -377,6 +377,52 @@ describe('production workflow repository', () => {
     }), /超过预算/);
   });
 
+  it('releases a definitively rejected video reservation exactly once after local waiting state', () => {
+    const run = makeRun({ idempotency_key: 'rejected-video-release' });
+    const action = repo.reserveAction(db, {
+      run_id: run.id,
+      action_key: 'shot:1:rejected:a1',
+      stage: 'shot_video',
+      scope_type: 'shot',
+      scope_id: '1',
+      kind: 'video_generate',
+      request: { model: 'seedance-test' },
+      reserved_video_seconds: 5,
+      cost: {
+        provider: 'yinzi', service_type: 'video', model: 'seedance-test',
+        billing_unit: 'per_second', units: 5, estimated_microusd: 500000,
+      },
+    }).action;
+    repo.updateAction(db, action.id, {
+      status: 'waiting', task_id: 'local-task', generation_id: 91,
+    });
+
+    const released = repo.releaseUnacceptedVideoAction(db, action.id, {
+      submission_status: 'rejected',
+      error_code: 'VIDEO_SUBMISSION_REJECTED',
+      error_message: 'HTTP 400 unsupported_media_reference',
+      result: { submission_http_status: 400 },
+    });
+    assert.equal(released.status, 'failed');
+    assert.equal(released.result.reservation_released, true);
+    assert.equal(released.result.submission_status, 'rejected');
+    assert.deepEqual(repo.getRun(db, run.id).usage, {
+      video_attempts_reserved: 0,
+      video_seconds_reserved: 0,
+    });
+    assert.equal(db.prepare('SELECT status FROM cost_ledger WHERE action_id = ?').get(action.id).status, 'released');
+
+    const repeated = repo.releaseUnacceptedVideoAction(db, action.id, {
+      submission_status: 'rejected',
+      error_message: 'same rejection observed again',
+    });
+    assert.equal(repeated.result.reservation_released, true);
+    assert.deepEqual(repo.getRun(db, run.id).usage, {
+      video_attempts_reserved: 0,
+      video_seconds_reserved: 0,
+    });
+  });
+
   it('returns the latest scoped provider action separately from paginated history', () => {
     const run = makeRun({ idempotency_key: 'current-provider-action' });
     repo.updateRun(db, run.id, {

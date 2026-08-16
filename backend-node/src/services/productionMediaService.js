@@ -3,6 +3,7 @@ const path = require('node:path');
 const repo = require('./productionRepository');
 const imageService = require('./imageService');
 const videoService = require('./videoService');
+const videoClient = require('./videoClient');
 const taskService = require('./taskService');
 const validation = require('./productionMediaValidation');
 const boundaryFrames = require('./productionBoundaryFrames');
@@ -11,11 +12,13 @@ const promptRegistry = require('./productionPromptRegistry');
 const promptRuntime = require('./productionPromptRuntime');
 const accounting = require('./productionRuntimeAccounting');
 const costLedger = require('./productionCostLedger');
+const { archiveDetachedVideoGeneration } = require('./productionDetachedMedia');
 const {
   getYinziVideoCapability,
   capabilitySupportsRole,
 } = require('./yinziVideoCapabilities');
-const { fetchYinziCatalog } = require('./yinziService');
+const { fetchYinziCatalog, fetchYinziCatalogForConfig } = require('./yinziService');
+const aiConfigService = require('./aiConfigService');
 const {
   listShotVideoRouteOptions,
   selectShotVideoRoute,
@@ -166,6 +169,9 @@ function assertVideoDispatchContract({ run, shot, route, bundle, request, persis
     persisted_generation_model: persistedGenerationModel || null,
     bundle_artifact_id: Number(bundle.id),
     routing_material_signature: routeSignature,
+    contract_status: route?.contract_status || 'missing',
+    contract_warnings: Array.isArray(route?.contract_warnings) ? route.contract_warnings : [],
+    reference_warnings: Array.isArray(request?.reference_warnings) ? request.reference_warnings : [],
   };
 }
 
@@ -691,6 +697,7 @@ function isAmbiguousImageGenerationFailure(generation) {
 
 function selectGenerationAction(action, source, replacementTarget, options = {}) {
   if (!action) return { action: null, blocked: null };
+  if (action.result?.detached_from_sequence === true) return { action: null, blocked: null, detached: action };
   if (action.status === 'ambiguous') return { action, blocked: null };
   const sourceArtifactId = action.result?.source_artifact_id ?? action.request?.source_artifact_id;
   const sourceChanged = sourceArtifactId != null && Number(sourceArtifactId) !== Number(source.id);
@@ -725,14 +732,36 @@ function createDefaultAdapters(db, cfg, log) {
       return imageService.getById(db, id);
     },
     createVideo(request) {
+      const videoConfig = videoClient.getDefaultVideoConfig(db, request.model, request.video_config_id);
+      if (!videoConfig) {
+        const suffix = request.video_config_id == null
+          ? '请先在设置中添加并启用视频 URL / Key 配置'
+          : `视频配置 #${request.video_config_id} 不存在、不是视频配置或已停用，请重新选择配置`;
+        throw codedError('VIDEO_CONFIG_UNAVAILABLE', suffix);
+      }
       const task = taskService.createTask(db, log, 'video_generation', String(request.drama_id || ''));
       const timestamp = new Date().toISOString();
+      const videoConfigId = videoConfig.id;
+      const providerProtocol = videoClient.resolveVideoProtocol(videoConfig, request.model);
+      const providerConfigSnapshot = {
+        config_id: videoConfig.id,
+        provider: videoConfig.provider || null,
+        api_protocol: videoConfig.api_protocol || null,
+        base_url: videoConfig.base_url || null,
+        endpoint: videoConfig.endpoint || null,
+        query_endpoint: videoConfig.query_endpoint || null,
+        model: request.model || videoConfig.default_model || null,
+      };
       const info = db.prepare(
         `INSERT INTO video_generations (
           drama_id, storyboard_id, provider, prompt, prompt_contract_json, model, duration, aspect_ratio, resolution,
           seed, camera_fixed, watermark, first_frame_url, last_frame_url, reference_image_urls,
-          reference_video_urls, reference_audio_urls, status, task_id, created_at, updated_at
-        ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'processing', ?, ?, ?)`
+          reference_video_urls, reference_audio_urls, status, generation_status, download_status,
+          video_config_id, provider_protocol, provider_config_snapshot_json,
+          submission_status, submission_http_status, submission_receipt_json, contract_validation_mode,
+          task_id, created_at, updated_at
+        ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'processing', 'processing',
+          'pending', ?, ?, ?, 'not_sent', NULL, NULL, ?, ?, ?, ?)`
       ).run(
         Number(request.drama_id) || 0,
         request.provider || 'yinzi',
@@ -750,6 +779,10 @@ function createDefaultAdapters(db, cfg, log) {
         JSON.stringify(request.reference_image_urls || []),
         JSON.stringify(request.reference_video_urls || []),
         JSON.stringify(request.reference_audio_urls || []),
+        videoConfigId,
+        providerProtocol,
+        JSON.stringify(providerConfigSnapshot),
+        videoClient.normalizeContractValidationMode(request.contract_validation_mode || 'advisory'),
         task.id,
         timestamp,
         timestamp
@@ -799,7 +832,27 @@ function createDefaultAdapters(db, cfg, log) {
         cache_reused: prepared.cache_reused === true,
       };
     },
-    fetchVideoCatalog: () => fetchYinziCatalog(),
+    async fetchVideoCatalog(run = null) {
+      const configId = Number(run?.policy?.video_config_id || 0);
+      if (!Number.isSafeInteger(configId) || configId <= 0) return fetchYinziCatalog();
+      const config = aiConfigService.getConfig(db, configId);
+      if (!config || config.service_type !== 'video' || config.is_active === false) {
+        const error = new Error(`视频配置 #${configId} 不存在、不是视频配置或已停用`);
+        error.code = 'VIDEO_CONFIG_UNAVAILABLE';
+        throw error;
+      }
+      const discovery = await aiConfigService.discoverModels(config, { db });
+      let pricing = null;
+      if (String(config.provider || '').toLowerCase() === 'yinzi') {
+        try { pricing = await fetchYinziCatalogForConfig(config); } catch (_) { pricing = null; }
+      }
+      return aiConfigService.mergeDiscoveredCatalog(discovery, pricing, {
+        provider: config.provider,
+        service_type: 'video',
+        group: run?.policy?.video_group || '',
+        capability_overrides: aiConfigService.getModelCapabilityOverrides(config),
+      });
+    },
   };
 }
 
@@ -1113,12 +1166,12 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
   const resolveVideoCapability = injected.getVideoCapability || getYinziVideoCapability;
 
   async function resolveShotVideoRoute(run, shot) {
-    const catalog = catalogWithStoredVideoPrices(db, await adapters.fetchVideoCatalog(), run);
+    const catalog = catalogWithStoredVideoPrices(db, await adapters.fetchVideoCatalog(run), run);
     return selectShotVideoRoute({ shot, catalog, policy: run.policy || {} });
   }
 
   async function listVideoRoutingOptions(run, shot) {
-    const catalog = catalogWithStoredVideoPrices(db, await adapters.fetchVideoCatalog(), run);
+    const catalog = catalogWithStoredVideoPrices(db, await adapters.fetchVideoCatalog(run), run);
     return {
       pricing_version: String(catalog?.pricing_version || ''),
       fetched_at: catalog?.fetched_at || null,
@@ -1765,27 +1818,35 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
     const continuityVideo = usesContinuityFrame && previousShot
       ? shotVideos.find((item) => item.scope_id === previousShot.scope_id)
       : null;
+    const referenceWarnings = [];
     if (strictFirstFrame && !capabilitySupportsRole(capability, 'image', 'first_frame')) {
-      throw codedError(
-        'STRICT_FIRST_FRAME_UNSUPPORTED',
-        `当前视频模型 ${route.model || '未选择'} 不支持严格首帧；请把镜头 ${shot.scope_id} 改为硬切，或选择明确支持 first_frame 的模型`
-      );
+      referenceWarnings.push('strict_first_frame_unsupported');
     }
     if (usesContinuityFrame && !continuityVideo) {
-      throw codedError(
-        'PREDECESSOR_VIDEO_REQUIRED',
-        `镜头 ${shot.scope_id} 必须等上一镜头正式视频确认后才能提取衔接尾帧`
-      );
+      // Keep the user's continuity choice, but do not force a predecessor
+      // video to exist before the bundle can be edited or submitted.
+      referenceWarnings.push('predecessor_video_missing');
     }
-    const continuityFrame = usesContinuityFrame
-      ? await ensureContinuityFrame(run, shot, continuityVideo)
-      : null;
+    let continuityFrame = null;
+    if (usesContinuityFrame && continuityVideo) {
+      try {
+        continuityFrame = await ensureContinuityFrame(run, shot, continuityVideo);
+      } catch (error) {
+        // Extraction is an optional suggestion.  Preserve the source error as
+        // a warning and let the user submit without the derived frame.
+        referenceWarnings.push('continuity_frame_unavailable');
+        log.warn?.('Optional continuity frame could not be prepared', {
+          run_id: run.id,
+          shot: shot.scope_id,
+          source_artifact_id: continuityVideo.id,
+          error: error.message,
+        });
+      }
+    }
     const storyboardImage = storyboardImages.find((item) => item.scope_id === shot.scope_id);
     const preview = previews.find((item) => item.scope_id === shot.scope_id);
-    if (!storyboardImage?.media_path) throw new Error(`Shot ${shot.scope_id} is missing an approved storyboard image`);
-    if (route.requires_director_preview && !preview?.media_path) {
-      throw new Error(`Shot ${shot.scope_id} requires an approved director preview`);
-    }
+    if (!storyboardImage?.media_path) referenceWarnings.push('storyboard_image_missing');
+    if (route.requires_director_preview && !preview?.media_path) referenceWarnings.push('director_preview_missing');
     const imageRefs = [];
     if (continuityFrame?.media_path) {
       imageRefs.push({
@@ -1797,14 +1858,18 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
         locked: true,
       });
     }
-    imageRefs.push({
-      path: storyboardImage.media_path,
-      artifact_id: storyboardImage.id,
-      label: '当前分镜图',
-      source: 'storyboard',
-      role: 'reference',
-    });
-    const imageLimit = Number(capability?.max_images || route.limits?.images || 4);
+    if (storyboardImage?.media_path) {
+      imageRefs.push({
+        path: storyboardImage.media_path,
+        artifact_id: storyboardImage.id,
+        label: '当前分镜图',
+        source: 'storyboard',
+        role: 'reference',
+      });
+    }
+    const imageLimit = Number.isFinite(Number(capability?.max_images || route.limits?.images))
+      ? Number(capability?.max_images || route.limits?.images)
+      : 4;
     const autoLink = buildImageReferenceAutoLink(db, run, shot, Math.max(0, imageLimit - imageRefs.length), {
       providerImageLimit: imageLimit,
       mandatoryImageCount: imageRefs.length,
@@ -1822,14 +1887,16 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
         source_duration_seconds: artifactVideoDuration(preview),
       });
     }
-    const videoLimit = Number(capability?.max_videos || route.limits?.videos || 0);
+    const videoLimit = Number.isFinite(Number(capability?.max_videos || route.limits?.videos))
+      ? Number(capability?.max_videos || route.limits?.videos)
+      : 1;
     const videoBudget = route.uses_reference_video
       ? await applyReferenceVideoBudget(run, capability, videoRefs.slice(0, videoLimit))
       : { videos: [], receipt: { enforced: false, reason: 'reference_video_not_selected' } };
     const { capability: _capability, ...routingReceipt } = route;
     const dependencyIds = [...new Set([
       shot.id,
-      storyboardImage.id,
+      ...(storyboardImage?.id ? [storyboardImage.id] : []),
       ...(preview?.id && route.requires_director_preview ? [preview.id] : []),
       ...(continuityVideo ? [continuityVideo.id] : []),
       ...(continuityFrame ? [continuityFrame.id] : []),
@@ -1857,12 +1924,22 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
         uses_reference_video: route.uses_reference_video,
         requires_director_preview: route.requires_director_preview,
         bundle_origin: 'automatic_suggestion',
-        limits: {
-          images: Number(capability?.max_images || route.limits?.images || 4),
-          videos: route.uses_reference_video
-            ? Number(capability?.max_videos || route.limits?.videos || 0)
-            : 0,
-          audios: Number(capability?.max_audios || route.limits?.audios || 0),
+        limits: capability ? {
+          images: Number(capability.max_images),
+          videos: route.uses_reference_video ? Number(capability.max_videos || 0) : 0,
+          audios: Number(capability.max_audios),
+        } : null,
+        soft_limits: !capability,
+        reference_warnings: [...new Set(referenceWarnings)],
+        media_constraints: {
+          contract_status: capability ? 'known' : 'unknown',
+          max_image_bytes: Number.isFinite(Number(capability?.max_image_bytes)) ? Number(capability.max_image_bytes) : null,
+          max_video_bytes: Number.isFinite(Number(capability?.max_video_bytes)) ? Number(capability.max_video_bytes) : null,
+          max_audio_bytes: Number.isFinite(Number(capability?.max_audio_bytes)) ? Number(capability.max_audio_bytes) : null,
+          max_total_references: Number.isFinite(Number(capability?.max_total_references)) ? Number(capability.max_total_references) : null,
+          max_reference_video_seconds_total: Number.isFinite(Number(capability?.max_reference_video_seconds_total))
+            ? Number(capability.max_reference_video_seconds_total)
+            : null,
         },
         included: true,
       },
@@ -1874,15 +1951,11 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
     if (!bundle || !['draft', 'reviewing', 'approved'].includes(bundle.status)) return false;
     if (Number(bundle.content?.source_artifact_id) !== Number(desired.content.source_artifact_id)) return false;
     if (bundle.status === 'approved') {
-      const limits = desired.content.limits || { images: 0, videos: 0, audios: 0 };
-      const buckets = [
-        ['images', Number(limits.images || 0)],
-        ['videos', Number(limits.videos || 0)],
-        ['audios', Number(limits.audios || 0)],
-      ];
-      for (const [key, limit] of buckets) {
+      // An approved bundle is the user's explicit media selection.  Do not
+      // recreate it just because it is empty, exceeds a locally cached
+      // contract, or omits an optional continuity/director asset.
+      for (const key of ['images', 'videos', 'audios']) {
         const items = Array.isArray(bundle.content?.[key]) ? bundle.content[key] : [];
-        if (items.length > limit) return false;
         for (const item of items) {
           if (!String(item?.path || '').trim()) return false;
           if (item.artifact_id != null) {
@@ -1892,24 +1965,19 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
           }
         }
       }
-      if (desired.content.uses_reference_video === false && (bundle.content?.videos || []).length) return false;
       if (String(bundle.content?.routing_material_signature || '') !== String(desired.content.routing_material_signature || '')) return false;
       if (String(bundle.content?.transition_mode || '') !== String(desired.content.transition_mode || '')) return false;
-      const desiredStrictFrameId = Number(desired.content.strict_first_frame_artifact_id || 0);
-      const actualStrictFrame = (bundle.content?.images || []).find((item) => item.role === 'first_frame');
-      if (desiredStrictFrameId && Number(actualStrictFrame?.artifact_id || 0) !== desiredStrictFrameId) return false;
-      if (!desiredStrictFrameId && actualStrictFrame) return false;
-      const desiredContinuityFrameId = Number(desired.content.continuity_frame_artifact_id || 0);
-      const actualContinuityFrame = (bundle.content?.images || []).find((item) => (
-        ['strict_first_frame', 'continuity_first_frame'].includes(item.source)
-      ));
-      if (desiredContinuityFrameId
-        && Number(actualContinuityFrame?.artifact_id || 0) !== desiredContinuityFrameId) return false;
-      if (!desiredContinuityFrameId && actualContinuityFrame) return false;
-      if (String(bundle.content?.continuity_frame_transport || 'none')
-        !== String(desired.content.continuity_frame_transport || 'none')) return false;
       const actualDependencies = repo.listUpstreamArtifactIds(db, bundle.id);
       return actualDependencies.some((id) => Number(id) === Number(desired.content.source_artifact_id));
+    }
+    const manualBundle = ['manual', 'manual_revision'].includes(String(bundle.content?.bundle_origin || ''))
+      || Boolean(bundle.content?.revision_source?.type === 'user_edit');
+    if (manualBundle
+      && String(bundle.content?.routing_material_signature || '') === String(desired.content.routing_material_signature || '')
+      && String(bundle.content?.transition_mode || '') === String(desired.content.transition_mode || '')) {
+      // A saved manual draft/review is also authoritative for its media
+      // arrays.  Polling must not silently put automatic suggestions back.
+      return true;
     }
     const bundleImageIds = (bundle.content?.images || []).map((item) => item.artifact_id);
     const desiredImageIds = desired.content.images.map((item) => item.artifact_id);
@@ -2096,6 +2164,114 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
     return { reused: false, artifact, receipt };
   }
 
+  function currentShotPlan(runId, scopeId) {
+    return currentArtifacts(db, runId, 'storyboard_plan')
+      .find((item) => String(item.scope_id) === String(scopeId)) || null;
+  }
+
+  function actionIsDetachedFromSequence(action, shot) {
+    if (action?.result?.detached_from_sequence === true) return true;
+    const liveShot = currentShotPlan(action?.run_id || shot?.run_id, shot?.scope_id);
+    return Boolean(liveShot && liveShot.content?.included === false);
+  }
+
+  function videoSubmissionStatus(generation) {
+    const status = String(generation?.submission_status || '').trim().toLowerCase();
+    if (['not_sent', 'rejected', 'accepted', 'ambiguous'].includes(status)) return status;
+    if (generation?.provider_task_id) return 'accepted';
+    return 'ambiguous';
+  }
+
+  function failVideoActionFromGeneration(action, generation, input = {}) {
+    const submissionStatus = videoSubmissionStatus(generation);
+    const errorMessage = input.error_message
+      || generation?.error_msg
+      || generation?.error_message
+      || '视频生成失败';
+    const result = {
+      ...(action.result || {}),
+      ...(input.result || {}),
+      generation_id: generation?.id || action.generation_id || null,
+      generation_status: generation?.generation_status || generation?.status || null,
+      submission_status: submissionStatus,
+      submission_http_status: generation?.submission_http_status ?? null,
+      submission_receipt: generation?.submission_receipt || null,
+    };
+    if (['not_sent', 'rejected'].includes(submissionStatus) && !generation?.provider_task_id) {
+      return repo.releaseUnacceptedVideoAction(db, action.id, {
+        submission_status: submissionStatus,
+        error_code: input.error_code || 'VIDEO_SUBMISSION_REJECTED',
+        error_message: errorMessage,
+        result,
+      });
+    }
+    if (submissionStatus === 'ambiguous' && !generation?.provider_task_id) {
+      return repo.updateAction(db, action.id, {
+        status: 'ambiguous',
+        error_code: input.ambiguous_error_code || 'VIDEO_CREATE_AMBIGUOUS',
+        error_message: errorMessage,
+        cost_status: 'uncertain',
+        result,
+      });
+    }
+    return repo.updateAction(db, action.id, {
+      status: 'failed',
+      ...(generation?.provider_task_id ? { provider_id: generation.provider_task_id } : {}),
+      error_code: input.error_code || 'VIDEO_GENERATION_FAILED',
+      error_message: errorMessage,
+      result,
+    });
+  }
+
+  function settleDetachedVideoAction(action, generation, shot, receipt = null) {
+    const detachedAt = action.result?.detached_at || new Date().toISOString();
+    const detachedResult = {
+      ...(action.result || {}),
+      source_artifact_id: action.result?.source_artifact_id ?? action.request?.source_artifact_id ?? shot?.id ?? null,
+      bundle_artifact_id: action.result?.bundle_artifact_id ?? action.request?.bundle_artifact_id ?? null,
+      detached_from_sequence: true,
+      detached_reason: action.result?.detached_reason || 'shot_excluded_while_video_active',
+      detached_at: detachedAt,
+      workflow_blocking: false,
+      generation_id: generation?.id || action.generation_id || null,
+      generation_status: generation?.status || null,
+      ...(receipt ? { receipt } : {}),
+    };
+    if (!generation || ['pending', 'processing'].includes(generation.status)) {
+      const updated = repo.updateAction(db, action.id, {
+        ...(generation?.provider_task_id && generation.provider_task_id !== action.provider_id
+          ? { provider_id: generation.provider_task_id }
+          : {}),
+        result: detachedResult,
+      });
+      return { state: 'progressed', reason: 'detached_video_waiting', detached: true, action: updated, generation };
+    }
+    if (generation.status !== 'completed') {
+      const updated = failVideoActionFromGeneration(action, generation, {
+        error_code: 'DETACHED_VIDEO_GENERATION_FAILED',
+        error_message: generation.error_msg || generation.error_message || '已跳过镜头的视频生成失败',
+        result: detachedResult,
+      });
+      return { state: 'progressed', reason: 'detached_video_failed', detached: true, action: updated, generation };
+    }
+    const updated = repo.updateAction(db, action.id, {
+      status: 'completed', error_code: null, error_message: null, result: detachedResult,
+    });
+    const archived = archiveDetachedVideoGeneration(db, {
+      generation_id: generation.id || action.generation_id,
+      local_path: receipt?.relative_path || generation.local_path || null,
+      remote_url: generation.video_url || generation.remote_video_url || null,
+    });
+    return {
+      state: 'progressed',
+      reason: 'detached_video_archived',
+      detached: true,
+      action: updated,
+      generation,
+      archived_artifacts: archived,
+    };
+  }
+
   async function ensureShotVideos(run) {
     const shots = scopeShotItems(
       approvedIncluded(db, run.id, 'storyboard_plan').sort(compareShots),
@@ -2143,7 +2319,7 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
         return { state: 'waiting_review', reason, action: blockedAction, shot };
       }
       action = selection.action;
-      const actionSourceChanged = selection.sourceChanged === true;
+      let actionSourceChanged = selection.sourceChanged === true;
       let route = action?.request?.routing_receipt
         ? {
           ...action.request.routing_receipt,
@@ -2182,16 +2358,6 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
             payload: { artifact_id: bundle.id, reason },
           });
           return { state: 'waiting_review', reason, artifact: bundle, shot };
-        }
-        const refs = bundle.content || {};
-        const limits = refs.limits || route.limits || { images: 4, videos: 3, audios: 1 };
-        if ((refs.images || []).length > Number(limits.images)
-          || (refs.videos || []).length > Number(limits.videos)
-          || (refs.audios || []).length > Number(limits.audios)) {
-          throw new Error(`Shot ${shot.scope_id} reference media exceeds the ${limits.images}/${limits.videos}/${limits.audios} limit`);
-        }
-        if (!route.uses_reference_video && (refs.videos || []).length) {
-          throw codedError('VIDEO_ROUTE_REFERENCE_UNSUPPORTED', `短镜头 ${shot.scope_id} 不允许上传参考视频`);
         }
         const attempt = repo.nextActionAttempt(db, run.id, 'shot_video', 'shot', shot.scope_id, 'video_generate');
         const sourceAttempt = sourceGenerationAttemptCount(db, run.id, 'shot_video', shot, 'video_generate') + 1;
@@ -2260,30 +2426,24 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
         duration = Number(route?.duration || shot.content.duration);
         if (!model) throw new Error(`镜头 ${shot.scope_id} 没有可用的视频模型`);
         const dispatchRefs = bundle.content || {};
-        const dispatchLimits = dispatchRefs.limits || route.limits || { images: 4, videos: 3, audios: 1 };
-        if ((dispatchRefs.images || []).length > Number(dispatchLimits.images)
-          || (dispatchRefs.videos || []).length > Number(dispatchLimits.videos)
-          || (dispatchRefs.audios || []).length > Number(dispatchLimits.audios)) {
-          throw codedError('VIDEO_DISPATCH_CONTRACT_MISMATCH', '参考包在提交前超过了当前模型的媒体数量上限');
+        const dispatchLimits = dispatchRefs.limits || route.limits || {};
+        const dispatchWarnings = [
+          ...(Array.isArray(route.contract_warnings) ? route.contract_warnings : []),
+          ...(Array.isArray(dispatchRefs.reference_warnings) ? dispatchRefs.reference_warnings : []),
+        ];
+        for (const [key, warning] of [['images', 'image_count_over_contract'], ['videos', 'video_count_over_contract'], ['audios', 'audio_count_over_contract']]) {
+          if (Number.isFinite(Number(dispatchLimits[key])) && (dispatchRefs[key] || []).length > Number(dispatchLimits[key])) dispatchWarnings.push(warning);
         }
-        if (!route.uses_reference_video && (dispatchRefs.videos || []).length) {
-          throw codedError('VIDEO_ROUTE_REFERENCE_UNSUPPORTED', `短镜头 ${shot.scope_id} 不允许上传参考视频`);
-        }
+        if (!(dispatchRefs.images || []).length) dispatchWarnings.push('reference_image_missing');
+        if (route.uses_reference_video && !(dispatchRefs.videos || []).length) dispatchWarnings.push('reference_video_missing');
+        if (!route.uses_reference_video && (dispatchRefs.videos || []).length) dispatchWarnings.push('reference_video_not_declared');
         const transitionMode = transitionModeForShot(shot);
         const strictFirstFrame = (dispatchRefs.images || []).find((item) => item.role === 'first_frame');
         const continuityReference = (dispatchRefs.images || []).find((item) => item.source === 'continuity_first_frame');
-        if (transitionMode === 'strict_continuation' && !strictFirstFrame?.path) {
-          throw codedError('STRICT_FIRST_FRAME_MISSING', `镜头 ${shot.scope_id} 的参考包缺少派生严格首帧`);
-        }
-        if (transitionMode === 'reference_continuation' && !continuityReference?.path) {
-          throw codedError('CONTINUITY_FRAME_MISSING', `镜头 ${shot.scope_id} 选择了尾帧参考续接，但参考包缺少上一镜尾帧`);
-        }
-        if (strictFirstFrame && !capabilitySupportsRole(capability, 'image', 'first_frame')) {
-          throw codedError(
-            'STRICT_FIRST_FRAME_UNSUPPORTED',
-            `当前视频模型 ${model} 不支持严格首帧，已在付费提交前停止`
-          );
-        }
+        if (transitionMode === 'strict_continuation' && !strictFirstFrame?.path) dispatchWarnings.push('strict_first_frame_missing');
+        if (transitionMode === 'reference_continuation' && !continuityReference?.path) dispatchWarnings.push('continuity_frame_missing');
+        if (strictFirstFrame && !capabilitySupportsRole(capability, 'image', 'first_frame')) dispatchWarnings.push('strict_first_frame_unsupported');
+        if (route.requires_director_preview && !(dispatchRefs.videos || []).length) dispatchWarnings.push('director_preview_missing');
         const promptPackage = buildProviderPromptPackage(
           db,
           dispatchRun,
@@ -2295,6 +2455,8 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
         const request = {
           drama_id: dispatchRun.drama_id,
           provider: dispatchRun.policy?.video_provider || 'yinzi',
+          video_config_id: dispatchRun.policy?.video_config_id || null,
+          contract_validation_mode: 'advisory',
           model,
           duration,
           aspect_ratio: dispatchRun.policy?.aspect_ratio || '16:9',
@@ -2309,11 +2471,12 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
           watermark: false,
           first_frame_url: strictFirstFrame?.path,
           reference_image_urls: (dispatchRefs.images || [])
-            .filter((item) => item.role !== 'first_frame')
+            .filter((item) => transitionMode !== 'strict_continuation' || item.role !== 'first_frame')
             .map((item) => item.path),
           reference_video_urls: (dispatchRefs.videos || []).map((item) => item.path),
           reference_audio_urls: (dispatchRefs.audios || []).map((item) => item.path),
           reference_video_budget: dispatchRefs.reference_video_budget || null,
+          reference_warnings: [...new Set(dispatchWarnings)],
           routing_receipt: (() => { const { capability: _capability, ...receipt } = route; return receipt; })(),
           routing_material_signature: routingMaterialSignature(route),
         };
@@ -2330,7 +2493,7 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
         try { created = await adapters.createVideo(request); }
         catch (error) {
           repo.updateAction(db, action.id, {
-            status: 'failed', error_code: 'VIDEO_CREATE_FAILED', error_message: error.message,
+            status: 'failed', error_code: error.code || 'VIDEO_CREATE_FAILED', error_message: error.message,
             cost_status: 'released',
             result: {
               source_artifact_id: shot.id,
@@ -2372,6 +2535,14 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
       }
       if (['reserved', 'submitted', 'waiting'].includes(action.status)) {
         const generation = action.generation_id ? await adapters.getVideo(action.generation_id) : null;
+        action = repo.getAction(db, action.id) || action;
+        if (actionIsDetachedFromSequence(action, shot)) {
+          return settleDetachedVideoAction(action, generation, shot);
+        }
+        const liveShotAfterPoll = currentShotPlan(run.id, shot.scope_id);
+        if (liveShotAfterPoll && Number(liveShotAfterPoll.id) !== Number(shot.id)) {
+          actionSourceChanged = true;
+        }
         const capturedBundleId = Number(action.result?.bundle_artifact_id ?? action.request?.bundle_artifact_id);
         const liveRun = repo.getRun(db, run.id);
         const liveBundle = currentArtifacts(db, run.id, 'reference_bundle')
@@ -2400,13 +2571,26 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
         }
         if (generation.status !== 'completed' && !actionRouteSuperseded) {
           const errorMessage = generation.error_msg || '视频生成失败';
-          repo.updateAction(db, action.id, { status: 'failed', error_code: 'VIDEO_GENERATION_FAILED', error_message: errorMessage });
-          repo.updateRun(db, run.id, { status: 'waiting_review', waiting_reason: 'video_generation_failed', error_code: 'VIDEO_GENERATION_FAILED', error_message: errorMessage });
-          return { state: 'waiting_review', reason: 'video_generation_failed', generation };
+          const failedAction = failVideoActionFromGeneration(action, generation, {
+            error_code: 'VIDEO_GENERATION_FAILED',
+            error_message: errorMessage,
+          });
+          const ambiguous = failedAction.status === 'ambiguous';
+          const reason = ambiguous ? 'ambiguous_video_create' : 'video_generation_failed';
+          const errorCode = ambiguous ? 'VIDEO_CREATE_AMBIGUOUS' : 'VIDEO_GENERATION_FAILED';
+          repo.updateRun(db, run.id, {
+            status: 'waiting_review', waiting_reason: reason,
+            error_code: errorCode, error_message: errorMessage,
+          });
+          return { state: 'waiting_review', reason, generation, action: failedAction };
         }
         const completionRun = repo.getRun(db, run.id);
         const completionVersion = Number(completionRun.version);
         const bundleState = await ensureReferenceBundleForShot(completionRun, shot);
+        action = repo.getAction(db, action.id) || action;
+        if (actionIsDetachedFromSequence(action, shot)) {
+          return settleDetachedVideoAction(action, generation, shot);
+        }
         const afterBundleRun = repo.getRun(db, run.id);
         const bundle = currentArtifacts(db, run.id, 'reference_bundle')
           .find((item) => item.scope_id === shot.scope_id) || bundleState.artifact;
@@ -2423,11 +2607,26 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
           const staleMessage = providerFailed
             ? (generation.error_msg || '旧模型视频生成失败；当前模型路由已变化，失败只保留为历史')
             : `Reference bundle changed before generation ${generation.id} completed`;
-          repo.updateAction(db, action.id, {
-            status: providerFailed ? 'failed' : 'completed',
-            error_code: providerFailed ? 'SUPERSEDED_VIDEO_GENERATION_FAILED' : null,
-            error_message: providerFailed ? staleMessage : null,
-            result: {
+          if (providerFailed) {
+            failVideoActionFromGeneration(action, generation, {
+              error_code: 'SUPERSEDED_VIDEO_GENERATION_FAILED',
+              error_message: staleMessage,
+              result: {
+                generation_id: generation.id,
+                generation_status: generation.status,
+                superseded_by_route_change: true,
+                superseded_by_source_change: actionSourceChanged,
+                superseded_by_artifact_id: actionSourceChanged ? shot.id : null,
+                stale_bundle_artifact_id: Number.isInteger(capturedBundleId) ? capturedBundleId : null,
+                current_bundle_artifact_id: bundle?.id || null,
+              },
+            });
+          } else {
+            repo.updateAction(db, action.id, {
+              status: 'completed',
+              error_code: null,
+              error_message: null,
+              result: {
               ...(action.result || {}),
               generation_id: generation.id,
               generation_status: generation.status,
@@ -2437,7 +2636,8 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
               stale_bundle_artifact_id: Number.isInteger(capturedBundleId) ? capturedBundleId : null,
               current_bundle_artifact_id: bundle?.id || null,
             },
-          });
+            });
+          }
           repo.updateRun(db, run.id, {
             current_stage: bundle?.status === 'approved' ? 'shot_video' : 'reference_bundle',
             current_scope_type: 'shot', current_scope_id: String(shot.scope_id),
@@ -2469,6 +2669,10 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
           duration_tolerance: Math.max(1.2, duration * 0.25),
           expected_aspect_ratio: normalizeProductionAspectRatio(afterBundleRun.policy?.aspect_ratio),
         });
+        action = repo.getAction(db, action.id) || action;
+        if (actionIsDetachedFromSequence(action, shot)) {
+          return settleDetachedVideoAction(action, generation, shot, receipt);
+        }
         const transitionMode = transitionModeForShot(shot);
         let boundaryValidation = { mode: transitionMode, evaluated: transitionMode === 'opening' ? false : true };
         if (transitionMode === 'strict_continuation') {
@@ -2535,6 +2739,10 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
               });
             }
           }
+        }
+        action = repo.getAction(db, action.id) || action;
+        if (actionIsDetachedFromSequence(action, shot)) {
+          return settleDetachedVideoAction(action, generation, shot, receipt);
         }
         const finalRun = repo.getRun(db, run.id);
         const finalBundle = currentArtifacts(db, run.id, 'reference_bundle')
