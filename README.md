@@ -2,7 +2,7 @@
 
 面向短剧、漫剧和分镜视频生产的本地工作流。项目把故事/小说、剧本、角色/场景/道具资产、逐镜分镜、可选 3D 导演台、视频生成、旁白字幕和最终剪辑组织成可恢复、可审批、可全自动运行的一条生产链。
 
-- 当前版本：`0.1.2-beta.1`（V0.1.2 内测版）
+- 当前版本：`0.1.3-beta.4`（V0.1.3 Windows/macOS 内测版）
 - 维护者：银子
 - GitHub：[`ginsonko`](https://github.com/ginsonko)
 - 联系 QQ：`474764004`
@@ -11,16 +11,20 @@
 
 ## 下载与启动
 
-Windows x64 用户使用 Release 中的任一版本：
+从 Release 下载与设备架构匹配的版本：
 
-| 文件 | 适合场景 |
+| 文件 | 平台与用途 |
 | --- | --- |
-| `银子AI视频工作流-Setup-0.1.2-beta.1-x64.exe` | 推荐。带安装向导、桌面和开始菜单入口 |
-| `银子AI视频工作流-Portable-0.1.2-beta.1-x64.exe` | 不安装，直接双击运行 |
+| `银子AI视频工作流-Setup-0.1.3-beta.4-x64.exe` | 推荐。带安装向导、桌面和开始菜单入口 |
+| `银子AI视频工作流-Portable-0.1.3-beta.4-x64.exe` | 不安装，直接双击运行 |
+| `银子AI视频工作流-0.1.3-beta.4-mac-arm64.dmg` | Apple Silicon Mac（M1/M2/M3/M4 及后续），推荐 |
+| `银子AI视频工作流-0.1.3-beta.4-mac-arm64.zip` | Apple Silicon Mac 备用包 |
+| `银子AI视频工作流-0.1.3-beta.4-mac-x64.dmg` | Intel Mac，推荐 |
+| `银子AI视频工作流-0.1.3-beta.4-mac-x64.zip` | Intel Mac 备用包 |
 
 安装包已经内置 Node.js 运行时、SQLite、FFmpeg/FFprobe 和图片处理模块，不要求用户安装 Node、npm、Python 或 FFmpeg。首次打开不会自动调用付费 API；没有 Key 也可以从首页进入零成本模拟体验。
 
-> 当前安装包未做商业代码签名，Windows 可能显示 SmartScreen 提示。请只从项目 Release 下载并对照 `SHA256SUMS.txt`。
+> 当前 Windows 与 macOS 安装包均未做商业代码签名。Windows 可能显示 SmartScreen 提示，Mac 首次打开需按 [Mac 小白测试说明](desktop/release-docs/Mac小白测试说明.md) 放行。请只从项目 Release 下载并对照 `SHA256SUMS.txt`。
 
 ## 标准工作流
 
@@ -44,7 +48,7 @@ Windows x64 用户使用 Release 中的任一版本：
 - 角色、场景、道具、分镜图、镜头视频和成片均可版本化审批与回退。
 - 已批准资产可以重新打回，也可以加入素材库供其它项目复用。
 - 3D 导演台支持本地 JSON 驱动、关键帧时间线、相机和对象动作；整段预演可选携带。
-- 自动按镜头长度、参考媒体能力和供应商状态路由视频模型，并保留人工覆盖入口。V0.1.2 内置当前 YinziAPI 的 22 个视频模型与价格快照，包括 Seedance 2.5、Grok、MiniMax 和 Kling；站点目录更新后仍会同步新模型。
+- 自动按镜头长度、参考媒体能力和供应商状态路由视频模型，并保留人工覆盖入口。V0.1.3 会从当前 Key 只读发现模型目录，切换后参考包、派发请求和生成记录保持同一模型，不复用已失效的旧路由。
 - 旁白默认可使用 Xiaoyi Edge Neural 在线音色；无需 Python，但合成语音时需要联网。
 - 高级设置可编辑全部系统/审核提示词，导入导出提示词包，维护模型价格和项目预算。
 - 用户配置支持快照、回滚、备份、导入与跨设备迁移。
@@ -65,7 +69,7 @@ Windows x64 用户使用 Release 中的任一版本：
 
 ## 源码开发
 
-要求：Windows/macOS/Linux，Node.js `>=22`。Windows 发布包仅承诺 x64。
+要求：Windows/macOS/Linux，Node.js `>=22`。预编译发布包支持 Windows x64、macOS Intel x64 与 macOS Apple Silicon arm64。
 
 ```powershell
 git clone https://github.com/ginsonko/yinzi-ai-video-workflow.git

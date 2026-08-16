@@ -187,7 +187,7 @@ describe('release packaging contract', () => {
       'utf8'
     ));
 
-    assert.equal(packageJson.version, '0.1.2-beta.1');
+    assert.equal(packageJson.version, '0.1.3-beta.4');
     assert.equal(packageJson.build.directories.output, 'release');
     assert.equal(packageJson.build.electronVersion, packageJson.devDependencies.electron);
     assert.equal(Object.hasOwn(packageJson.build, 'electronDist'), false);
@@ -213,5 +213,15 @@ describe('release packaging contract', () => {
       assert.equal(fs.existsSync(file), true, `${name} is missing from frontweb/public/demo`);
       assert.ok(fs.statSync(file).size > 1024, `${name} is unexpectedly empty`);
     }
+  });
+
+  it('launches portable acceptance against the current package version', () => {
+    const script = fs.readFileSync(path.join(desktopDir, 'scripts', 'launch-portable-acceptance.ps1'), 'utf8');
+
+    assert.match(script, /package\.json/);
+    assert.match(script, /ReadAllText\(\$packageFile, \[Text\.Encoding\]::UTF8\)/);
+    assert.match(script, /productName/);
+    assert.match(script, /Portable-\$packageVersion-x64\.exe/);
+    assert.doesNotMatch(script, /Portable-0\.1\.2-beta\.1-x64\.exe/);
   });
 });

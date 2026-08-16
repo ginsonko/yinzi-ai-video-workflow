@@ -1,11 +1,11 @@
 const KNOWN_STALE_PRICING_VERSION = 'a42d372ccf0b5dd13ecf71203521f9d2';
-const DEFAULT_PRICE_SOURCE = 'v0.1.2-default';
+const DEFAULT_PRICE_SOURCE = 'yinzi-catalog-2026-08-16';
 
 function normalizeModelName(model) {
   return String(model || '').trim().toLowerCase();
 }
 
-function price(model, group, billingUnit, effectivePrice) {
+function price(model, group, billingUnit, effectivePrice, options = {}) {
   return Object.freeze({
     model,
     group,
@@ -14,15 +14,16 @@ function price(model, group, billingUnit, effectivePrice) {
     effective_price: effectivePrice,
     effective_input_usd: null,
     effective_output_usd: null,
-    fixed_duration_seconds: null,
+    fixed_duration_seconds: options.fixedDurationSeconds ?? null,
+    currency: options.currency || 'CNY',
     source: DEFAULT_PRICE_SOURCE,
   });
 }
 
 const DEFAULT_VIDEO_PRICES = Object.freeze([
-  price('官转-seedance2.0 720p-fast', '特价视频分组(即梦)', 'per_second', 0.845),
-  price('官转-seedance2.0 720p-pro', '特价视频分组(即梦)', 'per_second', 0.975),
-  price('破甲seedance 720p-fast', '特价视频分组(即梦)', 'per_second', 1.794),
+  price('官转-seedance2.0 720p-fast', '特价视频分组(即梦)', 'per_second', 1.014),
+  price('官转-seedance2.0 720p-pro', '特价视频分组(即梦)', 'per_second', 1.17),
+  price('破甲seedance 720p-fast', '特价视频分组(即梦)', 'per_second', 2.1528),
   price('特价seedance-2.5-480p', '特价视频分组(即梦)', 'per_second', 0.3354),
   price('特价seedance-2.5-720p', '特价视频分组(即梦)', 'per_second', 0.4654),
   price('af-seedance-2.0', '特价视频分组(即梦)', 'per_request', 0.3484),
@@ -36,9 +37,15 @@ const DEFAULT_VIDEO_PRICES = Object.freeze([
   price('mg-seedance2.0 -720p mini', '特价视频分组(即梦)', 'per_second', 0.2574),
   price('mg-seedance2.0 -720p pro', '特价视频分组(即梦)', 'per_second', 0.4784),
   price('seedance-2.5-480p', '特价视频分组(即梦)', 'per_second', 0.5044),
-  price('seedance-2.5-720p', '特价视频分组(即梦)', 'per_second', 0.7644),
+  price('seedance-2.5-720p', '特价视频分组(即梦)', 'per_second', 0.672),
   price('seedance2.0 -720p-15s', '特价视频分组(即梦)', 'per_request', 6.344),
   price('seedance2.0 -720p-gz-15s', '特价视频分组(即梦)', 'per_request', 6.474),
+  price('cm-seedance2.0 -720p-15s', '特价视频分组(即梦)', 'per_request', 8.0808),
+  price('cm-seedance2.0特价fast-720p-gz-15s', '特价视频分组(即梦)', 'per_request', 4.68, { fixedDurationSeconds: 15 }),
+  price('seedance2.0 -720p-fast-15s', '特价视频分组(即梦)', 'per_request', 5.58),
+  price('seedance2.0 720p-pro-nv-nsp', '特价视频分组(即梦)', 'per_request', 0.44928),
+  price('seedance2.0特价pro-720p-gz-15s', '特价视频分组(即梦)', 'fixed_duration', 6.24, { fixedDurationSeconds: 15 }),
+  price('seedance2.0特价pro-720p-gz-15s-nsp', '特价视频分组(即梦)', 'per_request', 5.16, { fixedDurationSeconds: 15 }),
   price('grok-imagine-video', '视频模型渠道', 'per_request', 0.1125),
   price('MiniMax-H3-2k', 'minimax/可灵视频', 'per_second', 0.20475),
   price('Kling VIDEO 3.0 Omni', 'minimax/可灵视频', 'per_request', 0.25),
@@ -60,7 +67,7 @@ function listDefaultYinziVideoPrices() {
 }
 
 function validVideoPrice(price) {
-  return ['per_request', 'per_second'].includes(String(price?.billing_unit || '').toLowerCase())
+  return ['per_request', 'per_second', 'per_generation', 'fixed_duration'].includes(String(price?.billing_unit || '').toLowerCase())
     && Number.isFinite(Number(price?.effective_price));
 }
 

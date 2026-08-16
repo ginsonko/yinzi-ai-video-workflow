@@ -17,7 +17,7 @@ export const CONTINUITY_MODES = Object.freeze([
     value: 'strict_continuation',
     label: '严格首帧续拍',
     shortLabel: '严格 first_frame',
-    description: '把同一张末帧以 first_frame 角色发送，只允许明确支持严格首帧的模型。',
+    description: '把同一张末帧以 first_frame 角色发送；本地能力提示只用于说明风险，不限制手动提交。',
   },
 ])
 
@@ -141,15 +141,15 @@ export function buildShotContinuityView({ artifact = {}, draft = null, artifacts
   else if (mode === 'opening' || mode === 'hard_cut') actualCode = 'none'
   const actualTransport = transportMeta(actualCode)
 
-  let blocker = ''
+  let advisory = ''
   if (!['opening', 'hard_cut'].includes(mode) && !previousVideo?.media_path) {
-    blocker = '需要先确认上一镜正式视频，系统才能从它提取最后一帧。'
+    advisory = '当前没有可提取的上一镜正式视频；仍可提交不带尾帧的参考包，但镜头连续性可能下降。'
   } else if (!['opening', 'hard_cut'].includes(mode) && bundle && !continuityFrame?.media_path) {
-    blocker = '参考包尚未取得有效尾帧文件，请重新建包后再确认。'
+    advisory = '参考包尚未取得有效尾帧文件；仍可按当前媒体清单提交，也可以重新建包后再试。'
   } else if (mode === 'strict_continuation' && normalizedRoute.model && firstFrameSupport === false) {
-    blocker = `当前模型 ${normalizedRoute.model} 不支持 first_frame；请选择兼容模型或改用尾帧参考。`
+    advisory = `本地提示显示 ${normalizedRoute.model} 可能不支持 first_frame；仍可提交，若上游拒绝会保留原始原因并允许调整后重试。`
   } else if (mode === 'strict_continuation' && !normalizedRoute.model) {
-    blocker = '等待自动路由选择支持 first_frame 的模型；不会静默降级为普通参考图。'
+    advisory = '尚未取得当前模型的 first_frame 能力提示；仍可提交，最终以上游响应为准。'
   }
 
   const mismatch = Boolean(video && plannedTransport.code !== actualTransport.code)
@@ -168,7 +168,8 @@ export function buildShotContinuityView({ artifact = {}, draft = null, artifacts
     plannedTransport,
     actualTransport,
     dispatch,
-    blocker,
+    blocker: '',
+    advisory,
     mismatch,
     frameValidation,
     boundaryValidation,

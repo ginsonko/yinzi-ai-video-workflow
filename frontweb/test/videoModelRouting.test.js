@@ -7,6 +7,7 @@ import {
   catalogModelOption,
   modelMediaLabel,
   modelPriceLabel,
+  projectVideoModelDisplay,
   projectVideoRoutingChanged,
   projectVideoRoutingState,
   shotVideoPrevisMode,
@@ -45,26 +46,59 @@ test('normalizes project routing and detects only material project-route changes
     video_model: 'balanced-video',
     video_group: '特价视频分组(即梦)',
     video_quality: 'balanced',
+    video_config_id: 17,
     video_model_overrides: { 5: 'other-video' },
   }
   assert.deepEqual(projectVideoRoutingState(policy), {
     mode: 'fixed', model: 'balanced-video', group: '特价视频分组(即梦)', quality: 'balanced',
+    configId: 17,
   })
   assert.equal(projectVideoRoutingChanged(policy, {
-    video_routing_mode: 'fixed', video_model: 'balanced-video', video_group: '特价视频分组(即梦)', video_quality: 'balanced',
+    video_routing_mode: 'fixed', video_model: 'balanced-video', video_group: '特价视频分组(即梦)', video_quality: 'balanced', video_config_id: 17,
   }), false)
+  assert.equal(projectVideoRoutingChanged(policy, {
+    video_routing_mode: 'fixed', video_model: 'balanced-video', video_group: '特价视频分组(即梦)', video_quality: 'balanced', video_config_id: 18,
+  }), true)
   assert.equal(projectVideoRoutingChanged(policy, {
     video_routing_mode: 'auto', video_model: 'balanced-video', video_group: '特价视频分组(即梦)', video_quality: 'balanced',
   }), true)
 })
 
+test('does not show the persisted model while a switched config is unavailable', () => {
+  assert.equal(projectVideoModelDisplay({
+    settingsVisible: true,
+    draft: { video_config_id: 14, video_routing_mode: 'auto', video_model: '' },
+    activePolicy: { video_config_id: 12 },
+    currentModel: 'old-video-model',
+    catalogConfigId: 14,
+    catalog: [],
+    catalogError: 'model discovery failed',
+  }), '尚未选择（保存前需读取模型目录）')
+  assert.equal(projectVideoModelDisplay({
+    settingsVisible: true,
+    draft: { video_config_id: 14, video_routing_mode: 'auto', video_model: '' },
+    activePolicy: { video_config_id: 12 },
+    currentModel: 'old-video-model',
+    catalogConfigId: 14,
+    catalog: [{ model: 'new-video' }],
+  }), '按镜头自动选择（保存后生效）')
+  assert.equal(projectVideoModelDisplay({
+    settingsVisible: true,
+    draft: { video_config_id: 14, video_routing_mode: 'fixed', video_model: 'new-video' },
+    activePolicy: { video_config_id: 12 },
+    currentModel: 'old-video-model',
+    catalogConfigId: 14,
+    catalog: [{ model: 'new-video' }],
+  }), 'new-video')
+})
+
 test('builds a redacted atomic project-routing payload and clears fixed model in auto mode', () => {
   const fixed = buildProjectVideoRoutingPayload({
-    video_routing_mode: 'fixed', video_model: ' balanced-video ', video_group: '视频模型渠道', video_quality: 'quality', api_key: 'secret',
+    video_routing_mode: 'fixed', video_model: ' balanced-video ', video_group: '视频模型渠道', video_quality: 'quality', video_config_id: 23, api_key: 'secret',
   }, { shotId: 5, expectedVersion: 8091, confirmExpensive: true })
   assert.deepEqual(fixed, {
     scope: 'run', shot_id: '5', mode: 'fixed', model: 'balanced-video', group: '视频模型渠道',
-    quality: 'quality', confirm_expensive: true, expected_version: 8091,
+    quality: 'quality', config_id: 23, confirm_expensive: true, expected_version: 8091,
   })
   assert.equal(Object.hasOwn(fixed, 'api_key'), false)
 
@@ -83,9 +117,34 @@ test('maps live group, capability and expensive warnings for manual model select
   assert.equal(modelMediaLabel(option), '4 图 · 3 视频 · 1 音频')
 
   const unavailable = catalogModelOption(catalog, 'bypass-video', '特价视频分组(即梦)')
-  assert.equal(unavailable.selectable, false)
-  assert.match(unavailable.incompatibility_reason, /不在当前分组/)
+  assert.equal(unavailable.selectable, true)
+  assert.equal(unavailable.group_available, false)
+  assert.match(unavailable.incompatibility_reason, /尚未确认/)
   assert.equal(unavailable.requires_explicit_confirmation, true)
+
+  const unregistered = catalogModelOption(catalog, 'new-upstream-video', '特价视频分组(即梦)')
+  assert.equal(unregistered.selectable, true)
+  assert.equal(unregistered.catalog_verified, false)
+  assert.equal(unregistered.contract_status, 'missing')
+  assert.deepEqual(unregistered.limits, { images: null, videos: null, audios: null })
+  assert.ok(unregistered.warnings.includes('model_not_in_catalog'))
+})
+
+test('labels local capability hints without turning them into a manual gate', () => {
+  const option = catalogModelOption([{
+    model: 'local-video',
+    groups: ['特价视频分组(即梦)'],
+    contract_status: 'local',
+    capability_source: 'local',
+    capabilities: {
+      resolution: '720p', quality_tier: 'balanced', duration_mode: 'range', duration_min: 5, duration_max: 15,
+      max_images: 30, max_videos: 10, max_audios: 10,
+    },
+  }], 'local-video', '特价视频分组(即梦)')
+  assert.equal(option.selectable, true)
+  assert.equal(option.contract_status, 'local')
+  assert.deepEqual(option.limits, { images: 30, videos: 10, audios: 10 })
+  assert.ok(!option.warnings.includes('unknown_contract'))
 })
 
 test('never presents an incompatible or unestimated model as free', () => {
@@ -94,18 +153,25 @@ test('never presents an incompatible or unestimated model as free', () => {
     estimated_price: null,
     unit_price: 0.1125,
     billing_unit: 'per_request',
-  }), '$0.1125 / 次')
+  }), '0.1125 / 次')
   assert.equal(modelPriceLabel({
     estimated_price: 1.4312,
     unit_price: 0.20475,
     billing_unit: 'per_second',
-  }), '本镜预计 $1.4312')
+    currency: 'CNY',
+  }), '本镜预计 ¥1.4312')
+  assert.equal(modelPriceLabel({
+    estimated_price: null,
+    unit_price: 0.1125,
+    billing_unit: 'per_request',
+    currency: 'USD',
+  }), '$0.1125 / 次')
 })
 
 test('builds a shot routing payload that can explicitly omit director media', () => {
   const routing = {
     run_version: 8507,
-    project: { director_mode: 'auto' },
+    project: { director_mode: 'auto', config_id: 17 },
     shot: { id: '6', mode: 'inherit', model: '' },
     effective_route: { model: 'balanced-video', previs_mode: 'auto' },
   }
@@ -113,7 +179,7 @@ test('builds a shot routing payload that can explicitly omit director media', ()
   assert.deepEqual(buildShotVideoRoutingPayload(routing, {
     mode: 'fixed', model: ' balanced-video ', previs_mode: 'skip',
   }), {
-    scope: 'shot', shot_id: '6', mode: 'fixed', model: 'balanced-video', previs_mode: 'skip',
+    scope: 'shot', shot_id: '6', config_id: 17, mode: 'fixed', model: 'balanced-video', previs_mode: 'skip',
     authorize_retry: false, retry_reason: '', confirm_expensive: false, expected_version: 8507,
   })
 })

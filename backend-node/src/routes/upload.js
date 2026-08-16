@@ -101,6 +101,8 @@ function routes(cfg, log, db) {
           url: result.url,
           path: result.local_path,
           local_path: result.local_path,
+          sha256: result.sha256,
+          deduplicated: result.deduplicated,
           filename: req.file.originalname,
           size: req.file.size,
         });
@@ -133,6 +135,8 @@ function routes(cfg, log, db) {
         response.success(res, {
           url: result.url,
           local_path: result.local_path,
+          sha256: result.sha256,
+          deduplicated: result.deduplicated,
           filename: req.file.originalname,
           size: req.file.size,
           mime_type: req.file.mimetype,

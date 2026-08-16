@@ -45,6 +45,8 @@ test('keeps counters isolated by stage and scope', () => {
 test('classifies ambiguous and budget failures as hard stops', () => {
   assert.equal(autonomy.classifyFailure({ code: 'VIDEO_CREATE_AMBIGUOUS' }).recoverable, false);
   assert.equal(autonomy.classifyFailure({ code: 'VIDEO_SECONDS_BUDGET' }).stop_reason, 'budget_exhausted');
+  assert.equal(autonomy.classifyFailure({ code: 'STAGE_HANDLER_PENDING' }).counts_as_failure, false);
+  assert.equal(autonomy.classifyFailure({ code: 'VIDEO_DOWNLOAD_PENDING' }).category, 'workflow_wait');
 })
 
 test('classifies explicit video content-policy rejection separately from provider outages', () => {
@@ -58,6 +60,21 @@ test('classifies explicit video content-policy rejection separately from provide
     stage: 'shot_video', code: 'VIDEO_GENERATION_FAILED', message: 'temporary provider outage',
   });
   assert.equal(outage.category, 'provider_or_content_failure');
+})
+
+test('keeps a stale local video-config binding error recoverable without switching models', () => {
+  const binding = autonomy.classifyFailure({
+    stage: 'shot_video', code: 'VIDEO_GENERATION_FAILED', message: '未配置视频模型',
+  });
+  assert.equal(binding.category, 'configuration_binding_failure');
+  assert.equal(binding.recoverable, true);
+  assert.equal(binding.allow_model_switch, false);
+
+  const missing = autonomy.classifyFailure({
+    stage: 'shot_video', code: 'VIDEO_CONFIG_UNAVAILABLE', message: '请重新选择视频配置',
+  });
+  assert.equal(missing.category, 'resource_unavailable');
+  assert.equal(missing.recoverable, false);
 })
 
 test('sanitizes keys, authorization values and local paths before diagnostics', () => {

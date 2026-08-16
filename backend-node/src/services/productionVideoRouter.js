@@ -74,32 +74,42 @@ function shotModelOverride(shot, policy = {}) {
   return String(overrides[String(shotId)] || '').trim();
 }
 
-function priceForCatalogItem(item, group) {
+function priceForCatalogItem(item, group, duration = null) {
   const prices = Array.isArray(item?.prices) ? item.prices : [];
   const matching = group ? prices.filter((price) => price.group === group) : prices;
   const usable = (matching.length ? matching : prices)
-    .filter((price) => Number.isFinite(Number(price.effective_price)));
+    .filter((price) => estimatePrice(price, duration) != null);
   if (!usable.length) return null;
-  return usable.sort((left, right) => Number(left.effective_price) - Number(right.effective_price))[0];
+  return usable.sort((left, right) => {
+    const estimatedDiff = Number(estimatePrice(left, duration)) - Number(estimatePrice(right, duration));
+    if (estimatedDiff !== 0) return estimatedDiff;
+    return String(left.billing_unit || '').localeCompare(String(right.billing_unit || ''));
+  })[0];
 }
 
 function estimatePrice(price, duration) {
   if (!price || !Number.isFinite(Number(price.effective_price))) return null;
   if (price.billing_unit === 'per_second') {
+    if (!Number.isFinite(Number(duration))) return null;
     return Number((Number(price.effective_price) * Number(duration)).toFixed(4));
   }
-  return Number(Number(price.effective_price).toFixed(4));
+  if (['per_request', 'per_generation', 'fixed_duration'].includes(price.billing_unit)) {
+    return Number(Number(price.effective_price).toFixed(4));
+  }
+  return null;
 }
 
-function qualityPenalty(capability, qualityPolicy) {
+function qualityPreferenceRank(capability, qualityPolicy) {
   const tier = capability?.quality_tier;
-  if (qualityPolicy === 'quality') {
-    if (capability?.resolution === '720p' && tier === 'quality') return -40;
-    if (capability?.resolution === '720p') return -20;
-  }
-  if (qualityPolicy === 'economy' && tier === 'economy') return -30;
-  if (qualityPolicy === 'speed' && tier === 'fast') return -30;
-  return 0;
+  const policyOrder = {
+    quality: ['quality', 'balanced', 'fast', 'economy'],
+    speed: ['fast', 'balanced', 'economy', 'quality'],
+    economy: ['economy', 'fast', 'balanced', 'quality'],
+    balanced: ['balanced', 'fast', 'quality', 'economy'],
+  };
+  const order = policyOrder[qualityPolicy] || policyOrder.balanced;
+  const index = order.indexOf(tier);
+  return index === -1 ? order.length : index;
 }
 
 function materialRoutePayload(route) {
@@ -115,6 +125,10 @@ function materialRoutePayload(route) {
     director_mode: route.director_mode,
     transition_mode: route.transition_mode,
     requires_strict_first_frame: route.requires_strict_first_frame,
+    group: route.group || null,
+    group_available: route.group_available !== false,
+    contract_status: route.contract_status || (route.capability ? 'known' : 'missing'),
+    contract_warnings: route.contract_warnings || [],
     limits: route.limits,
     roles: route.roles,
   };
@@ -126,11 +140,11 @@ function routingMaterialSignature(route) {
     .digest('hex');
 }
 
-function fixedModelRoute(shot, model, policy = {}) {
+function fixedModelRoute(shot, model, policy = {}, capabilityInput = undefined, capabilityStatus = null) {
   const classified = classifyShotRoute(shot, policy);
-  const capability = getYinziVideoCapability(model);
+  const capability = capabilityInput === undefined ? getYinziVideoCapability(model) : capabilityInput;
   if (!capability) {
-    return {
+    const route = {
       ...classified,
       model: String(model || '').trim(),
       capability: null,
@@ -140,25 +154,18 @@ function fixedModelRoute(shot, model, policy = {}) {
       limits: null,
       roles: null,
       reason_codes: ['fixed_unknown_contract'],
+      contract_status: 'missing',
+      contract_warnings: ['unknown_contract'],
       estimated_price: null,
       billing_unit: null,
     };
+    route.material_signature = routingMaterialSignature(route);
+    return route;
   }
-  if (!capabilityAcceptsDuration(capability, classified.duration)) {
-    const error = new Error(`${model} 不支持 ${classified.duration} 秒镜头，系统不会静默修改分镜时长`);
-    error.code = 'VIDEO_ROUTE_DURATION_UNSUPPORTED';
-    throw error;
-  }
-  if (classified.uses_reference_video && Number(capability.max_videos) < 1) {
-    const error = new Error(`${model} 不支持参考视频，不能用于 ${classified.duration} 秒长镜头路线`);
-    error.code = 'VIDEO_ROUTE_REFERENCE_UNSUPPORTED';
-    throw error;
-  }
-  if (classified.requires_strict_first_frame && !capabilitySupportsRole(capability, 'image', 'first_frame')) {
-    const error = new Error(`${model} does not support strict first-frame continuation`);
-    error.code = 'STRICT_FIRST_FRAME_UNSUPPORTED';
-    throw error;
-  }
+  const contractWarnings = [];
+  if (!capabilityAcceptsDuration(capability, classified.duration)) contractWarnings.push('duration_mismatch');
+  if (classified.uses_reference_video && Number(capability.max_videos) < 1) contractWarnings.push('video_reference_unsupported');
+  if (classified.requires_strict_first_frame && !capabilitySupportsRole(capability, 'image', 'first_frame')) contractWarnings.push('strict_first_frame_unsupported');
   const route = {
     ...classified,
     model: String(model || '').trim(),
@@ -173,6 +180,8 @@ function fixedModelRoute(shot, model, policy = {}) {
     },
     roles: capability.roles,
     reason_codes: ['fixed_model_override'],
+    contract_status: capabilityStatus || 'known',
+    contract_warnings: contractWarnings,
     estimated_price: null,
     billing_unit: null,
   };
@@ -187,40 +196,39 @@ function selectShotVideoRoute(input) {
     ? String(policy.video_routing_mode)
     : String(policy.video_model || '').trim() ? 'fixed' : 'auto';
   const manualModel = shotModelOverride(shot, policy);
+  const catalogItems = normalizeCatalog(catalog);
   if (routingMode === 'fixed' || manualModel) {
-    const fixed = fixedModelRoute(shot, manualModel || policy.video_model, policy);
-    const catalogItems = normalizeCatalog(catalog);
-    if (!catalogItems.length) {
-      const error = new Error('实时视频模型目录不可用，固定模型也不会在未核对目录时提交');
-      error.code = 'VIDEO_ROUTE_CATALOG_UNAVAILABLE';
-      throw error;
-    }
-    const catalogItem = catalogItems.find((item) => item.model === fixed.model);
-    if (!catalogItem) {
-      const error = new Error(`当前实时目录中找不到视频模型 ${fixed.model}`);
-      error.code = 'VIDEO_ROUTE_MODEL_UNAVAILABLE';
-      throw error;
-    }
+    const selectedModel = manualModel || policy.video_model;
+    const catalogItem = catalogItems.find((item) => item.model.toLowerCase() === String(selectedModel || '').toLowerCase());
+    const fixed = fixedModelRoute(
+      shot,
+      selectedModel,
+      policy,
+      catalogItem?.capabilities,
+      catalogItem?.contract_status || null,
+    );
     const group = String(policy.video_group || '').trim();
-    if (group && !catalogItem.groups.includes(group)) {
-      const error = new Error(`视频模型 ${fixed.model} 不在当前分组 ${group} 中`);
-      error.code = 'VIDEO_ROUTE_GROUP_UNAVAILABLE';
-      throw error;
-    }
-    const price = priceForCatalogItem(catalogItem, group);
+    const groupAvailable = !group || Boolean(catalogItem?.groups?.includes(group));
+    const price = catalogItem ? priceForCatalogItem(catalogItem, group, fixed.duration) : null;
     fixed.reason_codes = manualModel ? ['shot_model_override'] : fixed.reason_codes;
-    fixed.catalog_verified = true;
+    fixed.catalog_verified = Boolean(catalogItem);
     fixed.catalog_version = String(catalog?.pricing_version || '');
     fixed.catalog_fetched_at = catalog?.fetched_at || null;
-    fixed.group = group || price?.group || catalogItem.groups?.[0] || null;
+    fixed.group = group || price?.group || catalogItem?.groups?.[0] || null;
+    fixed.group_available = groupAvailable;
+    fixed.contract_warnings = [
+      ...(fixed.contract_warnings || []),
+      ...(!catalogItem ? ['model_not_in_catalog'] : []),
+      ...(group && !groupAvailable ? ['group_unavailable'] : []),
+    ];
     fixed.billing_unit = price?.billing_unit || null;
     fixed.unit_price = price?.effective_price ?? null;
     fixed.estimated_price = estimatePrice(price, fixed.duration);
+    fixed.currency = price?.currency || null;
     fixed.material_signature = routingMaterialSignature(fixed);
     return fixed;
   }
 
-  const catalogItems = normalizeCatalog(catalog);
   if (!catalogItems.length) {
     const error = new Error('实时视频模型目录不可用，自动路由已在付费提交前停止');
     error.code = 'VIDEO_ROUTE_CATALOG_UNAVAILABLE';
@@ -228,11 +236,10 @@ function selectShotVideoRoute(input) {
   }
   const qualityPolicy = String(policy.video_quality || 'balanced');
   const group = String(policy.video_group || '').trim();
-  const allowFixed = policy.allow_fixed_15s === true;
   const allowBypass = policy.allow_expensive_bypass === true;
   const evaluated = [];
   for (const item of catalogItems) {
-    const capability = getYinziVideoCapability(item.model);
+    const capability = item.capabilities || getYinziVideoCapability(item.model);
     const reasons = [];
     if (!capability) reasons.push('unknown_contract');
     if (capability && !capabilitySupportsRoute(capability, classified.profile)) reasons.push('profile_mismatch');
@@ -241,23 +248,31 @@ function selectShotVideoRoute(input) {
     if (capability && classified.requires_strict_first_frame
       && !capabilitySupportsRole(capability, 'image', 'first_frame')) reasons.push('strict_first_frame_required');
     if (capability && !capability.automatic_eligible) reasons.push(capability.exclusion_reason || 'not_automatic');
-    if (capability?.duration_mode === 'fixed' && !allowFixed) reasons.push('fixed_duration_disabled');
     if (capability?.expensive_bypass && !allowBypass) reasons.push('expensive_bypass_disabled');
     if (group && Array.isArray(item.groups) && !item.groups.includes(group)) reasons.push('group_unavailable');
-    const price = priceForCatalogItem(item, group);
+    const price = priceForCatalogItem(item, group, classified.duration);
     const estimated = estimatePrice(price, classified.duration);
+    if (estimated == null) reasons.push('price_unknown');
     const shortMultimodalPenalty = capability
       && !classified.uses_reference_video
       && capability.max_videos > 0
       && classified.profile === ROUTE_PROFILES.SHORT ? 5 : 0;
-    const score = Number(capability?.preference_rank || 1000)
-      + qualityPenalty(capability, qualityPolicy)
-      + shortMultimodalPenalty
-      + (estimated == null ? 25 : estimated);
-    evaluated.push({ item, capability, price, estimated, reasons: [...new Set(reasons)], score });
+    evaluated.push({
+      item,
+      capability,
+      price,
+      estimated,
+      reasons: [...new Set(reasons)],
+      quality_rank: qualityPreferenceRank(capability, qualityPolicy),
+      short_multimodal_penalty: shortMultimodalPenalty,
+    });
   }
   const eligible = evaluated.filter((candidate) => candidate.reasons.length === 0)
-    .sort((left, right) => left.score - right.score || left.item.model.localeCompare(right.item.model));
+    .sort((left, right) => Number(left.estimated) - Number(right.estimated)
+      || left.quality_rank - right.quality_rank
+      || left.short_multimodal_penalty - right.short_multimodal_penalty
+      || Number(left.capability?.preference_rank || 1000) - Number(right.capability?.preference_rank || 1000)
+      || left.item.model.localeCompare(right.item.model));
   if (!eligible.length) {
     const error = new Error(`${classified.duration} 秒镜头没有满足媒体、时长和费用策略的视频模型`);
     error.code = 'VIDEO_ROUTE_NO_ELIGIBLE_MODEL';
@@ -285,6 +300,7 @@ function selectShotVideoRoute(input) {
     billing_unit: selected.price?.billing_unit || null,
     unit_price: selected.price?.effective_price ?? null,
     estimated_price: selected.estimated,
+    currency: selected.price?.currency || null,
     queue_signal: 'unknown',
     reason_codes: classified.profile === ROUTE_PROFILES.SHORT
       ? [
@@ -306,6 +322,7 @@ function selectShotVideoRoute(input) {
       model: candidate.item.model,
       estimated_price: candidate.estimated,
       billing_unit: candidate.price?.billing_unit || null,
+      currency: candidate.price?.currency || null,
       resolution: candidate.capability.resolution,
       quality_tier: candidate.capability.quality_tier,
     })),
@@ -324,37 +341,51 @@ function listShotVideoRouteOptions(input) {
   const currentModel = shotModelOverride(shot, policy)
     || (projectMode === 'fixed' ? String(policy.video_model || '').trim() : '');
   return items.map((item) => {
-    const capability = getYinziVideoCapability(item.model);
+    const capability = item.capabilities || getYinziVideoCapability(item.model);
     const groupAvailable = !group || item.groups.includes(group);
     let route = null;
     let error = null;
     try {
-      route = fixedModelRoute(shot, item.model, policy);
+      route = fixedModelRoute(shot, item.model, policy, item.capabilities, item.contract_status || null);
     } catch (caught) {
       error = caught;
     }
-    const price = priceForCatalogItem(item, group);
+    const price = priceForCatalogItem(item, group, route?.duration);
     const warnings = [];
     if (capability?.expensive_bypass) warnings.push('expensive_bypass');
     if (capability?.duration_mode === 'fixed') warnings.push('fixed_duration_product');
     if (!capability) warnings.push('unknown_contract');
     if (!groupAvailable) warnings.push('group_unavailable');
-    const compatible = Boolean(route && capability && groupAvailable);
+    warnings.push(...(route?.contract_warnings || []));
+    const contractIssue = (route?.contract_warnings || []).find((warning) => warning !== 'unknown_contract') || null;
+    // A manually selected model is always an allowed attempt.  Compatibility
+    // remains advisory so automatic routing and the UI can explain what is
+    // known locally, but an unregistered or cross-group model must not be
+    // hidden behind a local contract gate.
+    const compatible = Boolean(route && capability && groupAvailable && !contractIssue);
     return {
       model: item.model,
       name: item.name || item.model,
+      contract_status: item.contract_status || (capability ? 'known' : 'missing'),
+      capability_source: item.capability_source || (capability ? 'builtin' : 'unknown'),
       groups: item.groups,
       group,
       group_available: groupAvailable,
       compatible,
-      selectable: compatible,
+      selectable: true,
       incompatibility_code: !groupAvailable
         ? 'VIDEO_ROUTE_GROUP_UNAVAILABLE'
-        : error?.code || (!capability ? 'VIDEO_ROUTE_UNKNOWN_CONTRACT' : null),
+        : error?.code
+          || (!capability ? 'VIDEO_ROUTE_UNKNOWN_CONTRACT' : null)
+          || (contractIssue === 'duration_mismatch' ? 'VIDEO_ROUTE_DURATION_UNSUPPORTED'
+            : contractIssue === 'video_reference_unsupported' ? 'VIDEO_ROUTE_REFERENCE_UNSUPPORTED'
+              : contractIssue === 'strict_first_frame_unsupported' ? 'STRICT_FIRST_FRAME_UNSUPPORTED' : null),
       incompatibility_reason: !groupAvailable
         ? `不在当前分组 ${group}`
-        : error?.message || (!capability ? '本地尚未登记该模型的媒体契约' : null),
-      warnings,
+        : error?.message
+          || (!capability ? '本地尚未登记该模型的能力提示；手动选择仍可提交' : null)
+          || (contractIssue ? `本地能力提示：${contractIssue}` : null),
+      warnings: [...new Set(warnings)],
       requires_explicit_confirmation: capability?.expensive_bypass === true,
       resolution: capability?.resolution || null,
       quality_tier: capability?.quality_tier || null,
@@ -370,6 +401,7 @@ function listShotVideoRouteOptions(input) {
       roles: capability?.roles || null,
       billing_unit: price?.billing_unit || null,
       unit_price: price?.effective_price ?? null,
+      currency: price?.currency || null,
       estimated_price: route ? estimatePrice(price, route.duration) : null,
       route: route ? {
         profile: route.profile,

@@ -78,16 +78,21 @@ function multimodalSeedanceProfile({
   maxVideos,
   maxAudios,
   maxReferenceVideoSeconds,
+  durationMode = 'free',
+  durationMin = 5,
+  durationMax = 15,
+  autoDurationMin = 5,
+  autoDurationMax = 15,
   automaticEligible = true,
   exclusionReason = null,
 } = {}) {
   return freezeProfile({
     family,
-    duration_mode: 'free',
-    duration_min: 5,
-    duration_max: 15,
-    auto_duration_min: 5,
-    auto_duration_max: 15,
+    duration_mode: durationMode,
+    duration_min: durationMin,
+    duration_max: durationMax,
+    auto_duration_min: autoDurationMin,
+    auto_duration_max: autoDurationMax,
     max_images: maxImages,
     max_videos: maxVideos,
     max_audios: maxAudios,
@@ -99,7 +104,11 @@ function multimodalSeedanceProfile({
     preference_rank: preferenceRank,
     ...(exclusionReason ? { exclusion_reason: exclusionReason } : {}),
     route_profiles: ['short_image_guided', 'long_previs_guided'],
-    roles: { image: ['reference'], video: ['reference'], audio: ['reference'] },
+    roles: {
+      image: maxImages > 0 ? ['reference'] : [],
+      video: maxVideos > 0 ? ['reference'] : [],
+      audio: maxAudios > 0 ? ['reference'] : [],
+    },
   });
 }
 
@@ -124,27 +133,49 @@ function conservativeManualProfile(family, resolution = '720p') {
   });
 }
 
-function fixedFifteenProfile(resolution, quality = 'fast') {
+function fixedFifteenProfile(resolution, quality = 'fast', options = {}) {
+  const maxImages = Number(options.maxImages ?? 9);
+  const maxVideos = Number(options.maxVideos ?? 3);
+  const maxAudios = Number(options.maxAudios ?? 3);
+  const automaticEligible = options.automaticEligible === true;
   return freezeProfile({
-    family: 'seedance2-fixed-15s',
+    family: options.family || 'seedance2-fixed-15s',
     duration_mode: 'fixed',
     duration_min: 15,
     duration_max: 15,
     fixed_duration_seconds: 15,
-    max_images: 9,
-    max_videos: 3,
-    max_audios: 3,
-    max_total_references: 15,
-    max_reference_video_seconds_total: 15,
+    max_images: maxImages,
+    max_videos: maxVideos,
+    max_audios: maxAudios,
+    max_total_references: maxImages + maxVideos + maxAudios,
+    max_reference_video_seconds_total: maxVideos > 0 ? 15 : 0,
     resolution,
     quality_tier: quality,
-    automatic_eligible: false,
-    exclusion_reason: 'fixed_15_second_product',
-    requires_director_preview: true,
+    automatic_eligible: automaticEligible,
+    preference_rank: Number(options.preferenceRank ?? 100),
+    ...(!automaticEligible ? { exclusion_reason: options.exclusionReason || 'fixed_15_second_product' } : {}),
+    requires_director_preview: maxVideos > 0,
     route_profiles: ['long_previs_guided'],
-    roles: { image: ['reference'], video: ['reference'], audio: ['reference'] },
+    roles: {
+      image: maxImages > 0 ? ['reference'] : [],
+      video: maxVideos > 0 ? ['reference'] : [],
+      audio: maxAudios > 0 ? ['reference'] : [],
+    },
   });
 }
+
+const CURRENT_YINZI_JIMENG_MODELS = Object.freeze([
+  '官转-seedance2.0 720p-fast',
+  '官转-seedance2.0 720p-pro',
+  '破甲seedance 720p-fast',
+  'cm-seedance2.0 -720p-15s',
+  'cm-seedance2.0特价fast-720p-gz-15s',
+  'seedance-2.5-720p',
+  'seedance2.0 -720p-fast-15s',
+  'seedance2.0 720p-pro-nv-nsp',
+  'seedance2.0特价pro-720p-gz-15s',
+  'seedance2.0特价pro-720p-gz-15s-nsp',
+]);
 
 const AIZZZ_PROFILES = Object.freeze({
   'cc-seedance2.0 480p-fast-nsp': shortImageGuidedProfile({ quality: 'fast', preferenceRank: 10 }),
@@ -179,7 +210,8 @@ const AIZZZ_PROFILES = Object.freeze({
   }),
   'seedance-2.5-720p': multimodalSeedanceProfile({
     family: 'seedance2.5-reference', resolution: '720p', quality: 'quality', preferenceRank: 55,
-    maxImages: 30, maxVideos: 10, maxAudios: 10, maxReferenceVideoSeconds: 29,
+    maxImages: 30, maxVideos: 0, maxAudios: 10, maxReferenceVideoSeconds: 0,
+    durationMode: 'range', durationMin: 4, durationMax: 30, autoDurationMin: 5, autoDurationMax: 15,
   }),
   '特价seedance-2.5-480p': multimodalSeedanceProfile({
     family: 'seedance2.5-discount-reference', resolution: '480p', quality: 'economy', preferenceRank: 25,
@@ -198,6 +230,29 @@ const AIZZZ_PROFILES = Object.freeze({
     family: 'cav2-seedance2-reference', resolution: '720p', quality: 'quality', preferenceRank: 110,
     maxImages: 9, maxVideos: 3, maxAudios: 3, maxReferenceVideoSeconds: 15,
     automaticEligible: false, exclusionReason: 'manual_fixed_price_product',
+  }),
+
+  'cm-seedance2.0 -720p-15s': multimodalSeedanceProfile({
+    family: 'cm-seedance2-reference', resolution: '720p', quality: 'balanced', preferenceRank: 90,
+    maxImages: 9, maxVideos: 3, maxAudios: 3, maxReferenceVideoSeconds: 15,
+  }),
+  'cm-seedance2.0特价fast-720p-gz-15s': fixedFifteenProfile('720p', 'fast', {
+    family: 'cm-seedance2-discount-fixed', automaticEligible: true, preferenceRank: 25,
+  }),
+  'seedance2.0 -720p-fast-15s': multimodalSeedanceProfile({
+    family: 'seedance2-fast-request-priced', resolution: '720p', quality: 'fast', preferenceRank: 30,
+    maxImages: 9, maxVideos: 3, maxAudios: 3, maxReferenceVideoSeconds: 15,
+  }),
+  'seedance2.0 720p-pro-nv-nsp': multimodalSeedanceProfile({
+    family: 'seedance2-pro-no-video', resolution: '720p', quality: 'quality', preferenceRank: 5,
+    maxImages: 9, maxVideos: 0, maxAudios: 3, maxReferenceVideoSeconds: 0,
+  }),
+  'seedance2.0特价pro-720p-gz-15s': fixedFifteenProfile('720p', 'quality', {
+    family: 'seedance2-pro-discount-fixed', automaticEligible: true, preferenceRank: 40,
+  }),
+  'seedance2.0特价pro-720p-gz-15s-nsp': fixedFifteenProfile('720p', 'quality', {
+    family: 'seedance2-pro-discount-fixed-no-video', automaticEligible: true,
+    preferenceRank: 35, maxVideos: 0,
   }),
 
   'mg-seedance2.0 -480p-fast-gz-15s': fixedFifteenProfile('480p', 'fast'),
@@ -298,6 +353,7 @@ function clampYinziVideoDuration(model, duration) {
 }
 
 module.exports = {
+  CURRENT_YINZI_JIMENG_MODELS,
   getYinziVideoCapability,
   listYinziVideoCapabilities,
   capabilitySupportsRole,

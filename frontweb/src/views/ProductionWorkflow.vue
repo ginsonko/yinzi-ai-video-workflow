@@ -164,7 +164,7 @@
         <footer class="start-footer">
           <div>
             <strong>{{ startButtonLabel }}</strong>
-            <span>总视频预算 {{ newRun.maxSeconds }} 秒；每次真实提交前都会重新核对模型目录、时长与参考媒体</span>
+            <span>总视频预算 {{ newRun.maxSeconds }} 秒；自动模式参考目录能力，手动指定时按你的模型和参考媒体清单提交</span>
           </div>
           <el-button type="primary" size="large" :icon="VideoPlay" :loading="starting" :disabled="!sourceDraft.trim()" @click="createAndStartRun">
             {{ startButtonLabel }}
@@ -290,7 +290,11 @@
             v-for="shot in shotStrip"
             :key="shot.id"
             type="button"
-            :class="['shot-chip', { active: String(shot.scope_id) === String(selectedShotId || activeRun.current_scope_id), approved: shot.status === 'approved' }]"
+            :class="['shot-chip', {
+              active: String(shot.scope_id) === String(selectedShotId || activeRun.current_scope_id),
+              approved: shot.status === 'approved' && shot.content?.included !== false,
+              skipped: shot.content?.included === false,
+            }]"
             :aria-pressed="String(shot.scope_id) === String(selectedShotId || activeRun.current_scope_id)"
             :title="routeHeadline(artifactRoute(shot), shot)"
             @click="selectShot(shot)"
@@ -298,6 +302,7 @@
             <span>#{{ shot.content?.number || shot.scope_id }}</span>
             <strong>{{ shot.content?.title || shot.title }}</strong>
             <small>{{ routeHeadline(artifactRoute(shot), shot) }}</small>
+            <em>{{ shotStateLabel(shot) }}</em>
           </button>
         </section>
 
@@ -310,6 +315,28 @@
           compact
           @edit="openVideoModelPicker"
         />
+        <section v-if="currentShotArtifact" class="shot-operations" aria-label="当前镜头操作">
+          <div class="shot-operation-copy">
+            <span class="section-kicker">镜头 #{{ currentShotArtifact.content?.number || currentShotArtifact.scope_id }}</span>
+            <strong>{{ shotStateLabel(currentShotArtifact) }}</strong>
+            <small v-if="currentShotArtifact.content?.included === false">此镜头已退出主序列；已外发任务完成后只进入素材库，不会阻塞后续镜头。</small>
+            <small v-else>操作只影响当前镜头；全自动和 AI 审批会在操作完成后继续无人值守流程。</small>
+          </div>
+          <div class="shot-operation-actions">
+            <el-button
+              v-if="currentShotArtifact.content?.included === false"
+              :icon="Refresh"
+              :loading="shotOperationBusy"
+              @click="restoreShotOperation(currentShotArtifact)"
+            >恢复镜头</el-button>
+            <template v-else>
+              <el-button :icon="Edit" :loading="shotOperationBusy" @click="reviseShotOperation(currentShotArtifact)">按意见修改</el-button>
+              <el-button :icon="Files" :loading="shotOperationBusy" @click="splitShotOperation(currentShotArtifact)">拆成两镜</el-button>
+              <el-button :icon="VideoCamera" :loading="shotOperationBusy" @click="pickupShotOperation(currentShotArtifact)">补拍一镜</el-button>
+              <el-button type="danger" plain :icon="Remove" :loading="shotOperationBusy" @click="skipShotOperation(currentShotArtifact)">跳过并继续</el-button>
+            </template>
+          </div>
+        </section>
         <ProviderStatus
           v-if="activeRun.status === 'waiting_provider' || activeProviderAction"
           class="provider-status-spacing"
@@ -673,21 +700,21 @@
                   </section>
                   <div v-for="bucket in referenceBuckets(artifact)" :key="bucket.key" class="reference-bucket">
                     <div class="bucket-title">
-                      <span>{{ bucket.label }}</span><small>{{ bucket.items.length }} / {{ bucket.limit }}</small>
+                      <span>{{ bucket.label }}</span><small>{{ bucket.limit == null ? `${bucket.items.length} · 上游校验` : `${bucket.items.length} / ${bucket.limit}（建议）` }}</small>
                     </div>
                     <div class="reference-list">
                       <div v-for="item in bucket.items" :key="item.path" class="reference-row">
                         <el-icon><component :is="bucket.key === 'images' ? Picture : bucket.key === 'videos' ? VideoCamera : Headset" /></el-icon>
                         <span><strong>{{ item.label || fileName(item.path) }}</strong><small>{{ referenceSourceText(item) }}</small></span>
                         <a :href="mediaUrl(item.path)" target="_blank" title="查看"><el-icon><View /></el-icon></a>
-                        <el-icon v-if="item.locked" class="reference-lock" title="由上一镜头派生，不能手动移除"><Lock /></el-icon>
-                        <el-button v-else-if="!isUnattendedMode" :icon="Close" circle title="移除" @click="removeReference(artifact, bucket.key, item.path)" />
+                        <el-icon v-if="item.locked" class="reference-lock" title="由上一镜头派生；仍可按需移除"><Lock /></el-icon>
+                        <el-button v-if="!isUnattendedMode" :icon="Close" circle :title="item.locked ? '移除派生参考' : '移除'" @click="removeReference(artifact, bucket.key, item.path)" />
                       </div>
                       <span v-if="!bucket.items.length" class="bucket-empty">暂无文件</span>
-                    </div>
+                     </div>
                      <div v-if="!isUnattendedMode" class="reference-add-actions">
-                       <el-button :icon="Plus" size="small" :disabled="bucket.items.length >= bucket.limit" @click="uploadBundleReference(artifact, bucket.key)">添加{{ bucket.label }}</el-button>
-                       <el-button :icon="FolderOpened" size="small" :disabled="bucket.items.length >= bucket.limit" @click="openMediaPicker(artifact, bucket.key)">从素材库</el-button>
+                       <el-button :icon="Plus" size="small" @click="uploadBundleReference(artifact, bucket.key)">添加{{ bucket.label }}</el-button>
+                       <el-button :icon="FolderOpened" size="small" @click="openMediaPicker(artifact, bucket.key)">从素材库</el-button>
                      </div>
                   </div>
                 </div>
@@ -872,15 +899,38 @@
           <div class="video-provider-receipt">
             <span><small>提供方</small><strong>YinziAPI</strong></span>
             <span><small>当前视频配置</small><strong>{{ activeVideoConfig?.name || '未找到启用的视频配置' }}</strong></span>
-            <span><small>当前有效镜头模型</small><strong>{{ currentRoute.model || '提交前自动选择' }}</strong></span>
-            <el-button :icon="Refresh" :loading="videoCatalogLoading" @click="loadCatalogs">刷新模型目录</el-button>
+            <span><small>当前有效镜头模型</small><strong>{{ projectVideoModelLabel }}</strong></span>
+            <el-button :icon="Refresh" :loading="videoCatalogLoading" @click="refreshSelectedVideoCatalog">刷新模型目录</el-button>
           </div>
           <el-alert v-if="catalogLoadError" type="warning" :closable="false" show-icon :title="catalogLoadError" />
 
           <div class="settings-grid video-routing-grid">
+            <div class="video-config-select">
+              <label>视频 URL / Key 配置</label>
+              <el-select
+                v-model="settingsDraft.video_config_id"
+                filterable
+                placeholder="选择已配置的视频渠道"
+                :loading="videoConfigsLoading"
+                @change="onVideoConfigChange"
+              >
+                <el-option
+                  v-for="config in activeVideoConfigs"
+                  :key="config.id"
+                  :label="`${config.name || config.provider || '视频配置'} · ${config.base_url || '未填写 URL'}`"
+                  :value="config.id"
+                >
+                  <span class="video-config-option">
+                    <strong>{{ config.name || config.provider || `视频配置 #${config.id}` }}</strong>
+                    <small>{{ config.base_url || '未填写 Base URL' }} · {{ config.has_api_key ? 'Key 已保存' : '缺少 Key' }}</small>
+                  </span>
+                </el-option>
+              </el-select>
+              <small class="field-hint">切换后会按这个 Key 重新读取可用模型；没有选择时不会沿用旧配置。</small>
+            </div>
             <div>
               <label>视频分组</label>
-              <el-select v-model="settingsDraft.video_group" filterable placeholder="选择当前 Key 可用分组" @change="projectExpensiveConfirmed = false">
+              <el-select v-model="settingsDraft.video_group" filterable allow-create default-first-option placeholder="选择或手动输入视频分组" @change="projectExpensiveConfirmed = false">
                 <el-option v-for="group in projectVideoGroups" :key="group" :label="group" :value="group" />
               </el-select>
             </div>
@@ -902,35 +952,39 @@
               <el-radio-button value="fixed">固定一个模型</el-radio-button>
             </el-radio-group>
             <p v-if="settingsDraft.video_routing_mode === 'auto'">系统按每镜时长、参考图/视频/音频能力、质量偏好与价格自动选择；镜头级手动覆盖仍然优先。</p>
-            <p v-else>固定模型必须兼容项目中的全部镜头。保存时后端会按实时目录逐镜核对，不兼容时会说明具体镜头和原因。</p>
+            <p v-else>固定模型按你的选择保存；本地能力提示只用于说明风险，不会因为未登记、跨分组或参考包不匹配而禁止保存，最终由上游响应决定。</p>
           </div>
 
           <div v-if="settingsDraft.video_routing_mode === 'fixed'" class="fixed-video-model">
             <label>项目固定模型</label>
-            <el-select v-model="settingsDraft.video_model" filterable placeholder="从实时目录选择模型" @change="projectExpensiveConfirmed = false">
+            <el-select v-model="settingsDraft.video_model" filterable allow-create default-first-option placeholder="从目录选择或手动输入模型名" @change="projectExpensiveConfirmed = false">
               <el-option
                 v-for="option in projectVideoModelOptions"
                 :key="option.model"
                 :label="`${option.name || option.model} · ${modelDurationLabel(option)} · ${modelPriceLabel(option)}`"
                 :value="option.model"
-                :disabled="!option.selectable"
               />
             </el-select>
             <div v-if="projectSelectedVideoOption" class="project-model-receipt">
               <span><strong>{{ projectSelectedVideoOption.model }}</strong><small>{{ modelMediaLabel(projectSelectedVideoOption) }} · {{ modelQualityLabel(projectSelectedVideoOption) }} · {{ modelPriceLabel(projectSelectedVideoOption) }}</small></span>
-              <el-tag :type="projectSelectedVideoOption.selectable ? 'success' : 'danger'" effect="plain">{{ modelCompatibilityLabel(projectSelectedVideoOption) }}</el-tag>
+              <el-tag :type="projectSelectedVideoOption.contract_status === 'known' && projectSelectedVideoOption.group_available !== false ? 'success' : 'warning'" effect="plain">{{ modelCompatibilityLabel(projectSelectedVideoOption) }}</el-tag>
             </div>
-            <el-alert v-else-if="settingsDraft.video_model" type="error" :closable="false" show-icon title="当前实时目录中找不到这个模型，请刷新目录或改选其它模型。" />
+            <el-alert v-if="projectSelectedVideoOption?.warnings?.length" type="warning" :closable="false" show-icon :title="modelWarnings(projectSelectedVideoOption).join('；')" />
+            <el-alert v-else-if="settingsDraft.video_model && !projectSelectedVideoOption" type="warning" :closable="false" show-icon title="模型能力尚未从当前 Key 目录确认，仍可保存并在提交时由上游校验。" />
             <el-checkbox v-if="projectSelectedVideoOption?.requires_explicit_confirmation" v-model="projectExpensiveConfirmed">
               我已确认这是高价破甲模型，并接受目录显示的价格
             </el-checkbox>
+            <div class="model-contract-actions">
+              <el-button link type="primary" :loading="videoCatalogLoading" @click="refreshSelectedVideoCatalog">同步当前 Key 模型与能力提示</el-button>
+              <el-button link type="primary" @click="router.push({ name: 'advanced-settings', query: { tab: 'prices', model: settingsDraft.video_model || '' } })">编辑价格/契约提示</el-button>
+            </div>
           </div>
 
           <div class="settings-grid">
             <div><label>每镜自动尝试上限</label><el-input-number v-model="settingsDraft.max_video_attempts_per_shot" :min="1" :max="6" /></div>
             <div><label>全片视频任务上限</label><el-input-number v-model="settingsDraft.max_video_attempts" :min="1" :max="120" /></div>
           </div>
-          <el-alert type="info" :closable="false" show-icon title="目录可选不等于上游此刻一定稳定；真正提交前还会再次校验。高价破甲模型不会被自动路由选中。" />
+          <el-alert type="info" :closable="false" show-icon title="目录和能力提示只用于自动建议与费用预估；手动选中的任意模型都会按原名提交。上游若拒绝，会保留原始原因和参考包，供你调整后重试。高价破甲模型仍需单独确认价格。" />
         </section>
         <div class="settings-grid">
           <div><label>目标镜头</label><el-input-number v-model="settingsDraft.target_shots" :min="1" :max="12" /></div>
@@ -967,6 +1021,7 @@
       :loading="videoRoutingLoading"
       :saving="videoRoutingSaving"
       @refresh="loadVideoRouting(videoRoutingShotId)"
+      @manage-capabilities="openVideoCapabilityManager"
       @save="saveVideoRouting"
     />
 
@@ -1032,6 +1087,25 @@
       </div>
     </el-dialog>
 
+    <WorkflowUploadDialog
+      v-model="uploadDialogVisible"
+      :title="uploadDialogContext?.title || '上传媒体'"
+      :description="uploadDialogContext?.description || ''"
+      :accept="uploadDialogContext?.accept || '*/*'"
+      :expected-media-type="uploadDialogContext?.expectedMediaType || 'image'"
+      :endpoint="uploadDialogContext?.endpoint || 'reference'"
+      :drama-id="dramaId"
+      :capability="uploadDialogContext?.capability || {}"
+      :current-items="uploadDialogContext?.currentItems || []"
+      :targets="uploadDialogContext?.targets || []"
+      :initial-target-key="uploadDialogContext?.initialTargetKey || ''"
+      :max-files="uploadDialogContext?.maxFiles ?? null"
+      :enforce-contract-limits="uploadDialogContext?.enforceContractLimits !== false"
+      :concurrency="3"
+      :commit-upload="commitWorkflowUpload"
+      @finished="onWorkflowUploadFinished"
+    />
+
     <el-dialog v-model="exportVisible" title="交付文件已整理" width="min(720px, 94vw)">
       <div v-if="exportResult" class="export-result">
         <el-icon><FolderOpened /></el-icon>
@@ -1078,7 +1152,6 @@ import { dramaAPI } from '@/api/drama'
 import { aiAPI } from '@/api/ai'
 import { productionAPI } from '@/api/production'
 import { advancedSettingsAPI } from '@/api/advancedSettings'
-import { uploadAPI } from '@/api/upload'
 import FieldAssist from '@/components/production/FieldAssist.vue'
 import DirectorCapture from '@/components/production/DirectorCapture.vue'
 import ShotContinuityPanel from '@/components/production/ShotContinuityPanel.vue'
@@ -1086,6 +1159,7 @@ import ShotRouteCard from '@/components/production/ShotRouteCard.vue'
 import VideoModelPicker from '@/components/production/VideoModelPicker.vue'
 import ProviderStatus from '@/components/production/ProviderStatus.vue'
 import ActivityLog from '@/components/production/ActivityLog.vue'
+import WorkflowUploadDialog from '@/components/production/WorkflowUploadDialog.vue'
 import { joinSelectedChapters, splitNovelChapters } from '@/utils/novelChapters'
 import {
   buildReferenceAutoLinkView,
@@ -1116,6 +1190,8 @@ import {
   modelMediaLabel,
   modelPriceLabel,
   modelQualityLabel,
+  modelWarnings,
+  projectVideoModelDisplay,
   projectVideoRoutingChanged,
   videoGroupsFromCatalog,
 } from '@/utils/videoModelRouting'
@@ -1151,6 +1227,7 @@ const starting = ref(false)
 const driving = ref(false)
 const savingId = ref(null)
 const suggestingId = ref(null)
+const shotOperationBusy = ref(false)
 const manualAdding = ref(false)
 const drama = ref(null)
 const graph = reactive({ stages: [], macros: [] })
@@ -1169,6 +1246,8 @@ const preflightResult = ref(null)
 const videoCatalog = ref([])
 const videoConfigs = ref([])
 const videoCatalogLoading = ref(false)
+const videoConfigsLoading = ref(false)
+const videoCatalogConfigId = ref(null)
 const catalogLoadError = ref('')
 const imageCatalog = ref([])
 const imageConfigs = reactive({ image: [], storyboard_image: [] })
@@ -1200,6 +1279,8 @@ const mediaPickerTarget = ref(null)
 const mediaPickerScope = ref('project')
 const mediaPickerKeyword = ref('')
 const materializingMediaId = ref(null)
+const uploadDialogVisible = ref(false)
+const uploadDialogContext = ref(null)
 const videoModelPickerVisible = ref(false)
 const videoRoutingShotId = ref(null)
 const videoRouting = ref(null)
@@ -1384,10 +1465,25 @@ function artifactRoute(artifact) {
     activeRun.value || {},
   )
 }
-const activeVideoConfig = computed(() => videoConfigs.value.find((item) => item.is_active && item.is_default)
-  || videoConfigs.value.find((item) => item.is_active)
+const activeVideoConfigs = computed(() => videoConfigs.value.filter((item) => item.is_active !== false))
+const activeVideoConfig = computed(() => {
+  const preferredId = (settingsVisible.value ? settingsDraft.value?.video_config_id : null)
+    ?? activeRun.value?.policy?.video_config_id
+  return videoConfigs.value.find((item) => item.is_active !== false && Number(item.id) === Number(preferredId))
+  || videoConfigs.value.find((item) => item.is_active !== false && item.is_default)
+  || videoConfigs.value.find((item) => item.is_active !== false)
   || videoConfigs.value[0]
-  || null)
+  || null
+})
+const projectVideoModelLabel = computed(() => projectVideoModelDisplay({
+  settingsVisible: settingsVisible.value,
+  draft: settingsDraft.value,
+  activePolicy: activeRun.value?.policy || {},
+  currentModel: currentRoute.value.model,
+  catalogConfigId: videoCatalogConfigId.value,
+  catalog: videoCatalog.value,
+  catalogError: catalogLoadError.value,
+}))
 const projectVideoGroups = computed(() => {
   const groups = videoGroupsFromCatalog(videoCatalog.value)
   const current = String(settingsDraft.value?.video_group || '').trim()
@@ -1395,24 +1491,28 @@ const projectVideoGroups = computed(() => {
 })
 const projectVideoModelOptions = computed(() => {
   const group = String(settingsDraft.value?.video_group || '').trim()
-  return (videoCatalog.value || [])
+  const options = (videoCatalog.value || [])
     .map((item) => catalogModelOption(videoCatalog.value, item.model, group))
     .filter(Boolean)
     .sort((left, right) => {
-      if (left.selectable !== right.selectable) return left.selectable ? -1 : 1
       return String(left.name || left.model).localeCompare(String(right.name || right.model), 'zh-CN')
     })
+  const currentModel = String(settingsDraft.value?.video_model || '').trim()
+  if (currentModel && !options.some((item) => item.model === currentModel)) options.unshift(catalogModelOption(videoCatalog.value, currentModel, group))
+  return options
 })
-const projectSelectedVideoOption = computed(() => projectVideoModelOptions.value
-  .find((item) => item.model === settingsDraft.value?.video_model) || null)
+const projectSelectedVideoOption = computed(() => {
+  const model = String(settingsDraft.value?.video_model || '').trim()
+  return model ? catalogModelOption(videoCatalog.value, model, String(settingsDraft.value?.video_group || '').trim()) : null
+})
 const settingsSaveDisabled = computed(() => {
   if (!settingsDraft.value || settingsSaving.value) return true
   if (settingsDraft.value.video_routing_mode !== 'fixed') return false
-  if (!projectSelectedVideoOption.value?.selectable) return true
+  if (!String(settingsDraft.value.video_model || '').trim()) return true
   return projectSelectedVideoOption.value.requires_explicit_confirmation === true && !projectExpensiveConfirmed.value
 })
 const shotStrip = computed(() => (runSummary.value?.artifacts || [])
-  .filter((item) => item.stage === 'storyboard_plan' && item.content?.included !== false)
+  .filter((item) => item.stage === 'storyboard_plan')
   .sort((a, b) => Number(a.content?.number || a.scope_id || 0) - Number(b.content?.number || b.scope_id || 0)))
 const manualTargetOptions = computed(() => {
   if (!activeRun.value || !currentStage.value?.source_stage) return []
@@ -1548,7 +1648,7 @@ async function loadRun(runId, { loadEvidence = true, viewportSnapshot = null } =
   const previousRun = runSummary.value?.run || null
   const nextSummary = await productionAPI.getRun(runId)
   const validShotIds = (nextSummary.artifacts || [])
-    .filter((item) => item.stage === 'storyboard_plan' && item.current !== false && item.content?.included !== false)
+    .filter((item) => item.stage === 'storyboard_plan' && item.current !== false)
     .map((item) => String(item.scope_id || ''))
     .filter(Boolean)
   const focus = resolveWorkflowFocus({
@@ -1664,6 +1764,75 @@ function selectShot(shot) {
   })
 }
 
+function shotStateLabel(shot) {
+  if (!shot) return '未创建'
+  if (shot.content?.included === false) return '已跳过，可恢复'
+  const scopeId = String(shot.scope_id || '')
+  const artifacts = runSummary.value?.artifacts || []
+  const video = artifacts.find((item) => item.stage === 'shot_video'
+    && String(item.scope_id || '') === scopeId
+    && item.status === 'approved'
+    && item.content?.included !== false)
+  if (video) return '镜头视频已通过'
+  if (String(activeRun.value?.current_scope_id || '') === scopeId) {
+    if (activeRun.value?.status === 'waiting_provider') return '云端生成或取回中'
+    return `${currentStage.value?.label || activeRun.value?.current_stage || '制作中'} · ${artifactStatusLabel(shot)}`
+  }
+  return shot.status === 'approved' ? '分镜脚本已确认' : artifactStatusLabel(shot)
+}
+
+function shotOperationErrorCode(error) {
+  return error?.response?.data?.error?.code || error?.code || ''
+}
+
+function waitMs(duration) {
+  return new Promise((resolve) => window.setTimeout(resolve, duration))
+}
+
+async function executeShotOperation({ runId, shotId, request, successMessage }) {
+  if (!runId || shotOperationBusy.value) return null
+  clearPoll()
+  shotOperationBusy.value = true
+  let result = null
+  let resumeAutonomy = false
+  try {
+    for (let attempt = 0; attempt < 24; attempt += 1) {
+      try {
+        const version = String(activeRun.value?.id || '') === String(runId) ? activeRun.value?.version : undefined
+        result = await request(version)
+        break
+      } catch (error) {
+        const code = shotOperationErrorCode(error)
+        if (code === 'VERSION_CONFLICT') {
+          await loadRun(runId, { loadEvidence: false })
+          continue
+        }
+        if (code === 'SHOT_OPERATION_BUSY' && attempt < 23) {
+          await waitMs(250)
+          continue
+        }
+        throw error
+      }
+    }
+    if (!result) throw new Error('当前镜头仍在收束另一个操作，请稍后再试')
+    const focusId = result.focus_shot_id ?? result.summary?.run?.current_scope_id ?? shotId ?? null
+    selectedShotId.value = focusId == null ? null : String(focusId)
+    selectedShotPinned.value = false
+    await loadRun(runId, { loadEvidence: true })
+    if (successMessage) ElMessage.success(successMessage)
+    resumeAutonomy = isUnattendedOwner(activeRun.value?.review_owner)
+      && !autonomyIntervention.value
+      && !['paused', 'cancelled', 'completed'].includes(activeRun.value?.status)
+    return result
+  } catch (error) {
+    if (error !== 'cancel' && error !== 'close') ElMessage.error(error.message || '镜头操作失败')
+    return null
+  } finally {
+    shotOperationBusy.value = false
+    if (resumeAutonomy) driveRun().catch(() => {})
+  }
+}
+
 async function loadVideoRouting(shotId = videoRoutingShotId.value) {
   if (!activeRun.value || shotId == null || shotId === '') return
   videoRoutingShotId.value = String(shotId)
@@ -1689,6 +1858,25 @@ async function openVideoModelPicker(artifact = null) {
   videoRoutingError.value = ''
   videoModelPickerVisible.value = true
   await loadVideoRouting(shotId)
+}
+
+function openVideoCapabilityManager(modelOverride = '') {
+  const configId = Number(videoRouting.value?.project?.config_id || settingsDraft.value?.video_config_id || 0)
+  const model = String(
+    modelOverride
+      || videoRouting.value?.effective_route?.model
+      || videoRouting.value?.shot?.model
+      || videoRouting.value?.project?.model
+      || '',
+  ).trim()
+  if (!Number.isSafeInteger(configId) || configId <= 0) {
+    ElMessage.warning('请先在项目设置中选择已保存的视频 URL / Key 配置')
+    router.push({ name: 'ai-config' })
+    return
+  }
+  const action = `capability:${configId}:${model}`
+  videoModelPickerVisible.value = false
+  router.push({ name: 'ai-config', query: { action } })
 }
 
 async function saveVideoRouting(payload) {
@@ -1767,6 +1955,7 @@ async function loadReusableMedia() {
 
 async function loadCatalogs() {
   videoCatalogLoading.value = true
+  videoConfigsLoading.value = true
   catalogLoadError.value = ''
   try {
     const results = await Promise.allSettled([
@@ -1786,8 +1975,69 @@ async function loadCatalogs() {
     if (videoResult.status === 'fulfilled') videoConfigs.value = Array.isArray(videoResult.value) ? videoResult.value : []
     const failures = results.filter((item) => item.status === 'rejected')
     if (failures.length) catalogLoadError.value = `有 ${failures.length} 项配置或目录暂时无法刷新；已加载内容仍保留，可稍后重试。`
+    const selectedConfigId = settingsDraft.value?.video_config_id ?? activeRun.value?.policy?.video_config_id
+    if (selectedConfigId) {
+      await discoverVideoCatalog(selectedConfigId, {
+        group: settingsDraft.value?.video_group || activeRun.value?.policy?.video_group || '',
+        preserveLoading: true,
+      })
+    }
   } finally {
     videoCatalogLoading.value = false
+    videoConfigsLoading.value = false
+  }
+}
+
+async function discoverVideoCatalog(configId, options = {}) {
+  const normalizedId = Number(configId)
+  if (!Number.isSafeInteger(normalizedId) || normalizedId <= 0) {
+    videoCatalog.value = []
+    videoCatalogConfigId.value = null
+    catalogLoadError.value = '请先选择一个已保存的视频 URL / Key 配置。'
+    return false
+  }
+  if (!options.preserveLoading) videoCatalogLoading.value = true
+  catalogLoadError.value = ''
+  try {
+    const result = await aiAPI.discoverModels({
+      config_id: normalizedId,
+      service_type: 'video',
+      group: String(options.group || '').trim(),
+    }, { suppressGlobalError: true })
+    const catalog = Array.isArray(result?.catalog?.video) ? result.catalog.video : []
+    videoCatalog.value = catalog
+    videoCatalogConfigId.value = normalizedId
+    if (!catalog.length) catalogLoadError.value = '这个 Key 的模型目录为空，请确认分组权限或上游 /models 返回内容。'
+    return catalog.length > 0
+  } catch (error) {
+    videoCatalog.value = []
+    videoCatalogConfigId.value = normalizedId
+    catalogLoadError.value = `读取当前视频配置的模型目录失败：${error.message || '请检查 URL、Key 和上游 /models 接口'}`
+    return false
+  } finally {
+    if (!options.preserveLoading) videoCatalogLoading.value = false
+  }
+}
+
+async function refreshSelectedVideoCatalog() {
+  const configId = settingsDraft.value?.video_config_id ?? activeRun.value?.policy?.video_config_id
+  await discoverVideoCatalog(configId, {
+    group: settingsDraft.value?.video_group || activeRun.value?.policy?.video_group || '',
+  })
+}
+
+async function onVideoConfigChange(configId) {
+  if (!settingsDraft.value) return
+  projectExpensiveConfirmed.value = false
+  settingsDraft.value.video_model = ''
+  const loaded = await discoverVideoCatalog(configId, { group: settingsDraft.value.video_group })
+  if (!loaded) return
+  const groups = videoGroupsFromCatalog(videoCatalog.value)
+  if (settingsDraft.value.video_group && !groups.includes(settingsDraft.value.video_group)) {
+    settingsDraft.value.video_group = groups[0] || ''
+  }
+  if (settingsDraft.value.video_routing_mode === 'fixed') {
+    settingsDraft.value.video_model = projectVideoModelOptions.value.find((item) => item.selectable)?.model || ''
   }
 }
 
@@ -1972,6 +2222,9 @@ async function createAndStartRun() {
         asset_image_config_id: imageConfigs.image.find((item) => item.is_default)?.id || imageConfigs.image[0]?.id || null,
         storyboard_image_config_id: imageConfigs.storyboard_image.find((item) => item.is_default)?.id || imageConfigs.storyboard_image[0]?.id || null,
         image_concurrency: newRun.imageConcurrency,
+        video_config_id: videoConfigs.value.find((item) => item.is_active !== false && item.is_default)?.id
+          || videoConfigs.value.find((item) => item.is_active !== false)?.id
+          || null,
         video_model: newRun.videoModel || '',
         video_routing_mode: 'auto',
         video_duration_min: 5,
@@ -2282,13 +2535,139 @@ async function reopenArtifact(artifact) {
   }
 }
 
+async function skipShotOperation(artifact) {
+  try {
+    const { value } = await ElMessageBox.prompt(
+      '镜头会退出主序列并立即让出后续制作。已经外发的视频不会重复提交，完成后只保留到素材库。',
+      `跳过镜头 #${artifact.content?.number || artifact.scope_id}`,
+      { inputPlaceholder: '可填写跳过原因', confirmButtonText: '跳过并继续', cancelButtonText: '取消' },
+    )
+    return executeShotOperation({
+      runId: activeRun.value.id,
+      shotId: artifact.scope_id,
+      request: (version) => productionAPI.skipShot(activeRun.value.id, artifact.scope_id, {
+        reason: String(value || '用户跳过此镜头').trim(),
+        expected_version: version,
+      }),
+      successMessage: '已跳过当前镜头并继续后续序列',
+    })
+  } catch (error) {
+    if (error !== 'cancel' && error !== 'close') ElMessage.error(error.message || '跳过镜头失败')
+    return null
+  }
+}
+
+async function restoreShotOperation(artifact) {
+  try {
+    await ElMessageBox.confirm(
+      '将创建一个新的分镜草稿重新进入审批，旧的分镜图、参考包和视频不会被自动复活。',
+      `恢复镜头 #${artifact.content?.number || artifact.scope_id}`,
+      { confirmButtonText: '恢复为新草稿', cancelButtonText: '取消' },
+    )
+    return executeShotOperation({
+      runId: activeRun.value.id,
+      shotId: artifact.scope_id,
+      request: (version) => productionAPI.restoreShot(activeRun.value.id, artifact.scope_id, {
+        reason: '用户恢复已跳过镜头', expected_version: version,
+      }),
+      successMessage: '镜头已恢复为新草稿',
+    })
+  } catch (error) {
+    if (error !== 'cancel' && error !== 'close') ElMessage.error(error.message || '恢复镜头失败')
+    return null
+  }
+}
+
+async function reviseShotOperation(artifact) {
+  try {
+    const { value } = await ElMessageBox.prompt(
+      '写清需要保留和改变的内容，系统会重写这一镜并让其后代按新版本重建。',
+      `修改镜头 #${artifact.content?.number || artifact.scope_id}`,
+      {
+        inputPlaceholder: '例如：保留角色和场景，只把动作改成先回头再拔剑',
+        confirmButtonText: '生成新修订',
+        inputValidator: (text) => Boolean(String(text || '').trim()) || '请输入修改要求',
+      },
+    )
+    return executeShotOperation({
+      runId: activeRun.value.id,
+      shotId: artifact.scope_id,
+      request: (version) => productionAPI.reviseShot(activeRun.value.id, artifact.scope_id, {
+        instruction: String(value).trim(), expected_version: version,
+      }),
+      successMessage: '镜头新修订已生成',
+    })
+  } catch (error) {
+    if (error !== 'cancel' && error !== 'close') ElMessage.error(error.message || '修改镜头失败')
+    return null
+  }
+}
+
+async function splitShotOperation(artifact) {
+  try {
+    const { value } = await ElMessageBox.prompt(
+      '说明当前镜头中没有展示完的动作或信息，系统会在真实剪辑点拆成两镜。',
+      `拆分镜头 #${artifact.content?.number || artifact.scope_id}`,
+      {
+        inputPlaceholder: '例如：把角色看到符箓后的反应拆成下一镜头特写',
+        confirmButtonText: '拆成两镜',
+        inputValidator: (text) => Boolean(String(text || '').trim()) || '请输入拆分要求',
+      },
+    )
+    return executeShotOperation({
+      runId: activeRun.value.id,
+      shotId: artifact.scope_id,
+      request: (version) => productionAPI.splitShot(activeRun.value.id, artifact.scope_id, {
+        instruction: String(value).trim(), expected_version: version,
+      }),
+      successMessage: '已创建两个可独立制作的镜头草稿',
+    })
+  } catch (error) {
+    if (error !== 'cancel' && error !== 'close') ElMessage.error(error.message || '拆分镜头失败')
+    return null
+  }
+}
+
+async function pickupShotOperation(artifact) {
+  try {
+    const { value } = await ElMessageBox.prompt(
+      '补拍镜头会插入当前镜头之后，不会覆盖现有素材。',
+      `在镜头 #${artifact.content?.number || artifact.scope_id} 后补拍`,
+      {
+        inputPlaceholder: '例如：补一个桃木剑落地后符纹熄灭的道具特写',
+        confirmButtonText: '添加补拍镜头',
+        inputValidator: (text) => Boolean(String(text || '').trim()) || '请输入补拍内容',
+      },
+    )
+    return executeShotOperation({
+      runId: activeRun.value.id,
+      shotId: artifact.scope_id,
+      request: (version) => productionAPI.pickupShot(activeRun.value.id, {
+        after_shot_id: artifact.scope_id,
+        instruction: String(value).trim(),
+        expected_version: version,
+      }),
+      successMessage: '补拍镜头已插入序列',
+    })
+  } catch (error) {
+    if (error !== 'cancel' && error !== 'close') ElMessage.error(error.message || '添加补拍镜头失败')
+    return null
+  }
+}
+
 async function excludeArtifact(artifact) {
+  if (artifact.stage === 'storyboard_plan' && artifact.scope_type === 'shot') {
+    return skipShotOperation(artifact)
+  }
   const { value } = await ElMessageBox.prompt('可以说明为什么不再使用，后续也可恢复。', '不使用此项', { inputPlaceholder: '例如：剧情已删除这个道具', confirmButtonText: '确认不使用' })
   await productionAPI.excludeArtifact(artifact.id, { reason: value || '用户选择不使用' })
   await loadRun(activeRun.value.id)
 }
 
 async function restoreArtifact(artifact) {
+  if (artifact.stage === 'storyboard_plan' && artifact.scope_type === 'shot') {
+    return restoreShotOperation(artifact)
+  }
   await productionAPI.restoreArtifact(artifact.id, { reason: '用户恢复使用' })
   await loadRun(activeRun.value.id)
 }
@@ -2404,9 +2783,9 @@ async function addManualDerivedArtifact(target) {
   }, source)
   const content = stage === 'reference_bundle'
     ? {
-      images: [], videos: [], audios: [], limits: manualRoute.usesReferenceVideo
-        ? { images: 4, videos: 3, audios: 1 }
-        : { images: 9, videos: 0, audios: 3 },
+      images: [], videos: [], audios: [], limits: null,
+      soft_limits: true,
+      media_constraints: { contract_status: 'unknown' },
       route_profile: manualRoute.profile,
       uses_reference_video: manualRoute.usesReferenceVideo,
       requires_director_preview: manualRoute.requiresDirectorPreview,
@@ -2432,48 +2811,46 @@ async function addManualDerivedArtifact(target) {
   }
 }
 
-async function uploadManualMedia(target) {
+function uploadManualMedia(target) {
   const stage = activeRun.value.current_stage
   const imageStage = ['asset_images', 'storyboard_images'].includes(stage)
-  const input = document.createElement('input')
-  input.type = 'file'
-  input.accept = imageStage ? 'image/*' : 'video/*'
-  input.onchange = async () => {
-    const file = input.files?.[0]
-    if (!file) return
-    manualAdding.value = true
-    try {
-      const uploaded = imageStage
-        ? await uploadAPI.uploadImage(file, { dramaId })
-        : await uploadAPI.uploadReferenceMedia(file)
-      const source = target?.source || null
-      await productionAPI.addArtifact(activeRun.value.id, {
-        stage,
-        source_artifact_id: source?.id,
-        scope_type: source?.scope_type || 'run',
-        scope_id: source?.scope_id || '',
-        title: source ? `${source.title} · ${file.name}` : file.name,
-        content: { included: true, uploaded_by_user: true, source_artifact_id: source?.id },
-        media_path: uploaded.local_path || uploaded.path,
-        mime_type: file.type,
-      })
-      await loadRun(activeRun.value.id)
-    } catch (error) {
-      ElMessage.error(error.message || '手动上传失败')
-    } finally {
-      manualAdding.value = false
-    }
+  const targets = manualTargetOptions.value.map((item) => ({ ...item }))
+  uploadDialogContext.value = {
+    mode: 'stage',
+    stage,
+    title: imageStage ? '批量上传阶段图片' : stage === 'final_edit' ? '上传已剪辑成片' : '批量上传阶段视频',
+    description: targets.length > 1 ? '每个文件会明确分配到一个目标，不会静默覆盖其它角色、场景或镜头。' : '',
+    expectedMediaType: imageStage ? 'image' : 'video',
+    endpoint: imageStage ? 'image' : 'reference',
+    accept: imageStage ? 'image/*' : 'video/*',
+    targets,
+    initialTargetKey: target?.key || targets[0]?.key || '',
+    maxFiles: targets.length || 1,
+    currentItems: [],
+    capability: {
+      media_constraints: {
+        contract_status: 'known',
+        ...(imageStage ? { max_image_bytes: 16 * 1024 * 1024 } : { max_video_bytes: 50 * 1024 * 1024 }),
+      },
+    },
   }
-  input.click()
+  uploadDialogVisible.value = true
 }
 
 function referenceBuckets(artifact) {
   const content = drafts[artifact.id] || artifact.content || {}
   const limits = content.limits || artifact.content?.limits || {}
+  const contractStatus = String(content.media_constraints?.contract_status || content.contract_status || '')
+  const softLimits = content.soft_limits === true || contractStatus !== 'known'
+  const resolvedLimit = (key) => {
+    if (softLimits) return null
+    const value = Number(limits[key])
+    return Number.isFinite(value) ? value : null
+  }
   return [
-    { key: 'images', label: '参考图', limit: Number(limits.images ?? 4), items: content.images || [] },
-    { key: 'videos', label: '参考视频', limit: Number(limits.videos ?? 3), items: content.videos || [] },
-    { key: 'audios', label: '参考音频', limit: Number(limits.audios ?? 1), items: content.audios || [] },
+    { key: 'images', label: '参考图', limit: resolvedLimit('images'), items: content.images || [] },
+    { key: 'videos', label: '参考视频', limit: resolvedLimit('videos'), items: content.videos || [] },
+    { key: 'audios', label: '参考音频', limit: resolvedLimit('audios'), items: content.audios || [] },
   ]
 }
 
@@ -2487,20 +2864,104 @@ function referenceSourceText(item) {
   return referenceSourceLabel(item)
 }
 
-async function uploadBundleReference(artifact, type) {
-  const input = document.createElement('input')
-  input.type = 'file'
-  input.accept = type === 'images' ? 'image/*' : type === 'videos' ? 'video/*' : 'audio/*'
-  input.onchange = async () => {
-    const file = input.files?.[0]
-    if (!file) return
-    const uploaded = await uploadAPI.uploadReferenceMedia(file)
+function uploadBundleReference(artifact, type) {
+  const content = drafts[artifact.id] || artifact.content || {}
+  const bucket = referenceBuckets(artifact).find((item) => item.key === type)
+  const allItems = ['images', 'videos', 'audios'].flatMap((key) => (content[key] || []).map((item) => ({
+    ...item,
+    mime_type: item.mime_type || (key === 'images' ? 'image/*' : key === 'videos' ? 'video/*' : 'audio/*'),
+  })))
+  const mediaType = type === 'images' ? 'image' : type === 'videos' ? 'video' : 'audio'
+  const remainingText = bucket?.limit == null
+    ? '当前模型未登记硬上限，可继续添加；提交时由上游校验'
+    : `当前为建议上限 ${bucket.limit} 个，可继续添加，提交时由上游校验`
+  uploadDialogContext.value = {
+    mode: 'reference',
+    artifactId: artifact.id,
+    bucket: type,
+    title: `为 ${artifact.title} 添加${bucket?.label || '参考媒体'}`,
+    description: remainingText,
+    expectedMediaType: mediaType,
+    endpoint: 'reference',
+    accept: `${mediaType}/*`,
+    targets: [],
+    initialTargetKey: '',
+    maxFiles: null,
+    enforceContractLimits: false,
+    currentItems: allItems,
+    capability: {
+      limits: content.limits || {},
+      media_constraints: content.media_constraints || { contract_status: 'unknown' },
+    },
+  }
+  uploadDialogVisible.value = true
+}
+
+async function commitWorkflowUpload({ file, descriptor, targetKey, uploaded }) {
+  const context = uploadDialogContext.value
+  if (!context || !activeRun.value) throw new Error('上传目标已经失效，请重新打开上传窗口')
+  const mediaPath = uploaded.local_path || uploaded.path
+  if (!mediaPath) throw new Error('上传成功，但服务端没有返回可用文件路径')
+  if (context.mode === 'stage') {
+    const target = context.targets.find((item) => item.key === targetKey)
+    if (!target) throw new Error('请选择此文件对应的角色、场景或镜头')
+    const source = target.source || null
+    await productionAPI.addArtifact(activeRun.value.id, {
+      stage: context.stage,
+      source_artifact_id: source?.id,
+      scope_type: source?.scope_type || 'run',
+      scope_id: source?.scope_id || '',
+      title: source ? `${source.title} · ${file.name}` : file.name,
+      content: {
+        included: true,
+        uploaded_by_user: true,
+        source_artifact_id: source?.id,
+        upload_receipt: {
+          sha256: uploaded.sha256 || descriptor.sha256 || null,
+          size: Number(file.size || 0),
+          deduplicated: uploaded.deduplicated === true,
+        },
+      },
+      media_path: mediaPath,
+      mime_type: file.type,
+      content_hash: uploaded.sha256 || descriptor.sha256 || null,
+    })
+    return
+  }
+  if (context.mode === 'reference') {
+    const artifact = (runSummary.value?.artifacts || []).find((item) => Number(item.id) === Number(context.artifactId))
+    if (!artifact || !drafts[artifact.id]) throw new Error('参考包已经变化，请重新打开上传窗口')
     const content = deepClone(drafts[artifact.id])
-    content[type] = [...(content[type] || []), { path: uploaded.local_path || uploaded.path, label: file.name, source: 'upload' }]
+    const current = content[context.bucket] || []
+    const sha256 = uploaded.sha256 || descriptor.sha256 || null
+    if (current.some((item) => item.path === mediaPath || (sha256 && (item.sha256 || item.content_hash) === sha256))) {
+      const error = new Error('相同内容已经在当前参考包中，无需重复添加')
+      error.code = 'DUPLICATE_REFERENCE'
+      throw error
+    }
+    content[context.bucket] = [...current, {
+      path: mediaPath,
+      label: file.name,
+      source: 'upload',
+      sha256,
+      content_hash: sha256,
+      size: Number(file.size || 0),
+      mime_type: file.type,
+      media_type: descriptor.mediaType,
+      duration_seconds: descriptor.durationSeconds,
+      deduplicated: uploaded.deduplicated === true,
+    }]
     drafts[artifact.id] = content
     markDirty(artifact.id)
   }
-  input.click()
+}
+
+async function onWorkflowUploadFinished(summary) {
+  if (uploadDialogContext.value?.mode === 'stage' && summary.uploaded > 0) {
+    await loadRun(activeRun.value.id)
+  }
+  if (summary.uploaded > 0) ElMessage.success(`已完成 ${summary.uploaded} 个文件`)
+  if (summary.failed > 0) ElMessage.warning(`${summary.failed} 个文件需要调整或重试`)
 }
 
 async function openMediaPicker(artifact, bucket) {
@@ -2519,7 +2980,6 @@ async function selectReusableMedia(item) {
   const target = mediaPickerTarget.value
   if (!target?.artifact || !target.bucket) return
   const content = deepClone(drafts[target.artifact.id])
-  const bucket = referenceBuckets(target.artifact).find((entry) => entry.key === target.bucket)
   const current = content[target.bucket] || []
   if (current.some((entry) => entry.path === item.media_path
     || Number(entry.artifact_id) === Number(item.artifact_id)
@@ -2527,7 +2987,6 @@ async function selectReusableMedia(item) {
     mediaPickerVisible.value = false
     return ElMessage.info('这个媒体已经在参考包中')
   }
-  if (current.length >= Number(bucket?.limit || 0)) return ElMessage.warning('已达到当前模型的参考媒体上限')
   if (item.available === false) return ElMessage.error('源文件不可用，无法加入参考包')
 
   let selected = item
@@ -2574,12 +3033,6 @@ async function selectReusableMedia(item) {
 
 function removeReference(artifact, type, mediaPath) {
   const content = deepClone(drafts[artifact.id])
-  const locked = (content[type] || []).find((item) => item.path === mediaPath && item.locked)
-  if (locked) {
-    return ElMessage.warning(locked.source === 'continuity_first_frame'
-      ? '上一镜尾帧由衔接方式自动派生；如不需要，请把分镜改为“独立切镜”'
-      : '严格首帧由上一镜正式视频派生；如不需要，请修改分镜衔接方式')
-  }
   content[type] = (content[type] || []).filter((item) => item.path !== mediaPath)
   drafts[artifact.id] = content
   markDirty(artifact.id)
@@ -2665,6 +3118,10 @@ async function openSettings() {
     || imageConfigs.storyboard_image.find((item) => item.is_default)
     || imageConfigs.storyboard_image[0]
     || null
+  const videoConfig = videoConfigs.value.find((item) => Number(item.id) === Number(activeRun.value.policy?.video_config_id) && item.is_active !== false)
+    || videoConfigs.value.find((item) => item.is_active !== false && item.is_default)
+    || videoConfigs.value.find((item) => item.is_active !== false)
+    || null
   settingsDraft.value = {
     review_owner: activeRun.value.review_owner,
     style: activeRun.value.policy?.style || '',
@@ -2674,6 +3131,7 @@ async function openSettings() {
       storyboard_image: imageConfigDraft('storyboard_image', storyboardConfig, activeRun.value.policy?.storyboard_image_model || activeRun.value.policy?.image_model),
     },
     image_concurrency: Math.min(8, Math.max(1, Number(activeRun.value.policy?.image_concurrency) || 4)),
+    video_config_id: videoConfig?.id || null,
     video_model: activeRun.value.policy?.video_model || '',
     video_routing_mode: activeRun.value.policy?.video_routing_mode || 'auto',
     video_group: activeRun.value.policy?.video_group || '特价视频分组(即梦)',
@@ -2694,6 +3152,9 @@ async function openSettings() {
   }
   projectExpensiveConfirmed.value = false
   settingsVisible.value = true
+  if (settingsDraft.value.video_config_id) {
+    await discoverVideoCatalog(settingsDraft.value.video_config_id, { group: settingsDraft.value.video_group })
+  }
 }
 
 async function saveSettings() {
@@ -2707,8 +3168,15 @@ async function saveSettings() {
   let routeApplied = false
   settingsSaving.value = true
   try {
+    const videoConfigId = Number(value.video_config_id)
+    if (!Number.isSafeInteger(videoConfigId) || videoConfigId <= 0) {
+      throw new Error('请先选择一个已保存的视频 URL / Key 配置')
+    }
+    if (videoCatalogConfigId.value !== videoConfigId || !videoCatalog.value.length) {
+      await discoverVideoCatalog(videoConfigId, { group: value.video_group })
+    }
     if (value.video_routing_mode === 'fixed') {
-      if (!projectSelectedVideoOption.value?.selectable) throw new Error('请从当前视频分组的实时目录中选择一个可用模型')
+      if (!String(value.video_model || '').trim()) throw new Error('请先选择或手动输入一个视频模型名')
       if (projectSelectedVideoOption.value.requires_explicit_confirmation && !projectExpensiveConfirmed.value) {
         throw new Error('高价破甲模型需要先确认目录价格')
       }
@@ -3048,6 +3516,10 @@ onBeforeUnmount(clearPoll)
 .video-provider-receipt > span { min-width: 0; display: grid; gap: 2px; }
 .video-provider-receipt small { color: #87959a; font-size: 9px; }
 .video-provider-receipt strong { overflow-wrap: anywhere; color: #40565c; font-size: 11px; }
+.video-config-select { min-width: 0; }
+.video-config-option { min-width: 0; display: grid; gap: 1px; line-height: 1.25; }
+.video-config-option strong, .video-config-option small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.video-config-option small, .field-hint { color: #7b898e; font-size: 10px; line-height: 1.45; }
 .project-routing-mode, .fixed-video-model { display: grid; gap: 8px; }
 .project-routing-mode > label, .fixed-video-model > label { color: #51616a; font-size: 12px; font-weight: 650; }
 .project-routing-mode p { margin: 0; color: #718187; font-size: 11px; line-height: 1.55; }
@@ -3074,8 +3546,18 @@ onBeforeUnmount(clearPoll)
   .media-picker-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; color: #586970; font-size: 12px; }.media-picker-toolbar > div { display: flex; align-items: center; gap: 8px; }.media-picker-toolbar > div:last-child { justify-content: flex-end; }.media-picker-toolbar :deep(.el-input) { width: 210px; }.media-picker-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; max-height: 64vh; overflow: auto; }.media-picker-item { min-width: 0; min-height: 80px; padding: 8px; display: grid; grid-template-columns: 96px minmax(0, 1fr) 24px; align-items: center; gap: 10px; border: 1px solid #dce4e6; background: #fff; color: #31424a; text-align: left; cursor: pointer; }.media-picker-item:not(:disabled):hover, .media-picker-item:not(:disabled):focus-visible { border-color: #69aaa0; outline: 2px solid rgba(22, 118, 107, .16); }.media-picker-item:disabled { cursor: wait; }.media-picker-item.is-unavailable { color: #7d898e; border-color: #e1e5e6; background: #f5f6f6; cursor: not-allowed; }.media-picker-item.is-unavailable .media-picker-thumb { opacity: .55; }.media-picker-thumb { width: 96px; aspect-ratio: 16 / 9; display: grid; place-items: center; overflow: hidden; background: #e9edef; }.media-picker-thumb img, .media-picker-thumb video { width: 100%; height: 100%; object-fit: cover; }.media-picker-copy { min-width: 0; display: grid; gap: 5px; }.media-picker-copy strong, .media-picker-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.media-picker-copy strong { font-size: 12px; }.media-picker-copy small { color: #7c8a91; font-size: 10px; }.media-picker-cross-project { color: #9a5c25 !important; }.media-picker-status { color: #2f7063 !important; }.media-picker-item.is-unavailable .media-picker-status { color: #a05548 !important; }
 .routing-promise { margin-top: 22px; padding: 13px 15px; display: flex; align-items: flex-start; gap: 10px; border: 1px solid #cfe1dd; background: #f7fbfa; color: #315b55; }.routing-promise > .el-icon { flex: 0 0 auto; margin-top: 2px; color: var(--accent); }.routing-promise > div { display: grid; gap: 3px; }.routing-promise strong { font-size: 12px; }.routing-promise span { color: #68817d; font-size: 11px; line-height: 1.55; }
 .shot-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px; margin: 0 0 16px; }.shot-chip { min-width: 0; padding: 10px 11px; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 3px 7px; text-align: left; border: 1px solid #d9e2e3; background: #fff; color: #687980; }.shot-chip.active { border-color: #75b7ad; background: #f3faf8; }.shot-chip.approved { color: #376f59; }.shot-chip span { color: var(--accent); font-size: 10px; font-weight: 800; }.shot-chip strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }.shot-chip small { grid-column: 2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #87969a; font-size: 10px; }.provider-status-spacing { margin: 0 0 16px; }.artifact-route-card { margin: 0 0 14px; }.skipped-previs { min-height: 42px; padding: 9px 12px; display: flex; align-items: center; gap: 8px; color: #3b7460; border: 1px solid #c8dfd1; background: #f4faf6; font-size: 11px; }.skipped-previs strong { margin-right: 5px; }.workflow-activity { margin-top: 24px; }.auto-routing-setting { min-height: 44px; padding: 10px 12px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid #cfe1dd; background: #f7fbfa; }.auto-routing-setting > div { display: grid; gap: 3px; }.auto-routing-setting strong { color: #2e625a; font-size: 12px; }.auto-routing-setting span { color: #718984; font-size: 11px; }.expert-settings { padding: 10px 12px; border: 1px solid #dfe6e7; background: #fafcfc; }.expert-settings summary { cursor: pointer; color: #53706c; font-size: 12px; }.expert-settings p { margin: 8px 0 12px; color: #7b898e; font-size: 11px; line-height: 1.55; }.expert-settings > label { display: block; margin: 9px 0 6px; }
+.shot-chip { grid-template-rows: auto auto auto; }
+.shot-chip.skipped { color: #7d8589; border-style: dashed; background: #f6f7f7; }
+.shot-chip em { grid-column: 1 / -1; color: #71847f; font-size: 9px; font-style: normal; }
+.shot-chip.skipped em { color: #9a5b4f; }
+.shot-operations { margin: -4px 0 16px; padding: 12px 14px; display: grid; grid-template-columns: minmax(220px, 1fr) auto; align-items: center; gap: 14px; border: 1px solid #d8e2e1; background: #fafcfc; }
+.shot-operation-copy { min-width: 0; display: grid; gap: 3px; }
+.shot-operation-copy strong { color: #294c48; font-size: 12px; }
+.shot-operation-copy small { color: #71817f; font-size: 10px; line-height: 1.5; }
+.shot-operation-actions { display: flex; justify-content: flex-end; gap: 7px; flex-wrap: wrap; }
+.shot-operation-actions :deep(.el-button) { margin-left: 0; }
 @media (max-width: 840px) {
-  .workflow-header { padding: 10px 14px; }.project-identity strong { max-width: 35vw; }.run-status { display: none; }.macro-rail { overflow-x: auto; grid-template-columns: repeat(5, 150px); padding: 0 12px; scrollbar-width: none; }.macro-rail::-webkit-scrollbar { display: none; }.start-main, .workflow-main { padding-left: 14px; padding-right: 14px; }.run-aspect-notice { grid-template-columns: auto minmax(0, 1fr); align-items: flex-start; }.run-aspect-notice :deep(.el-button) { grid-column: 1 / -1; width: 100%; margin-left: 0; }.option-grid, .run-overview { grid-template-columns: 1fr; }.run-overview { gap: 18px; }.run-metrics { grid-template-columns: repeat(3, 1fr); }.mode-control { justify-self: start; }.artifact-form, .reference-editor { grid-template-columns: 1fr; }.artifact-form > :deep(.assist-field) { grid-column: 1; }.artifact-actions, .stage-footer { align-items: flex-start; flex-direction: column; }.review-actions, .stage-next-actions { width: 100%; }.stage-next-actions :deep(.el-button) { flex: 1; }.artifact-media { grid-template-columns: 1fr; }
+  .workflow-header { padding: 10px 14px; }.project-identity strong { max-width: 35vw; }.run-status { display: none; }.macro-rail { overflow-x: auto; grid-template-columns: repeat(5, 150px); padding: 0 12px; scrollbar-width: none; }.macro-rail::-webkit-scrollbar { display: none; }.start-main, .workflow-main { padding-left: 14px; padding-right: 14px; }.run-aspect-notice { grid-template-columns: auto minmax(0, 1fr); align-items: flex-start; }.run-aspect-notice :deep(.el-button) { grid-column: 1 / -1; width: 100%; margin-left: 0; }.option-grid, .run-overview { grid-template-columns: 1fr; }.run-overview { gap: 18px; }.run-metrics { grid-template-columns: repeat(3, 1fr); }.mode-control { justify-self: start; }.artifact-form, .reference-editor { grid-template-columns: 1fr; }.artifact-form > :deep(.assist-field) { grid-column: 1; }.artifact-actions, .stage-footer { align-items: flex-start; flex-direction: column; }.review-actions, .stage-next-actions { width: 100%; }.stage-next-actions :deep(.el-button) { flex: 1; }.artifact-media { grid-template-columns: 1fr; }.shot-operations { grid-template-columns: minmax(0, 1fr); align-items: flex-start; }.shot-operation-actions { width: 100%; justify-content: flex-start; }
 }
 @media (max-width: 560px) {
   .macro-rail { grid-template-columns: repeat(5, minmax(0, 1fr)); overflow: visible; padding: 0 8px; }
@@ -3083,7 +3565,7 @@ onBeforeUnmount(clearPoll)
   .macro-step > span { width: 22px; height: 22px; font-size: 10px; }
   .macro-step strong { max-width: 100%; font-size: 10px; line-height: 1.25; overflow-wrap: anywhere; }
   .macro-step small { font-size: 9px; line-height: 1.2; }
-  .workflow-header { gap: 8px; }.header-actions { gap: 6px; }.header-actions > :deep(.el-button:not(.is-circle)) { width: 32px; min-width: 32px; padding: 0; }.header-actions > :deep(.el-button:not(.is-circle)) span { display: none; }.resume-card, .section-heading, .start-footer, .stage-toolbar { align-items: flex-start; flex-direction: column; }.resume-card :deep(.el-button) { width: 100%; }.section-heading h1 { font-size: 21px; }.mode-selector { display: grid; grid-template-columns: 1fr; width: 100%; }.mode-selector :deep(.el-radio-button__inner) { width: 100%; }.start-footer :deep(.el-button) { width: 100%; }.stage-toolbar-actions { width: 100%; flex-wrap: wrap; justify-content: flex-start; }.concurrency-control { width: 100%; padding: 7px 0 0; border-left: 0; border-top: 1px solid var(--line); }.artifact-list, .artifact-item, .artifact-actions, .edit-actions, .review-actions { min-width: 0; }.artifact-item { padding: 13px; }.artifact-header { align-items: flex-start; }.artifact-title { align-items: flex-start; flex-wrap: wrap; }.artifact-title strong { flex-basis: calc(100% - 38px); white-space: normal; }.edit-actions, .review-actions { width: 100%; align-items: stretch; flex-wrap: wrap; }.edit-actions :deep(.el-button) { flex: 1 1 100%; width: 100%; min-width: 0; margin-left: 0; }.review-actions :deep(.el-input) { flex-basis: 100%; }.review-actions :deep(.el-button) { flex: 1; min-width: 0; margin-left: 0; }.approved-note { width: 100%; flex-wrap: wrap; }.approved-note :deep(.el-button) { margin-left: 0; }.stage-next-actions { flex-direction: column; }.settings-grid, .retry-controls, .media-picker-list, .image-config-grid, .autolink-items { grid-template-columns: 1fr; }.autolink-heading { align-items: flex-start; flex-direction: column; }.image-config-heading, .image-config-actions, .video-config-heading { align-items: flex-start; flex-direction: column; }.image-config-actions > span { width: 100%; }.image-config-actions > span :deep(.el-button) { flex: 1; }.video-config-heading-actions { width: 100%; justify-content: flex-start; }.video-provider-receipt { grid-template-columns: 1fr; }.video-provider-receipt :deep(.el-button) { width: 100%; margin-left: 0; }.project-routing-mode :deep(.el-radio-group) { width: 100%; display: grid; grid-template-columns: 1fr; }.project-routing-mode :deep(.el-radio-button__inner) { width: 100%; }.project-model-receipt { align-items: flex-start; flex-direction: column; }.media-picker-item { grid-template-columns: 80px minmax(0, 1fr) 20px; }.media-picker-thumb { width: 80px; }.routing-promise { padding: 11px 12px; }.shot-strip { grid-template-columns: 1fr; }.shot-chip small { white-space: normal; }.auto-routing-setting { align-items: flex-start; }
+  .workflow-header { gap: 8px; }.header-actions { gap: 6px; }.header-actions > :deep(.el-button:not(.is-circle)) { width: 32px; min-width: 32px; padding: 0; }.header-actions > :deep(.el-button:not(.is-circle)) span { display: none; }.resume-card, .section-heading, .start-footer, .stage-toolbar { align-items: flex-start; flex-direction: column; }.resume-card :deep(.el-button) { width: 100%; }.section-heading h1 { font-size: 21px; }.mode-selector { display: grid; grid-template-columns: 1fr; width: 100%; }.mode-selector :deep(.el-radio-button__inner) { width: 100%; }.start-footer :deep(.el-button) { width: 100%; }.stage-toolbar-actions { width: 100%; flex-wrap: wrap; justify-content: flex-start; }.concurrency-control { width: 100%; padding: 7px 0 0; border-left: 0; border-top: 1px solid var(--line); }.artifact-list, .artifact-item, .artifact-actions, .edit-actions, .review-actions { min-width: 0; }.artifact-item { padding: 13px; }.artifact-header { align-items: flex-start; }.artifact-title { align-items: flex-start; flex-wrap: wrap; }.artifact-title strong { flex-basis: calc(100% - 38px); white-space: normal; }.edit-actions, .review-actions { width: 100%; align-items: stretch; flex-wrap: wrap; }.edit-actions :deep(.el-button) { flex: 1 1 100%; width: 100%; min-width: 0; margin-left: 0; }.review-actions :deep(.el-input) { flex-basis: 100%; }.review-actions :deep(.el-button) { flex: 1; min-width: 0; margin-left: 0; }.approved-note { width: 100%; flex-wrap: wrap; }.approved-note :deep(.el-button) { margin-left: 0; }.stage-next-actions { flex-direction: column; }.settings-grid, .retry-controls, .media-picker-list, .image-config-grid, .autolink-items { grid-template-columns: 1fr; }.autolink-heading { align-items: flex-start; flex-direction: column; }.image-config-heading, .image-config-actions, .video-config-heading { align-items: flex-start; flex-direction: column; }.image-config-actions > span { width: 100%; }.image-config-actions > span :deep(.el-button) { flex: 1; }.video-config-heading-actions { width: 100%; justify-content: flex-start; }.video-provider-receipt { grid-template-columns: 1fr; }.video-provider-receipt :deep(.el-button) { width: 100%; margin-left: 0; }.project-routing-mode :deep(.el-radio-group) { width: 100%; display: grid; grid-template-columns: 1fr; }.project-routing-mode :deep(.el-radio-button__inner) { width: 100%; }.project-model-receipt { align-items: flex-start; flex-direction: column; }.media-picker-item { grid-template-columns: 80px minmax(0, 1fr) 20px; }.media-picker-thumb { width: 80px; }.routing-promise { padding: 11px 12px; }.shot-strip { grid-template-columns: 1fr; }.shot-chip small { white-space: normal; }.auto-routing-setting { align-items: flex-start; }.shot-operation-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }.shot-operation-actions :deep(.el-button) { width: 100%; min-width: 0; }
 }
   .final-edit-status { margin: 0 0 16px; padding: 13px 15px; display: flex; align-items: center; justify-content: space-between; gap: 14px; border: 1px solid #dfe6e7; background: #fafcfc; }.final-edit-status.is-actionable { border-color: #c9ded9; background: #f5fbf9; }.final-edit-status-copy { min-width: 0; display: grid; gap: 4px; }.final-edit-status-copy > div { display: flex; align-items: center; gap: 7px; color: #355d58; }.final-edit-status-copy > div small { color: #768982; font-size: 10px; }.final-edit-status-copy > span, .final-edit-status-copy > small { color: #687a7e; font-size: 11px; line-height: 1.5; }.final-history-note { min-width: 0; display: flex; align-items: center; gap: 7px; color: #7a6a62; font-size: 12px; }.final-sidecars { display: flex; flex-wrap: wrap; gap: 8px 16px; padding: 0 0 14px; }.final-sidecars a { color: var(--accent); display: inline-flex; align-items: center; gap: 5px; text-decoration: none; font-size: 12px; }
 .narration-editor { display: grid; gap: 16px; padding: 14px 0; border-top: 1px solid #edf0f1; }.narration-banner { display: flex; align-items: flex-start; gap: 9px; padding: 11px 12px; border: 1px solid #cfe1dd; background: #f5fbf9; color: #356b61; }.narration-banner > .el-icon { margin-top: 2px; color: var(--accent); }.narration-banner > div { display: grid; gap: 3px; }.narration-banner span { color: #6d817e; font-size: 11px; line-height: 1.5; }.narration-settings-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }.narration-expert-settings { padding: 10px 12px; border: 1px solid #dfe6e7; background: #fafcfc; }.narration-expert-settings summary { cursor: pointer; color: #53706c; font-size: 12px; }.narration-expert-settings .narration-settings-grid { margin-top: 12px; }.narration-segments { display: grid; gap: 10px; }.narration-segments-heading { display: flex; align-items: baseline; gap: 9px; }.narration-segments-heading small { color: var(--muted); font-size: 11px; }.narration-segment { padding: 11px 12px; border: 1px solid #dfe6e7; background: #fff; }.narration-segment-heading { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 8px; color: #40545b; font-size: 12px; }.narration-segment-heading small { color: #87959a; font-size: 10px; }

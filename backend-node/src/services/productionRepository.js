@@ -156,6 +156,7 @@ function createRun(db, input) {
     storyboard_image_model: '',
     asset_image_config_id: defaultImageConfigId(db, 'image'),
     storyboard_image_config_id: defaultImageConfigId(db, 'storyboard_image'),
+    video_config_id: defaultImageConfigId(db, 'video'),
     video_model: '',
     video_duration_min: 5,
     director_mode: 'auto',
@@ -1171,6 +1172,118 @@ function updateAction(db, actionId, patch) {
   return toAction(db.prepare('SELECT * FROM production_actions WHERE id = ?').get(Number(actionId)));
 }
 
+function cancelReservedAction(db, actionId, result = {}) {
+  const tx = db.transaction(() => {
+    const action = getAction(db, actionId);
+    if (!action) return null;
+    if (action.status !== 'reserved') return action;
+    const updated = updateAction(db, action.id, {
+      status: 'cancelled',
+      result: { ...(action.result || {}), ...result },
+    });
+    if (action.kind === 'video_generate' || Number(action.reserved_video_seconds || 0) > 0) {
+      const run = getRun(db, action.run_id);
+      if (run) {
+        const usage = {
+          video_attempts_reserved: 0,
+          video_seconds_reserved: 0,
+          ...(run.usage || {}),
+        };
+        usage.video_attempts_reserved = Math.max(0, Number(usage.video_attempts_reserved || 0) - 1);
+        usage.video_seconds_reserved = Math.max(
+          0,
+          Number(usage.video_seconds_reserved || 0) - Number(action.reserved_video_seconds || 0)
+        );
+        updateRun(db, run.id, { usage });
+      }
+    }
+    appendEvent(db, action.run_id, 'action.reservation_released', {
+      stage: action.stage,
+      scope_type: action.scope_type,
+      scope_id: action.scope_id,
+      payload: {
+        action_id: action.id,
+        reserved_video_seconds: Number(action.reserved_video_seconds || 0),
+        reason: result.cancelled_reason || null,
+      },
+    });
+    return updated;
+  });
+  return tx.immediate();
+}
+
+function releaseUnacceptedVideoAction(db, actionId, patch = {}) {
+  const submissionStatus = String(patch.submission_status || '').trim().toLowerCase();
+  if (!['not_sent', 'rejected'].includes(submissionStatus)) {
+    const error = new Error(`Cannot release a video reservation with submission status ${submissionStatus || 'unknown'}`);
+    error.code = 'VIDEO_SUBMISSION_NOT_REJECTED';
+    throw error;
+  }
+  const tx = db.transaction(() => {
+    const action = getAction(db, actionId);
+    if (!action) return null;
+    if (action.kind !== 'video_generate' && Number(action.reserved_video_seconds || 0) <= 0) {
+      const error = new Error('Only a reserved video action can release video usage');
+      error.code = 'VIDEO_RESERVATION_KIND_INVALID';
+      throw error;
+    }
+    if (action.provider_id || patch.provider_task_id) {
+      const error = new Error('A provider task ID proves acceptance; the video reservation cannot be released');
+      error.code = 'VIDEO_SUBMISSION_ALREADY_ACCEPTED';
+      throw error;
+    }
+    if (action.result?.reservation_released === true) return action;
+    const ledger = costLedger.getByAction(db, action.id);
+    if (ledger?.status === 'settled') {
+      const error = new Error('The video cost is already settled and requires an explicit reconciliation receipt');
+      error.code = 'VIDEO_COST_ALREADY_SETTLED';
+      throw error;
+    }
+    const releasedAt = nowIso();
+    const updated = updateAction(db, action.id, {
+      status: patch.status || 'failed',
+      error_code: patch.error_code || action.error_code || 'VIDEO_SUBMISSION_REJECTED',
+      error_message: patch.error_message || action.error_message || 'Video submission was not accepted',
+      cost_status: 'released',
+      cost: { note: patch.cost_note || `Provider submission ${submissionStatus}; reservation released` },
+      result: {
+        ...(action.result || {}),
+        ...(patch.result || {}),
+        submission_status: submissionStatus,
+        reservation_released: true,
+        reservation_released_at: releasedAt,
+      },
+    });
+    const run = getRun(db, action.run_id);
+    if (run) {
+      const usage = {
+        video_attempts_reserved: 0,
+        video_seconds_reserved: 0,
+        ...(run.usage || {}),
+      };
+      usage.video_attempts_reserved = Math.max(0, Number(usage.video_attempts_reserved || 0) - 1);
+      usage.video_seconds_reserved = Math.max(
+        0,
+        Number(usage.video_seconds_reserved || 0) - Number(action.reserved_video_seconds || 0)
+      );
+      updateRun(db, run.id, { usage });
+    }
+    appendEvent(db, action.run_id, 'action.reservation_released', {
+      stage: action.stage,
+      scope_type: action.scope_type,
+      scope_id: action.scope_id,
+      payload: {
+        action_id: action.id,
+        submission_status: submissionStatus,
+        reserved_video_seconds: Number(action.reserved_video_seconds || 0),
+        reason: patch.error_code || 'VIDEO_SUBMISSION_REJECTED',
+      },
+    });
+    return updated;
+  });
+  return tx.immediate();
+}
+
 function getActionByKey(db, runId, actionKey) {
   return toAction(db.prepare(
     'SELECT * FROM production_actions WHERE run_id = ? AND action_key = ?'
@@ -1295,6 +1408,8 @@ module.exports = {
   releaseLease,
   reserveAction,
   updateAction,
+  cancelReservedAction,
+  releaseUnacceptedVideoAction,
   getActionByKey,
   getAction,
   getLatestAction,

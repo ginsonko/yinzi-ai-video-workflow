@@ -30,6 +30,24 @@ const DEFINITIONS = Object.freeze([
     locked_suffix: 'Return one strict JSON object with shape {"shot":{...}} and no Markdown. Keep the complete production shot schema used by the workflow.',
   },
   {
+    id: 'production.shot_revise.system', category: 'storyboard', name: '镜头修改后重做', version: 1,
+    description: '根据用户意见重写一个镜头，并保留资产身份与真实剪辑边界。', variables: [],
+    default_content: 'You are a film continuity editor revising one production shot from a user instruction. Preserve explicit story facts, approved character identities, scene geometry, props, duration budget, and meaningful editorial boundaries. Keep one complete camera shot per generated clip and make the result directly usable by image and video generation.',
+    locked_suffix: 'Return one strict JSON object with shape {"shot":{...}} and no Markdown. Keep the complete production shot schema used by the workflow.',
+  },
+  {
+    id: 'production.shot_split.system', category: 'storyboard', name: '镜头拆分', version: 1,
+    description: '把一个过载镜头拆成两个独立、可直接剪辑的完整摄影镜头。', variables: [],
+    default_content: 'You are a film editor splitting one overloaded production shot into two independent camera shots. Put the boundary at a real editorial cut caused by action completion, reaction, information change, eyeline, or a meaningful change of shot size or angle. Never invent flashes, occlusion, smoke, whip pans, or other transition effects to hide the cut. Preserve approved identities, locations, props, and story causality.',
+    locked_suffix: 'Return one strict JSON object with shape {"current_shot":{...},"next_shot":{...}} and no Markdown. Both objects must keep the complete production shot schema used by the workflow.',
+  },
+  {
+    id: 'production.shot_pickup.system', category: 'storyboard', name: '补拍新镜头', version: 1,
+    description: '在指定镜头后增加一个有明确叙事价值的补拍镜头。', variables: [],
+    default_content: 'You are a film director adding one pickup shot to an existing sequence. The pickup must have a clear narrative purpose, fit between its neighboring shots, preserve approved asset identities, and form one complete camera shot with an honest cut-in and cut-out. Do not duplicate content already covered by adjacent shots.',
+    locked_suffix: 'Return one strict JSON object with shape {"shot":{...}} and no Markdown. Keep the complete production shot schema used by the workflow.',
+  },
+  {
     id: 'production.director.system', category: 'director', name: '3D 导演台 JSON', version: 1,
     description: '把分镜转换为可录制的摄像机、物体和关键帧方案。',
     variables: ['attachment_contract', 'aspect_ratio', 'aspect_value', 'pose_ids', 'motion_ids', 'recipe_shapes', 'asset_catalog'],

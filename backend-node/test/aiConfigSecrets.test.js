@@ -2,6 +2,7 @@ const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 const Database = require('better-sqlite3');
 const aiConfigService = require('../src/services/aiConfigService');
+const videoClient = require('../src/services/videoClient');
 const createAiConfigRoutes = require('../src/routes/aiConfig');
 
 function createDb() {
@@ -211,5 +212,124 @@ describe('AI config secret boundaries', () => {
     } finally {
       global.fetch = originalFetch;
     }
+  });
+
+  it('discovers models with a read-only credential-scoped request and persists a redacted snapshot', async () => {
+    const db = createDb();
+    const created = aiConfigService.createConfig(db, log, {
+      service_type: 'video', provider: 'yinzi', name: 'Scoped video',
+      base_url: 'https://api.example/v1', api_key: 'catalog-private-value', model: ['old-model'],
+    });
+    const calls = [];
+    const result = await aiConfigService.discoverModels(aiConfigService.getConfig(db, created.id), {
+      db,
+      group: 'ignored-by-service',
+      fetchImpl: async (url, options = {}) => {
+        calls.push({ url: String(url), method: options.method, authorization: options.headers.Authorization });
+        return {
+          status: 200,
+          ok: true,
+          async json() { return { data: [{ id: 'new-video-a', owned_by: 'group-a' }, { model: 'new-video-b' }] }; },
+        };
+      },
+    });
+    assert.deepEqual(result.models.map((item) => item.model), ['new-video-a', 'new-video-b']);
+    assert.equal(calls[0].url, 'https://api.example/v1/models');
+    assert.equal(calls[0].method, 'GET');
+    assert.equal(calls[0].authorization, 'Bearer catalog-private-value');
+    assert.equal(aiConfigService.getConfig(db, created.id).default_model, null);
+    const snapshot = aiConfigService.getConfig(db, created.id).model_catalog_snapshot;
+    assert.equal(snapshot.availability_scope, 'credential');
+    assert.equal(snapshot.models.length, 2);
+    assert.equal(JSON.stringify(snapshot).includes('catalog-private-value'), false);
+    assert.equal(videoClient.getDefaultVideoConfig(db, 'new-video-a', created.id).id, created.id);
+    assert.equal(videoClient.getDefaultVideoConfig(db, 'not-in-current-key', created.id).id, created.id);
+    assert.equal(videoClient.getModelFromConfig({ provider: 'custom', model: ['old-model'] }, 'new-upstream-model'), 'new-upstream-model');
+  });
+
+  it('merges discovered Yinzi models with only matching public prices and local known capabilities', () => {
+    const merged = aiConfigService.mergeDiscoveredCatalog({
+      availability_scope: 'credential',
+      source_url: 'https://api.example/v1/models',
+      snapshot: { scope_verified: true, fetched_at: '2026-08-16T00:00:00.000Z' },
+      models: [{ model: 'cc-seedance2.0 480p-fast-nsp', name: 'Fast' }, { model: 'vendor-video', name: 'Vendor' }],
+    }, {
+      pricing_version: 'v2',
+      video: [{ model: 'cc-seedance2.0 480p-fast-nsp', groups: ['group-a'], prices: [{ group: 'group-a', effective_price: 1 }] }],
+    }, { provider: 'yinzi', service_type: 'video', group: 'group-a' });
+    assert.equal(merged.video.length, 2);
+    assert.equal(merged.video[0].contract_status, 'known');
+    assert.deepEqual(merged.video[0].groups, ['group-a']);
+    assert.equal(merged.video[1].contract_status, 'missing');
+    assert.equal(merged.video[1].automatic_eligible, false);
+  });
+
+  it('merges a local hint for an unknown model without making it automatic by default', () => {
+    const merged = aiConfigService.mergeDiscoveredCatalog({
+      availability_scope: 'credential',
+      source_url: 'https://api.example/v1/models',
+      snapshot: { scope_verified: true, fetched_at: '2026-08-16T00:00:00.000Z' },
+      models: [{ model: 'new-video-model', name: 'New video' }],
+    }, null, {
+      provider: 'yinzi', service_type: 'video',
+      capability_overrides: {
+        'new-video-model': { duration_mode: 'range', duration_min: 5, duration_max: 10, max_images: 4 },
+      },
+    });
+    assert.equal(merged.video[0].contract_status, 'local');
+    assert.equal(merged.video[0].capability_source, 'local');
+    assert.equal(merged.video[0].capabilities.max_images, 4);
+    assert.equal(merged.video[0].automatic_eligible, false);
+  });
+
+  it('saves and resets one local capability hint without changing the catalog snapshot', () => {
+    const db = createDb();
+    const created = aiConfigService.createConfig(db, log, {
+      service_type: 'video', provider: 'yinzi', name: 'Capability video',
+      base_url: 'https://api.example/v1', api_key: 'private-value', model: ['new-video-model'],
+      settings: JSON.stringify({ model_catalog_snapshot: { models: [{ model: 'new-video-model' }] }, other: true }),
+    });
+    const updated = aiConfigService.updateModelCapabilityOverride(db, log, created.id, 'new-video-model', {
+      duration_mode: 'range', duration_min: 5, duration_max: 10, max_images: 4, automatic_eligible: true,
+    });
+    assert.equal(updated.model_capability_overrides['new-video-model'].max_images, 4);
+    assert.equal(updated.model_capability_overrides['new-video-model'].automatic_eligible, true);
+    assert.deepEqual(updated.model_catalog_snapshot.models, [{ model: 'new-video-model' }]);
+    assert.equal(JSON.parse(updated.settings).other, true);
+    const reset = aiConfigService.resetModelCapabilityOverride(db, log, created.id, 'NEW-VIDEO-MODEL');
+    assert.equal(reset.model_capability_overrides, undefined);
+    assert.deepEqual(reset.model_catalog_snapshot.models, [{ model: 'new-video-model' }]);
+  });
+
+  it('rejects unknown capability fields before changing persisted settings', () => {
+    const db = createDb();
+    const created = aiConfigService.createConfig(db, log, {
+      service_type: 'video', provider: 'yinzi', name: 'Capability validation',
+      base_url: 'https://api.example/v1', api_key: 'private-value', model: ['model'],
+      settings: JSON.stringify({ keep: 'yes' }),
+    });
+    assert.throws(
+      () => aiConfigService.updateModelCapabilityOverride(db, log, created.id, 'model', { guessed_limit: 30 }),
+      /未知字段/,
+    );
+    const after = aiConfigService.getConfig(db, created.id);
+    assert.equal(JSON.parse(after.settings).keep, 'yes');
+    assert.equal(after.model_capability_overrides, undefined);
+  });
+
+  it('exposes capability CRUD without exposing the provider key', async () => {
+    const db = createDb();
+    const created = aiConfigService.createConfig(db, log, {
+      service_type: 'video', provider: 'yinzi', name: 'Capability route',
+      base_url: 'https://api.example/v1', api_key: 'route-secret', model: ['model'],
+    });
+    aiConfigService.updateModelCapabilityOverride(db, log, created.id, 'model', {
+      duration_mode: 'range', duration_min: 5, duration_max: 15,
+    });
+    const routes = createAiConfigRoutes(db, log, {});
+    const listResponse = captureResponse();
+    routes.modelCapabilities({ params: { id: String(created.id) } }, listResponse);
+    assert.equal(JSON.stringify(listResponse.body).includes('route-secret'), false);
+    assert.equal(listResponse.body.data.models[0].override.duration_min, 5);
   });
 });

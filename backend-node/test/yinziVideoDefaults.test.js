@@ -6,12 +6,28 @@ const {
   resolveYinziVideoPrices,
 } = require('../src/services/yinziVideoDefaults');
 
-describe('Yinzi V0.1.2 video defaults', () => {
-  it('freezes 22 unique fallback prices with only video billing units', () => {
+describe('Yinzi video defaults', () => {
+  it('keeps unique positive fallback prices and includes the current default video catalog', () => {
     const prices = listDefaultYinziVideoPrices();
-    assert.equal(prices.length, 22);
-    assert.equal(new Set(prices.map((item) => item.model.toLowerCase())).size, 22);
-    assert.equal(prices.every((item) => ['per_request', 'per_second'].includes(item.billing_unit)), true);
+    const modelNames = prices.map((item) => item.model.toLowerCase());
+    const requiredModels = [
+      '官转-seedance2.0 720p-fast',
+      '官转-seedance2.0 720p-pro',
+      '破甲seedance 720p-fast',
+      'cm-seedance2.0 -720p-15s',
+      'cm-seedance2.0特价fast-720p-gz-15s',
+      'seedance-2.5-720p',
+      'seedance2.0 -720p-fast-15s',
+      'seedance2.0 720p-pro-nv-nsp',
+      'seedance2.0特价pro-720p-gz-15s',
+      'seedance2.0特价pro-720p-gz-15s-nsp',
+    ].map((model) => model.toLowerCase());
+    assert.equal(new Set(modelNames).size, prices.length);
+    assert.equal(requiredModels.every((model) => modelNames.includes(model)), true);
+    assert.equal(
+      prices.every((item) => ['per_request', 'per_second', 'per_generation', 'fixed_duration'].includes(item.billing_unit)),
+      true,
+    );
     assert.equal(prices.every((item) => item.effective_price > 0), true);
   });
 

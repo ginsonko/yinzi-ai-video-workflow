@@ -167,6 +167,7 @@ describe('YinziAPI asynchronous lifecycle', () => {
       });
       assert.equal(calls, 1);
       assert.equal(result.ambiguous_submission, true);
+      assert.equal(result.submission_status, 'ambiguous');
       assert.match(result.error, /不会自动重试/);
     } finally {
       global.fetch = originalFetch;
@@ -188,7 +189,53 @@ describe('YinziAPI asynchronous lifecycle', () => {
         aspect_ratio: '16:9', first_frame_url: 'first.png', last_frame_url: 'last.png', video_gen_id: 2,
       });
       assert.equal(calls, 0);
+      assert.equal(result.submission_status, 'not_sent');
       assert.match(result.error, /未创建上游任务/);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('classifies a provider 4xx without a task ID as rejected', async () => {
+    const originalFetch = global.fetch;
+    const states = [];
+    global.fetch = async () => new Response(JSON.stringify({
+      error: { code: 'unsupported_media_reference', message: 'this route supports at most 1 reference images' },
+      request_id: 'request-rejected-1',
+    }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+    try {
+      const result = await callYinziVideoApi(null, {
+        base_url: 'https://api.yinziapi.top/v1', api_key: 'not-a-real-key', endpoint: '/videos',
+      }, log, {
+        model: 'mg-seedance2.0 -480p mini', prompt: 'test', duration: 5,
+        aspect_ratio: '16:9', video_gen_id: 23,
+        on_submission_state: (state) => states.push(state),
+      });
+      assert.equal(result.submission_status, 'rejected');
+      assert.equal(result.submission_http_status, 400);
+      assert.equal(result.submission_receipt.error_code, 'unsupported_media_reference');
+      assert.deepEqual(states.map((state) => state.status), ['ambiguous', 'rejected']);
+      assert.equal(result.task_id, undefined);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('keeps a provider 5xx as ambiguous', async () => {
+    const originalFetch = global.fetch;
+    global.fetch = async () => new Response(JSON.stringify({ message: 'temporary upstream error' }), {
+      status: 503, headers: { 'Content-Type': 'application/json' },
+    });
+    try {
+      const result = await callYinziVideoApi(null, {
+        base_url: 'https://api.yinziapi.top/v1', api_key: 'not-a-real-key', endpoint: '/videos',
+      }, log, {
+        model: 'mg-seedance2.0 -480p mini', prompt: 'test', duration: 5,
+        aspect_ratio: '16:9', video_gen_id: 24,
+      });
+      assert.equal(result.submission_status, 'ambiguous');
+      assert.equal(result.submission_http_status, 503);
+      assert.equal(result.ambiguous_submission, true);
     } finally {
       global.fetch = originalFetch;
     }
@@ -238,11 +285,75 @@ describe('YinziAPI asynchronous lifecycle', () => {
         video_gen_id: 3,
       });
       assert.equal(result.task_id, 'task-multimedia');
+      assert.equal(result.submission_status, 'accepted');
       assert.equal(submittedBody.references.length, 8);
       assert.deepEqual(submittedBody.references.map((ref) => ref.type), [
         'image', 'image', 'image', 'image', 'video', 'video', 'video', 'audio',
       ]);
       assert.ok(submittedBody.references.every((ref) => ref.role === 'reference'));
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('keeps a manually selected over-limit reference package in advisory mode', async () => {
+    const originalFetch = global.fetch;
+    let submittedBody;
+    global.fetch = async (_url, init) => {
+      submittedBody = JSON.parse(init.body);
+      return new Response(JSON.stringify({ id: 'task-advisory-over-limit', status: 'queued' }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      });
+    };
+    try {
+      const result = await callYinziVideoApi(null, {
+        base_url: 'https://api.yinziapi.top/v1', api_key: 'not-a-real-key', endpoint: '/videos',
+      }, log, {
+        model: 'mg-seedance2.0 -480p mini', prompt: 'test', duration: 5,
+        contract_validation_mode: 'advisory',
+        reference_urls: Array.from({ length: 5 }, (_, i) => `https://media.test/image-${i}.png`),
+        reference_video_urls: Array.from({ length: 4 }, (_, i) => `https://media.test/video-${i}.mp4`),
+        reference_audio_urls: ['https://media.test/audio-1.mp3', 'https://media.test/audio-2.mp3'],
+        video_gen_id: 31,
+      });
+      assert.equal(result.task_id, 'task-advisory-over-limit');
+      assert.equal(result.contract_validation.mode, 'advisory');
+      assert.ok(result.contract_validation.warnings.includes('reference_count_over_contract'));
+      assert.equal(submittedBody.references.length, 11);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('downgrades unsupported first and last frame roles to ordinary references in advisory mode', async () => {
+    const originalFetch = global.fetch;
+    let submittedBody;
+    global.fetch = async (_url, init) => {
+      submittedBody = JSON.parse(init.body);
+      return new Response(JSON.stringify({ id: 'task-advisory-frames', status: 'queued' }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      });
+    };
+    try {
+      const result = await callYinziVideoApi(null, {
+        base_url: 'https://api.yinziapi.top/v1', api_key: 'not-a-real-key', endpoint: '/videos',
+      }, log, {
+        model: 'mg-seedance2.0 -480p mini', prompt: 'test', duration: 5,
+        contract_validation_mode: 'advisory',
+        first_frame_url: 'https://media.test/first.png',
+        last_frame_url: 'https://media.test/last.png',
+        reference_urls: ['https://media.test/reference.png'],
+        video_gen_id: 32,
+      });
+      assert.equal(result.task_id, 'task-advisory-frames');
+      assert.ok(result.contract_validation.warnings.includes('first_frame_role_unsupported'));
+      assert.ok(result.contract_validation.warnings.includes('last_frame_role_unsupported'));
+      assert.deepEqual(submittedBody.references.map((item) => item.role), ['reference', 'reference', 'reference']);
+      assert.deepEqual(submittedBody.references.map((item) => item.url), [
+        'https://media.test/first.png',
+        'https://media.test/reference.png',
+        'https://media.test/last.png',
+      ]);
     } finally {
       global.fetch = originalFetch;
     }

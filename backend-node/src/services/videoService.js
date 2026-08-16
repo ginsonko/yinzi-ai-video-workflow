@@ -9,14 +9,90 @@ function resolveRemoteVideoUrl(videoUrl, fallbackError) {
   return { ok: false, error: (fallbackError || '超时或失败').slice(0, 500) };
 }
 
-/** 将 video_generations 标为失败；若无 error_msg 列则只更新 status/updated_at */
-function setVideoGenFailed(db, videoGenId, errorMsg, now) {
+const VIDEO_SUBMISSION_STATUSES = new Set(['not_sent', 'rejected', 'accepted', 'ambiguous']);
+
+function parseObject(value) {
+  if (!value) return null;
+  if (typeof value === 'object') return value;
   try {
-    db.prepare('UPDATE video_generations SET status = ?, error_msg = ?, updated_at = ? WHERE id = ?').run(
-      'failed', (errorMsg || '').slice(0, 500), now, videoGenId
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function submissionStatusForRow(row) {
+  const stored = String(row?.submission_status || '').trim().toLowerCase();
+  if (VIDEO_SUBMISSION_STATUSES.has(stored)) return stored;
+  if (row?.provider_task_id || row?.generation_status === 'completed' || row?.status === 'completed') return 'accepted';
+  if (row?.generation_status === 'ambiguous') return 'ambiguous';
+  if (row?.generation_status === 'failed' || row?.status === 'failed') return 'ambiguous';
+  return 'not_sent';
+}
+
+function sanitizeSubmissionReceipt(input = {}, status) {
+  const receipt = input && typeof input === 'object' ? input : {};
+  return {
+    version: 1,
+    status,
+    phase: receipt.phase ? String(receipt.phase).slice(0, 80) : status,
+    http_status: Number.isInteger(Number(receipt.http_status)) ? Number(receipt.http_status) : null,
+    error_code: receipt.error_code ? String(receipt.error_code).slice(0, 120) : null,
+    request_id: receipt.request_id ? String(receipt.request_id).slice(0, 160) : null,
+    provider_status: receipt.provider_status ? String(receipt.provider_status).slice(0, 80) : null,
+    message: receipt.message ? String(receipt.message).slice(0, 500) : null,
+    model: receipt.model ? String(receipt.model).slice(0, 240) : null,
+    endpoint: receipt.endpoint ? String(receipt.endpoint).slice(0, 240) : null,
+    reference_summary: receipt.reference_summary && typeof receipt.reference_summary === 'object'
+      ? receipt.reference_summary
+      : null,
+    observed_at: receipt.observed_at || new Date().toISOString(),
+  };
+}
+
+function persistVideoSubmissionState(db, videoGenId, status, input = {}) {
+  const normalized = String(status || '').trim().toLowerCase();
+  if (!VIDEO_SUBMISSION_STATUSES.has(normalized)) {
+    throw new Error(`Unknown video submission status: ${status}`);
+  }
+  const receipt = sanitizeSubmissionReceipt(input.receipt, normalized);
+  const httpStatus = Number.isInteger(Number(input.http_status)) ? Number(input.http_status) : receipt.http_status;
+  const now = new Date().toISOString();
+  db.prepare(
+    `UPDATE video_generations SET submission_status = ?, submission_http_status = ?,
+     submission_receipt_json = ?, updated_at = ? WHERE id = ?`
+  ).run(normalized, httpStatus, JSON.stringify(receipt), now, Number(videoGenId));
+  return { status: normalized, http_status: httpStatus, receipt };
+}
+
+/** 将 video_generations 标为失败；若无 error_msg 列则只更新 status/updated_at */
+function setVideoGenFailed(db, videoGenId, errorMsg, now, options = {}) {
+  const submissionStatus = options.submission_status
+    ? String(options.submission_status).trim().toLowerCase()
+    : null;
+  if (submissionStatus && VIDEO_SUBMISSION_STATUSES.has(submissionStatus)) {
+    persistVideoSubmissionState(db, videoGenId, submissionStatus, {
+      http_status: options.submission_http_status,
+      receipt: options.submission_receipt,
+    });
+  }
+  const generationStatus = options.generation_status
+    || (submissionStatus === 'ambiguous' ? 'ambiguous' : 'failed');
+  try {
+    db.prepare(
+      `UPDATE video_generations
+       SET status = 'failed', generation_status = ?, error_msg = ?, updated_at = ?
+       WHERE id = ?`
+    ).run(
+      generationStatus, (errorMsg || '').slice(0, 500), now, videoGenId
     );
   } catch (e) {
-    if ((e.message || '').includes('error_msg')) {
+    if ((e.message || '').includes('generation_status')) {
+      db.prepare('UPDATE video_generations SET status = ?, error_msg = ?, updated_at = ? WHERE id = ?').run(
+        'failed', (errorMsg || '').slice(0, 500), now, videoGenId
+      );
+    } else if ((e.message || '').includes('error_msg')) {
       db.prepare('UPDATE video_generations SET status = ?, updated_at = ? WHERE id = ?').run('failed', now, videoGenId);
     } else throw e;
   }
@@ -51,16 +127,6 @@ function list(db, query) {
 }
 
 function rowToItem(r) {
-  const parseObject = (value) => {
-    if (!value) return null;
-    if (typeof value === 'object') return value;
-    try {
-      const parsed = JSON.parse(value);
-      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
-    } catch (_) {
-      return null;
-    }
-  };
   return {
     id: r.id,
     storyboard_id: r.storyboard_id,
@@ -84,6 +150,24 @@ function rowToItem(r) {
     video_url: r.video_url,
     local_path: r.local_path,
     status: r.status,
+    generation_status: r.generation_status || legacyGenerationStatus(r),
+    download_status: r.download_status || legacyDownloadStatus(r),
+    remote_video_url: r.remote_video_url || null,
+    download_source_url: r.download_source_url || null,
+    download_requires_auth: Boolean(r.download_requires_auth),
+    download_error: r.download_error || null,
+    download_attempts: Number(r.download_attempts || 0),
+    download_started_at: r.download_started_at || null,
+    download_completed_at: r.download_completed_at || null,
+    provider_completed_at: r.provider_completed_at || null,
+    video_config_id: r.video_config_id == null ? null : Number(r.video_config_id),
+    provider_protocol: r.provider_protocol || null,
+    provider_config_snapshot: parseObject(r.provider_config_snapshot_json),
+    submission_status: submissionStatusForRow(r),
+    submission_http_status: r.submission_http_status == null ? null : Number(r.submission_http_status),
+    submission_receipt: parseObject(r.submission_receipt_json),
+    contract_validation_mode: videoClient.normalizeContractValidationMode(r.contract_validation_mode),
+    contract_validation: parseObject(r.contract_validation_receipt_json),
     task_id: r.task_id,
     provider_task_id: r.provider_task_id,
     prompt_contract: parseObject(r.prompt_contract_json),
@@ -125,7 +209,35 @@ const { randomUUID } = require('crypto');
 const videoClient = require('./videoClient');
 const taskService = require('./taskService');
 const storageLayout = require('./storageLayout');
-const { getFfmpegPath, hasLocalFfmpeg } = require('../utils/ffmpegPath');
+const costLedger = require('./productionCostLedger');
+const { archiveDetachedVideoGeneration } = require('./productionDetachedMedia');
+const {
+  getFfmpegPath,
+  getFfprobePath,
+  hasLocalFfmpeg,
+  hasLocalFfprobe,
+} = require('../utils/ffmpegPath');
+
+const LEGACY_DOWNLOAD_FAILURE = /任务已完成.*(?:无法下载|下载到本地)|结果无法下载到本地|重试下载，不要重新提交生成/i;
+const DOWNLOAD_LEASE_MS = 5 * 60 * 1000;
+const activeVideoDownloads = new Set();
+
+function legacyGenerationStatus(row) {
+  if (!row) return null;
+  if (row.status === 'completed') return 'completed';
+  if (row.status === 'failed') return LEGACY_DOWNLOAD_FAILURE.test(String(row.error_msg || ''))
+    && row.provider_task_id ? 'completed' : 'failed';
+  if (row.status === 'processing' || row.status === 'pending') return 'processing';
+  return row.status || null;
+}
+
+function legacyDownloadStatus(row) {
+  const generationStatus = row?.generation_status || legacyGenerationStatus(row);
+  if (generationStatus !== 'completed') return 'pending';
+  if (row.local_path) return 'completed';
+  if (LEGACY_DOWNLOAD_FAILURE.test(String(row.error_msg || ''))) return 'failed';
+  return row.status === 'completed' ? 'not_required' : 'pending';
+}
 
 /** @returns {{ dir: string, relPrefix: string }} 与图片 uploads 一致的工程子目录规则 */
 function resolveVideosDir(storagePath, projectSubdir) {
@@ -144,29 +256,86 @@ function resolveVideosDir(storagePath, projectSubdir) {
 async function downloadVideoToLocal(storagePath, videoUrl, videoGenId, log, projectSubdir = null, requestOptions = {}) {
   if (!videoUrl || typeof videoUrl !== 'string') return null;
   const { dir, relPrefix } = resolveVideosDir(storagePath, projectSubdir);
+  let temporaryPath = null;
   try {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     const ext = (videoUrl.split('?')[0].match(/\.(mp4|webm|mov)$/i) || [])[1] || 'mp4';
     const name = `vg_${videoGenId}_${randomUUID().slice(0, 8)}.${ext}`;
     const filePath = path.join(dir, name);
-    const res = await fetch(videoUrl, {
+    temporaryPath = `${filePath}.part-${randomUUID().slice(0, 8)}`;
+    const fetchImpl = requestOptions.fetch_impl || fetch;
+    const res = await fetchImpl(videoUrl, {
       method: 'GET',
       headers: requestOptions.headers || {},
       signal: AbortSignal.timeout(requestOptions.timeout_ms || 180000),
     });
     if (!res.ok) {
       log.warn('Download video failed', { status: res.status, videoGenId });
-      return null;
+      throw new Error(`下载地址返回 HTTP ${res.status}`);
+    }
+    const contentType = String(res.headers?.get?.('content-type') || '').toLowerCase();
+    if (contentType.includes('text/html') || contentType.includes('application/json') || contentType.includes('text/plain')) {
+      throw new Error(`下载地址返回了非视频内容（${contentType || 'unknown'}）`);
     }
     const buf = Buffer.from(await res.arrayBuffer());
-    fs.writeFileSync(filePath, buf);
+    const maxBytes = Math.max(1024, Number(requestOptions.max_bytes) || 2 * 1024 * 1024 * 1024);
+    if (buf.length > maxBytes) throw new Error(`视频文件超过允许大小 ${maxBytes} bytes`);
+    fs.writeFileSync(temporaryPath, buf);
+    validateDownloadedVideoFile(temporaryPath, {
+      content_type: contentType,
+      min_bytes: requestOptions.min_bytes,
+      skip_probe: requestOptions.skip_probe,
+    });
+    fs.renameSync(temporaryPath, filePath);
+    temporaryPath = null;
     const relativePath = `${relPrefix}/${name}`.replace(/\\/g, '/');
     log.info('Video saved to local', { videoGenId, local_path: relativePath, projectSubdir: projectSubdir || '(root)' });
     return relativePath;
   } catch (e) {
+    if (temporaryPath) {
+      try { fs.unlinkSync(temporaryPath); } catch (_) {}
+    }
     log.warn('Download video error', { videoGenId, error: e.message });
+    if (requestOptions.throw_on_error) throw e;
     return null;
   }
+}
+
+function validateDownloadedVideoFile(filePath, options = {}) {
+  const stat = fs.statSync(filePath);
+  const minBytes = Math.max(64, Number(options.min_bytes) || 1024);
+  if (!stat.isFile() || stat.size < minBytes) throw new Error(`下载的视频文件过小（${stat.size} bytes）`);
+  const header = Buffer.alloc(Math.min(32, stat.size));
+  const fd = fs.openSync(filePath, 'r');
+  try { fs.readSync(fd, header, 0, header.length, 0); } finally { fs.closeSync(fd); }
+  const prefix = header.toString('utf8').trimStart().toLowerCase();
+  if (prefix.startsWith('<!doctype') || prefix.startsWith('<html') || prefix.startsWith('{') || prefix.startsWith('[')) {
+    throw new Error('下载结果是错误页面或 JSON，不是视频文件');
+  }
+  if (!options.skip_probe && hasLocalFfprobe()) {
+    const probe = spawnSync(getFfprobePath(), [
+      '-v', 'error', '-show_entries', 'format=duration,format_name',
+      '-show_entries', 'stream=codec_type,width,height', '-of', 'json', filePath,
+    ], { encoding: 'utf8', timeout: 30000, windowsHide: true, maxBuffer: 4 * 1024 * 1024 });
+    if (probe.status !== 0) throw new Error(`ffprobe 无法识别下载的视频：${String(probe.stderr || '').slice(-240)}`);
+    const receipt = JSON.parse(probe.stdout || '{}');
+    const videoStream = (receipt.streams || []).find((stream) => stream.codec_type === 'video');
+    if (!videoStream) throw new Error('下载文件不包含视频轨道');
+    return {
+      bytes: stat.size,
+      duration: Number(receipt.format?.duration || 0),
+      width: Number(videoStream.width || 0),
+      height: Number(videoStream.height || 0),
+      format_name: receipt.format?.format_name || null,
+    };
+  }
+  const isIsoMedia = header.length >= 12 && header.subarray(4, 8).toString('ascii') === 'ftyp';
+  const isWebm = header.length >= 4 && header[0] === 0x1a && header[1] === 0x45 && header[2] === 0xdf && header[3] === 0xa3;
+  const isMpeg = header.length >= 4 && header[0] === 0x00 && header[1] === 0x00 && header[2] === 0x01;
+  if (!isIsoMedia && !isWebm && !isMpeg && !String(options.content_type || '').startsWith('video/')) {
+    throw new Error('下载文件没有可识别的视频容器签名');
+  }
+  return { bytes: stat.size, format_name: isIsoMedia ? 'iso-media' : isWebm ? 'webm' : isMpeg ? 'mpeg' : 'video' };
 }
 
 /** 与图生 aspectRatioToSize 对齐的归一化分辨率（偶数像素，便于 H.264） */
@@ -258,56 +427,44 @@ function resolveStoragePath(cfg) {
     : path.join(process.cwd(), cfg.storage?.local_path || './data/storage');
 }
 
-async function finalizeSuccessfulVideo(db, log, videoGenId, row, rowForAspect, videoUrl, logLabel, options = {}) {
-  const now = new Date().toISOString();
-  let localPath = null;
-  try {
-    const cfg = require('../config').loadConfig();
-    const storagePath = resolveStoragePath(cfg);
-    const projectSubdir = storageLayout.getProjectStorageSubdir(db, row.drama_id);
-    localPath = await downloadVideoToLocal(
-      storagePath,
-      options.download_url || videoUrl,
-      videoGenId,
-      log,
-      projectSubdir,
-      { headers: options.headers || {}, timeout_ms: options.timeout_ms }
-    );
-    maybeNormalizeVideoAfterDownload(storagePath, localPath, rowForAspect, videoGenId, log);
-  } catch (_) {}
-  if (options.require_local && !localPath) {
-    throw new Error('视频任务已完成，但结果无法下载到本地；请保留任务 ID 后重试下载，不要重新提交生成');
+function tableExists(db, table) {
+  return Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table));
+}
+
+function settleAcceptedVideoCost(db, videoGenId, log) {
+  if (!tableExists(db, 'production_actions') || !tableExists(db, 'cost_ledger')) return;
+  const actions = db.prepare(
+    `SELECT run_id, action_key FROM production_actions
+     WHERE generation_id = ? AND kind = 'video_generate'`
+  ).all(Number(videoGenId));
+  for (const action of actions) {
+    costLedger.transition(db, `production:${action.run_id}:${action.action_key}`, 'settled', {
+      note: '上游视频任务已完成；本地下载作为零费用恢复步骤独立进行',
+    });
   }
-  const persistedVideoUrl = options.prefer_local_url && localPath
+  if (actions.length) log.info('Settled accepted video generation cost', { videoGenId, actions: actions.length });
+}
+
+function resolvePersistedVideoConfig(db, row) {
+  const config = videoClient.getDefaultVideoConfig(db, row.model, row.video_config_id);
+  if (row.video_config_id != null && Number(config?.id) !== Number(row.video_config_id)) return null;
+  return config;
+}
+
+function providerReceiptJson(receipt) {
+  return receipt && typeof receipt === 'object' ? JSON.stringify(receipt) : null;
+}
+
+function persistCompletedReferences(db, log, row, videoGenId, videoUrl, localPath, options = {}) {
+  const now = new Date().toISOString();
+  const persistedVideoUrl = (options.prefer_local_url || row.download_requires_auth) && localPath
     ? `/static/${localPath}`
     : videoUrl;
-  const providerPromptReceiptJson = options.provider_prompt_receipt
-    ? JSON.stringify(options.provider_prompt_receipt)
-    : null;
-  try {
-    db.prepare(
-      'UPDATE video_generations SET status = ?, video_url = ?, local_path = ?, provider_prompt_receipt_json = COALESCE(?, provider_prompt_receipt_json), completed_at = ?, updated_at = ? WHERE id = ?'
-    ).run('completed', persistedVideoUrl, localPath, providerPromptReceiptJson, now, now, videoGenId);
-  } catch (e) {
-    if ((e.message || '').includes('provider_prompt_receipt_json')) {
-      db.prepare(
-        'UPDATE video_generations SET status = ?, video_url = ?, local_path = ?, completed_at = ?, updated_at = ? WHERE id = ?'
-      ).run('completed', persistedVideoUrl, localPath, now, now, videoGenId);
-    } else if ((e.message || '').includes('completed_at')) {
-      db.prepare(
-        'UPDATE video_generations SET status = ?, video_url = ?, local_path = ?, updated_at = ? WHERE id = ?'
-      ).run('completed', persistedVideoUrl, localPath, now, videoGenId);
-    } else throw e;
-  }
   if (row.storyboard_id) {
     try {
       db.prepare('UPDATE storyboards SET video_url = ?, local_path = ?, updated_at = ? WHERE id = ?').run(
-        persistedVideoUrl, localPath, now, row.storyboard_id
+        persistedVideoUrl, localPath || null, now, row.storyboard_id
       );
-      log.info('Updated storyboard video' + (logLabel ? ` (${logLabel})` : ''), {
-        storyboard_id: row.storyboard_id,
-        video_url: persistedVideoUrl,
-      });
     } catch (_) {}
   }
   if (row.task_id) {
@@ -318,11 +475,265 @@ async function finalizeSuccessfulVideo(db, log, videoGenId, row, rowForAspect, v
       provider_prompt_receipt: options.provider_prompt_receipt || undefined,
     });
   }
-  log.info('Video generation completed' + (logLabel ? ` (${logLabel})` : ''), {
+  try {
+    archiveDetachedVideoGeneration(db, {
+      generation_id: videoGenId,
+      local_path: localPath,
+      remote_url: persistedVideoUrl,
+    });
+  } catch (error) {
+    log.warn('Detached production video could not be archived', {
+      videoGenId,
+      error: error.message,
+    });
+  }
+  log.info('Video generation and delivery completed', {
     id: videoGenId,
     video_url: persistedVideoUrl,
-    local_path: localPath,
+    local_path: localPath || null,
   });
+  return persistedVideoUrl;
+}
+
+function markProviderCompleted(db, log, videoGenId, row, videoUrl, options = {}) {
+  const now = new Date().toISOString();
+  const requireLocal = options.require_local === true;
+  const sourceUrl = options.download_url || videoUrl;
+  const receipt = providerReceiptJson(options.provider_prompt_receipt);
+  persistVideoSubmissionState(db, videoGenId, 'accepted', {
+    receipt: {
+      phase: 'provider_completed',
+      request_id: row.provider_task_id || null,
+      provider_status: 'completed',
+      model: row.model || null,
+    },
+  });
+  db.prepare(
+    `UPDATE video_generations SET
+       status = ?, generation_status = 'completed', download_status = ?,
+       video_url = ?, remote_video_url = ?, download_source_url = ?, download_requires_auth = ?,
+       provider_prompt_receipt_json = COALESCE(?, provider_prompt_receipt_json),
+       provider_completed_at = COALESCE(provider_completed_at, ?), completed_at = ?,
+       error_msg = NULL, download_error = NULL, updated_at = ?
+     WHERE id = ?`
+  ).run(
+    requireLocal ? 'processing' : 'completed',
+    requireLocal ? 'pending' : 'not_required',
+    videoUrl,
+    videoUrl,
+    sourceUrl,
+    options.headers?.Authorization ? 1 : 0,
+    receipt,
+    now,
+    requireLocal ? null : now,
+    now,
+    videoGenId
+  );
+  settleAcceptedVideoCost(db, videoGenId, log);
+  if (row.task_id) {
+    if (requireLocal) {
+      taskService.updateTaskStatus(db, row.task_id, 'processing', 92, '上游生成已完成，正在取回视频文件…');
+    } else {
+      persistCompletedReferences(db, log, row, videoGenId, videoUrl, null, options);
+    }
+  } else if (!requireLocal) {
+    persistCompletedReferences(db, log, row, videoGenId, videoUrl, null, options);
+  }
+  log.info('Provider video generation completed', {
+    id: videoGenId,
+    provider_task_id: row.provider_task_id || null,
+    download_required: requireLocal,
+  });
+}
+
+function acquireDownloadLease(db, videoGenId, owner, leaseMs = DOWNLOAD_LEASE_MS) {
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const expiresAt = new Date(now.getTime() + leaseMs).toISOString();
+  const info = db.prepare(
+    `UPDATE video_generations SET
+       status = 'processing', download_status = 'downloading', download_lease_owner = ?,
+       download_lease_expires_at = ?, download_started_at = COALESCE(download_started_at, ?),
+       download_attempts = COALESCE(download_attempts, 0) + 1, updated_at = ?
+     WHERE id = ? AND generation_status = 'completed'
+       AND download_status IN ('pending', 'failed', 'downloading')
+       AND (download_lease_owner IS NULL OR download_lease_owner = ''
+         OR download_lease_expires_at IS NULL OR download_lease_expires_at <= ?
+         OR download_lease_owner = ?)`
+  ).run(owner, expiresAt, nowIso, nowIso, Number(videoGenId), nowIso, owner);
+  return info.changes === 1;
+}
+
+function markDownloadFailure(db, log, videoGenId, row, error) {
+  const now = new Date().toISOString();
+  const message = String(error?.message || error || '视频下载失败').slice(0, 500);
+  db.prepare(
+    `UPDATE video_generations SET
+       status = 'processing', download_status = 'failed', download_error = ?, error_msg = NULL,
+       download_lease_owner = NULL, download_lease_expires_at = NULL, updated_at = ?
+     WHERE id = ? AND generation_status = 'completed'`
+  ).run(message, now, Number(videoGenId));
+  if (row.task_id) {
+    taskService.updateTaskStatus(db, row.task_id, 'processing', 92, `视频已生成，取回失败，正在自动重试：${message}`);
+  }
+  log.warn('Provider video completed but local delivery failed', {
+    videoGenId,
+    provider_task_id: row.provider_task_id || null,
+    error: message,
+  });
+}
+
+function completeVideoDownload(db, log, videoGenId, row, localPath, options = {}) {
+  const now = new Date().toISOString();
+  const remoteVideoUrl = options.remote_video_url || row.remote_video_url || row.video_url;
+  const persistedVideoUrl = (options.prefer_local_url || row.download_requires_auth) && localPath
+    ? `/static/${localPath}`
+    : remoteVideoUrl;
+  db.prepare(
+    `UPDATE video_generations SET
+       status = 'completed', generation_status = 'completed', download_status = 'completed',
+       video_url = ?, remote_video_url = COALESCE(?, remote_video_url), local_path = ?,
+       download_error = NULL, error_msg = NULL, download_lease_owner = NULL,
+       download_lease_expires_at = NULL, download_completed_at = ?, completed_at = ?, updated_at = ?
+     WHERE id = ? AND generation_status = 'completed'`
+  ).run(persistedVideoUrl, remoteVideoUrl || null, localPath, now, now, now, Number(videoGenId));
+  persistCompletedReferences(db, log, row, videoGenId, remoteVideoUrl, localPath, {
+    prefer_local_url: options.prefer_local_url || row.download_requires_auth,
+    provider_prompt_receipt: options.provider_prompt_receipt,
+  });
+}
+
+function scheduleDownloadRetry(db, log, videoGenId, attempts = 1) {
+  const delay = Math.min(10 * 60 * 1000, Math.max(15000, 15000 * (2 ** Math.min(5, Math.max(0, attempts - 1)))));
+  const timer = setTimeout(() => {
+    resumeDownloadForVideoGeneration(db, log, videoGenId).catch((error) => {
+      log.error('Video download retry failed to start', { videoGenId, error: error.message });
+    });
+  }, delay);
+  timer.unref?.();
+}
+
+async function refreshCompletedDownloadSource(db, log, videoGenId, row, config) {
+  if (!row.provider_task_id || !config) return null;
+  const result = await videoClient.pollVideoTask(
+    db, log, videoGenId, row.provider_task_id, config, 1, 0, row.prompt
+  );
+  const resolved = resolveRemoteVideoUrl(result.video_url, result.error);
+  let sourceUrl = null;
+  let remoteVideoUrl = null;
+  let requiresAuth = false;
+  if (resolved.ok) {
+    sourceUrl = resolved.video_url;
+    remoteVideoUrl = resolved.video_url;
+  } else if (result.content_url) {
+    sourceUrl = result.content_url;
+    remoteVideoUrl = row.remote_video_url || result.content_url;
+    requiresAuth = true;
+  } else if (result.pending) {
+    throw new Error('原上游任务暂未返回可下载地址，请稍后继续取回');
+  } else {
+    throw new Error(resolved.error || '无法从原上游任务刷新下载地址');
+  }
+  db.prepare(
+    `UPDATE video_generations SET
+       remote_video_url = COALESCE(?, remote_video_url), download_source_url = ?,
+       download_requires_auth = ?, provider_prompt_receipt_json = COALESCE(?, provider_prompt_receipt_json),
+       updated_at = ? WHERE id = ?`
+  ).run(
+    remoteVideoUrl,
+    sourceUrl,
+    requiresAuth ? 1 : 0,
+    providerReceiptJson(result.provider_prompt_receipt),
+    new Date().toISOString(),
+    Number(videoGenId)
+  );
+  return { source_url: sourceUrl, remote_video_url: remoteVideoUrl, requires_auth: requiresAuth };
+}
+
+async function resumeDownloadForVideoGeneration(db, log, videoGenId, injected = {}) {
+  const numericId = Number(videoGenId);
+  if (activeVideoDownloads.has(numericId)) return { state: 'already_running' };
+  const owner = `download-${process.pid}-${randomUUID()}`;
+  if (!acquireDownloadLease(db, numericId, owner, injected.lease_ms || DOWNLOAD_LEASE_MS)) {
+    const current = db.prepare('SELECT * FROM video_generations WHERE id = ?').get(numericId);
+    return { state: current?.download_status === 'completed' ? 'completed' : 'leased', generation: current || null };
+  }
+  activeVideoDownloads.add(numericId);
+  let row = db.prepare('SELECT * FROM video_generations WHERE id = ? AND deleted_at IS NULL').get(numericId);
+  try {
+    const cfg = injected.config || require('../config').loadConfig();
+    const storagePath = resolveStoragePath(cfg);
+    const projectSubdir = storageLayout.getProjectStorageSubdir(db, row.drama_id);
+    const config = injected.video_config || resolvePersistedVideoConfig(db, row);
+    if (row.video_config_id != null && !config) {
+      throw new Error(`原视频配置 #${row.video_config_id} 已不可用，请重新绑定该配置后继续下载；不会重新生成视频`);
+    }
+    let sourceUrl = row.download_source_url || row.remote_video_url || row.video_url;
+    let remoteVideoUrl = row.remote_video_url || row.video_url || null;
+    let requiresAuth = Boolean(row.download_requires_auth);
+    const downloader = injected.download || downloadVideoToLocal;
+    const attempt = async () => downloader(
+      storagePath,
+      sourceUrl,
+      numericId,
+      log,
+      projectSubdir,
+      {
+        headers: requiresAuth && config?.api_key ? { Authorization: `Bearer ${config.api_key}` } : {},
+        timeout_ms: injected.timeout_ms,
+        throw_on_error: true,
+        fetch_impl: injected.fetch_impl,
+        skip_probe: injected.skip_probe,
+        min_bytes: injected.min_bytes,
+      }
+    );
+    let localPath = null;
+    let firstError = null;
+    if (sourceUrl) {
+      try { localPath = await attempt(); } catch (error) { firstError = error; }
+    }
+    if (!localPath && row.provider_task_id) {
+      const refreshed = injected.refresh_source
+        ? await injected.refresh_source({ db, log, videoGenId: numericId, row, config })
+        : await refreshCompletedDownloadSource(db, log, numericId, row, config);
+      if (refreshed) {
+        sourceUrl = refreshed.source_url;
+        remoteVideoUrl = refreshed.remote_video_url || remoteVideoUrl;
+        requiresAuth = Boolean(refreshed.requires_auth);
+        localPath = await attempt();
+      }
+    }
+    if (!localPath) throw firstError || new Error('原任务没有可用的下载地址');
+    maybeNormalizeVideoAfterDownload(storagePath, localPath, row, numericId, log);
+    row = db.prepare('SELECT * FROM video_generations WHERE id = ?').get(numericId);
+    completeVideoDownload(db, log, numericId, row, localPath, {
+      remote_video_url: remoteVideoUrl,
+      prefer_local_url: requiresAuth,
+      provider_prompt_receipt: row.provider_prompt_receipt_json
+        ? JSON.parse(row.provider_prompt_receipt_json) : undefined,
+    });
+    return { state: 'completed', local_path: localPath };
+  } catch (error) {
+    markDownloadFailure(db, log, numericId, row, error);
+    const updated = db.prepare('SELECT download_attempts FROM video_generations WHERE id = ?').get(numericId);
+    if (!injected.disable_retry) scheduleDownloadRetry(db, log, numericId, Number(updated?.download_attempts || 1));
+    return { state: 'download_failed', error: error.message };
+  } finally {
+    activeVideoDownloads.delete(numericId);
+  }
+}
+
+async function finalizeSuccessfulVideo(db, log, videoGenId, row, rowForAspect, videoUrl, logLabel, options = {}) {
+  markProviderCompleted(db, log, videoGenId, row, videoUrl, options);
+  if (options.require_local) {
+    const result = await resumeDownloadForVideoGeneration(db, log, videoGenId, {
+      timeout_ms: options.timeout_ms,
+    });
+    log.info('Video local delivery result' + (logLabel ? ` (${logLabel})` : ''), {
+      id: videoGenId,
+      state: result.state,
+    });
+  }
 }
 
 async function pollProviderTaskAndFinalize(db, log, videoGenId, row, rowForAspect, providerTaskId, config) {
@@ -372,8 +783,11 @@ async function pollProviderTaskAndFinalize(db, log, videoGenId, row, rowForAspec
       }
     );
   } else if (pollResult.pending) {
-    db.prepare('UPDATE video_generations SET status = ?, error_msg = NULL, updated_at = ? WHERE id = ?').run(
-      'processing', now, videoGenId
+    db.prepare(
+      `UPDATE video_generations SET status = 'processing', generation_status = 'processing',
+       error_msg = NULL, updated_at = ? WHERE id = ?`
+    ).run(
+      now, videoGenId
     );
     if (row.task_id) {
       taskService.updateTaskStatus(
@@ -411,15 +825,29 @@ async function resumePollForVideoGeneration(db, log, videoGenId) {
     return;
   }
   const row = db.prepare('SELECT * FROM video_generations WHERE id = ? AND deleted_at IS NULL').get(Number(videoGenId));
-  if (!row || row.status !== 'processing') return;
+  if (!row) return;
+  const generationStatus = row.generation_status || legacyGenerationStatus(row);
+  if (generationStatus === 'completed') {
+    if (!['completed', 'not_required'].includes(row.download_status || legacyDownloadStatus(row))) {
+      return resumeDownloadForVideoGeneration(db, log, videoGenId);
+    }
+    return;
+  }
+  if (generationStatus !== 'processing') return;
   const providerTaskId = row.provider_task_id && String(row.provider_task_id).trim();
   if (!providerTaskId) return;
 
-  const config = videoClient.getDefaultVideoConfig(db, row.model);
+  const config = resolvePersistedVideoConfig(db, row);
   if (!config) {
     const now = new Date().toISOString();
-    setVideoGenFailed(db, videoGenId, '未配置视频模型', now);
-    if (row.task_id) taskService.updateTaskError(db, row.task_id, '未配置视频模型');
+    const message = row.video_config_id != null
+      ? `原视频配置 #${row.video_config_id} 已不可用，请重新绑定后继续查询原任务；不会重新生成视频`
+      : '未配置视频模型，无法继续查询原任务';
+    db.prepare(
+      `UPDATE video_generations SET status = 'processing', generation_status = 'processing',
+       error_msg = ?, updated_at = ? WHERE id = ?`
+    ).run(message, now, Number(videoGenId));
+    if (row.task_id) taskService.updateTaskStatus(db, row.task_id, 'processing', 20, message);
     return;
   }
 
@@ -437,36 +865,100 @@ async function resumePollForVideoGeneration(db, log, videoGenId) {
     const rowForAspect = { ...row, aspect_ratio: aspectForVideo || row.aspect_ratio };
     await pollProviderTaskAndFinalize(db, log, videoGenId, row, rowForAspect, providerTaskId, config);
   } catch (err) {
-    const now = new Date().toISOString();
-    setVideoGenFailed(db, videoGenId, err.message, now);
-    if (row.task_id) taskService.updateTaskError(db, row.task_id, err.message);
-    log.error('Video generation resume poll error', { id: videoGenId, error: err.message });
+    const latest = db.prepare('SELECT * FROM video_generations WHERE id = ?').get(Number(videoGenId));
+    if ((latest?.generation_status || legacyGenerationStatus(latest)) === 'completed') {
+      markDownloadFailure(db, log, videoGenId, latest, err);
+    } else {
+      const now = new Date().toISOString();
+      setVideoGenFailed(db, videoGenId, err.message, now);
+      if (row.task_id) taskService.updateTaskError(db, row.task_id, err.message);
+      log.error('Video generation resume poll error', { id: videoGenId, error: err.message });
+    }
   } finally {
     activeVideoPolls.delete(videoGenId);
   }
 }
 
-/** 启动时恢复 processing 视频任务；无 provider_task_id 的视为中断 */
+function backfillVideoDeliveryState(db, log) {
+  const rows = db.prepare(
+    `SELECT * FROM video_generations
+     WHERE deleted_at IS NULL AND (generation_status IS NULL OR download_status IS NULL)`
+  ).all();
+  const update = db.prepare(
+    `UPDATE video_generations SET
+       status = ?, generation_status = ?, download_status = ?, remote_video_url = COALESCE(remote_video_url, ?),
+       download_source_url = COALESCE(download_source_url, ?), download_error = COALESCE(download_error, ?),
+       provider_completed_at = COALESCE(provider_completed_at, ?), error_msg = ?, updated_at = ?
+     WHERE id = ?`
+  );
+  const tx = db.transaction(() => {
+    for (const row of rows) {
+      const generationStatus = legacyGenerationStatus(row);
+      const downloadStatus = legacyDownloadStatus(row);
+      const historicalDownloadFailure = generationStatus === 'completed' && downloadStatus === 'failed';
+      const timestamp = row.updated_at || row.completed_at || new Date().toISOString();
+      update.run(
+        historicalDownloadFailure ? 'processing' : row.status,
+        generationStatus,
+        downloadStatus,
+        row.video_url || null,
+        row.video_url || null,
+        historicalDownloadFailure ? row.error_msg : null,
+        generationStatus === 'completed' ? timestamp : null,
+        historicalDownloadFailure ? null : row.error_msg,
+        new Date().toISOString(),
+        row.id
+      );
+    }
+    db.prepare(
+      `UPDATE video_generations SET download_status = 'failed', download_lease_owner = NULL,
+       download_lease_expires_at = NULL, updated_at = ?
+       WHERE generation_status = 'completed' AND download_status = 'downloading'
+         AND (download_lease_expires_at IS NULL OR download_lease_expires_at <= ?)`
+    ).run(new Date().toISOString(), new Date().toISOString());
+  });
+  tx.immediate();
+  if (rows.length) log.info('Backfilled video delivery state', { count: rows.length });
+  return rows.length;
+}
+
+/** 启动时分别恢复上游轮询和本地下载；任何恢复路径都不会创建新视频任务。 */
 function resumeProcessingVideoGenerations(db, log) {
+  backfillVideoDeliveryState(db, log);
   const stuck = db
     .prepare(
-      `SELECT id, task_id FROM video_generations
-       WHERE status = 'processing' AND deleted_at IS NULL
+      `SELECT * FROM video_generations
+       WHERE generation_status = 'processing' AND deleted_at IS NULL
          AND (provider_task_id IS NULL OR TRIM(provider_task_id) = '')`
     )
     .all();
-  const stuckMsg = '服务重启后无法恢复轮询（缺少厂商任务 ID），请重新生成';
   for (const s of stuck) {
     const now = new Date().toISOString();
-    setVideoGenFailed(db, s.id, stuckMsg, now);
+    const submissionStatus = submissionStatusForRow(s);
+    const definitelyNotSent = submissionStatus === 'not_sent';
+    const stuckMsg = definitelyNotSent
+      ? '服务重启前视频请求尚未发送，已安全停止；本次视频额度可返还'
+      : '服务重启后无法确认创建结果（缺少厂商任务 ID），已停止自动重提以避免重复扣费';
+    setVideoGenFailed(db, s.id, stuckMsg, now, {
+      submission_status: definitelyNotSent ? 'not_sent' : 'ambiguous',
+      generation_status: definitelyNotSent ? 'failed' : 'ambiguous',
+      submission_receipt: {
+        phase: definitelyNotSent ? 'restart_before_post' : 'restart_ambiguous_post',
+        model: s.model || null,
+        message: stuckMsg,
+      },
+    });
     if (s.task_id) taskService.updateTaskError(db, s.task_id, stuckMsg);
-    log.warn('Marked interrupted video generation as failed', { videoGenId: s.id });
+    log.warn(definitelyNotSent ? 'Stopped unsent video generation after restart' : 'Marked interrupted video creation as ambiguous', {
+      videoGenId: s.id,
+      submission_status: definitelyNotSent ? 'not_sent' : 'ambiguous',
+    });
   }
 
   const resumable = db
     .prepare(
       `SELECT id FROM video_generations
-       WHERE status = 'processing' AND deleted_at IS NULL
+       WHERE generation_status = 'processing' AND deleted_at IS NULL
          AND provider_task_id IS NOT NULL AND TRIM(provider_task_id) != ''`
     )
     .all();
@@ -480,33 +972,69 @@ function resumeProcessingVideoGenerations(db, log) {
       });
     });
   }
+  const downloads = db.prepare(
+    `SELECT id FROM video_generations
+     WHERE generation_status = 'completed' AND download_status IN ('pending', 'failed')
+       AND deleted_at IS NULL`
+  ).all();
+  if (downloads.length) log.info('Resuming completed video downloads', { count: downloads.length });
+  for (const row of downloads) {
+    setImmediate(() => {
+      resumeDownloadForVideoGeneration(db, log, row.id).catch((error) => {
+        log.error('resumeDownloadForVideoGeneration unhandled', { videoGenId: row.id, error: error.message });
+      });
+    });
+  }
 }
 
 async function processVideoGeneration(db, log, videoGenId) {
+  const existing = db.prepare('SELECT * FROM video_generations WHERE id = ? AND deleted_at IS NULL').get(Number(videoGenId));
+  if (!existing) {
+    log.error('Video generation not found', { id: videoGenId });
+    return;
+  }
+  const existingGenerationStatus = existing.generation_status || legacyGenerationStatus(existing);
+  if (existingGenerationStatus === 'completed') {
+    if (!['completed', 'not_required'].includes(existing.download_status || legacyDownloadStatus(existing))) {
+      return resumeDownloadForVideoGeneration(db, log, videoGenId);
+    }
+    return;
+  }
+  if (existingGenerationStatus === 'processing' && existing.provider_task_id) {
+    return resumePollForVideoGeneration(db, log, videoGenId);
+  }
+  if (['failed', 'ambiguous'].includes(existingGenerationStatus)) {
+    log.warn('Refusing to resubmit terminal or ambiguous video generation', {
+      videoGenId,
+      generation_status: existingGenerationStatus,
+    });
+    return;
+  }
   if (activeVideoPolls.has(videoGenId)) {
     log.info('Video generation already in progress, skip duplicate', { videoGenId });
     return;
   }
   activeVideoPolls.add(videoGenId);
   log.info('processVideoGeneration started', { videoGenId });
-  const row = db.prepare('SELECT * FROM video_generations WHERE id = ? AND deleted_at IS NULL').get(Number(videoGenId));
-  if (!row) {
-    activeVideoPolls.delete(videoGenId);
-    log.error('Video generation not found', { id: videoGenId });
-    return;
-  }
+  const row = existing;
   const now = new Date().toISOString();
   try {
-    db.prepare('UPDATE video_generations SET status = ?, updated_at = ? WHERE id = ?').run('processing', now, videoGenId);
+    db.prepare(
+      `UPDATE video_generations SET status = 'processing', generation_status = 'processing',
+       download_status = COALESCE(download_status, 'pending'), error_msg = NULL, updated_at = ? WHERE id = ?`
+    ).run(now, videoGenId);
     const loadConfig = require('../config').loadConfig;
     const cfg = loadConfig();
     const filesBaseUrl = (cfg.storage && cfg.storage.base_url) ? String(cfg.storage.base_url).replace(/\/$/, '') : '';
     const storageLocalPath = path.isAbsolute(cfg.storage?.local_path)
       ? cfg.storage.local_path
       : path.join(process.cwd(), cfg.storage?.local_path || './data/storage');
-    const config = videoClient.getDefaultVideoConfig(db, row.model);
+    const config = resolvePersistedVideoConfig(db, row);
     if (!config) {
-      setVideoGenFailed(db, videoGenId, '未配置视频模型', now);
+      setVideoGenFailed(db, videoGenId, '未配置视频模型', now, {
+        submission_status: 'not_sent',
+        submission_receipt: { phase: 'video_config_resolution', model: row.model || null },
+      });
       if (row.task_id) taskService.updateTaskError(db, row.task_id, '未配置视频模型');
       return;
     }
@@ -561,6 +1089,15 @@ async function processVideoGeneration(db, log, videoGenId) {
         `正在准备 ${referenceTransport.reference_count} 个参考媒体…`
       );
     }
+    if (videoClient.resolveVideoProtocol(config, row.model) !== 'yinzi') {
+      persistVideoSubmissionState(db, videoGenId, 'ambiguous', {
+        receipt: {
+          phase: 'provider_dispatch_started',
+          model: row.model || null,
+          endpoint: config.endpoint || null,
+        },
+      });
+    }
     const result = await videoClient.callVideoApi(db, log, {
       prompt: row.prompt,
       model: row.model,
@@ -579,19 +1116,57 @@ async function processVideoGeneration(db, log, videoGenId) {
       reference_urls: referenceTransport.reference_urls,
       reference_video_urls: referenceTransport.reference_video_urls,
       reference_audio_urls: referenceTransport.reference_audio_urls,
+      contract_validation_mode: videoClient.normalizeContractValidationMode(row.contract_validation_mode),
       files_base_url: filesBaseUrl,
       storage_local_path: storageLocalPath,
       video_gen_id: videoGenId,
+      video_config_id: row.video_config_id,
+      on_submission_state: (submission) => persistVideoSubmissionState(
+        db,
+        videoGenId,
+        submission.status,
+        { http_status: submission.http_status, receipt: submission.receipt }
+      ),
     });
+    if (result.submission_status) {
+      persistVideoSubmissionState(db, videoGenId, result.submission_status, {
+        http_status: result.submission_http_status,
+        receipt: result.submission_receipt,
+      });
+    }
+    if (result.contract_validation) {
+      try {
+        db.prepare(
+          'UPDATE video_generations SET contract_validation_receipt_json = ?, updated_at = ? WHERE id = ?'
+        ).run(JSON.stringify(result.contract_validation), new Date().toISOString(), videoGenId);
+      } catch (_) {
+        // Older ad-hoc databases may not have the optional receipt column;
+        // dispatch behavior remains valid because the action/request receipt
+        // still carries the same warnings.
+      }
+    }
     const now2 = new Date().toISOString();
     if (result.error) {
-      setVideoGenFailed(db, videoGenId, result.error, now2);
+      const submissionStatus = result.submission_status
+        || (result.ambiguous_submission ? 'ambiguous' : 'ambiguous');
+      setVideoGenFailed(db, videoGenId, result.error, now2, {
+        submission_status: submissionStatus,
+        submission_http_status: result.submission_http_status,
+        submission_receipt: result.submission_receipt,
+        generation_status: submissionStatus === 'ambiguous' ? 'ambiguous' : 'failed',
+      });
       if (row.task_id) taskService.updateTaskError(db, row.task_id, result.error);
-      log.error('Video generation failed', { id: videoGenId, error: result.error });
+      log.error('Video generation failed', {
+        id: videoGenId, error: result.error, submission_status: submissionStatus,
+      });
       return;
     }
     const directVideo = resolveRemoteVideoUrl(result.video_url, result.error);
     if (directVideo.ok) {
+      persistVideoSubmissionState(db, videoGenId, 'accepted', {
+        http_status: result.submission_http_status,
+        receipt: result.submission_receipt || { phase: 'direct_video_received', model: row.model || null },
+      });
       await finalizeSuccessfulVideo(
         db, log, videoGenId, row, rowForAspect, directVideo.video_url, '',
         { require_local: videoClient.resolveVideoProtocol(config) === 'yinzi' }
@@ -599,25 +1174,57 @@ async function processVideoGeneration(db, log, videoGenId) {
       return;
     }
     if (result.video_url) {
-      setVideoGenFailed(db, videoGenId, directVideo.error, now2);
+      setVideoGenFailed(db, videoGenId, directVideo.error, now2, {
+        submission_status: result.submission_status || 'ambiguous',
+        submission_http_status: result.submission_http_status,
+        submission_receipt: result.submission_receipt,
+        generation_status: 'ambiguous',
+      });
       if (row.task_id) taskService.updateTaskError(db, row.task_id, directVideo.error);
       log.error('Video generation failed', { id: videoGenId, error: directVideo.error });
       return;
     }
     if (result.task_id) {
+      persistVideoSubmissionState(db, videoGenId, 'accepted', {
+        http_status: result.submission_http_status,
+        receipt: result.submission_receipt || {
+          phase: 'task_id_received', request_id: result.task_id, model: row.model || null,
+        },
+      });
       db.prepare(
-        'UPDATE video_generations SET status = ?, provider_task_id = ?, updated_at = ? WHERE id = ?'
-      ).run('processing', result.task_id, now2, videoGenId);
+        `UPDATE video_generations SET status = 'processing', generation_status = 'processing',
+         provider_task_id = ?, updated_at = ? WHERE id = ?`
+      ).run(result.task_id, now2, videoGenId);
       await pollProviderTaskAndFinalize(db, log, videoGenId, row, rowForAspect, result.task_id, config);
       return;
     }
-    setVideoGenFailed(db, videoGenId, '未返回 task_id 或 video_url', now2);
+    setVideoGenFailed(db, videoGenId, '未返回 task_id 或 video_url', now2, {
+      submission_status: 'ambiguous',
+      generation_status: 'ambiguous',
+      submission_receipt: { phase: 'success_without_authority', model: row.model || null },
+    });
     if (row.task_id) taskService.updateTaskError(db, row.task_id, '未返回 task_id 或 video_url');
   } catch (err) {
-    const now2 = new Date().toISOString();
-    setVideoGenFailed(db, videoGenId, err.message, now2);
-    if (row && row.task_id) taskService.updateTaskError(db, row.task_id, err.message);
-    log.error('Video generation error', { id: videoGenId, error: err.message });
+    const latest = db.prepare('SELECT * FROM video_generations WHERE id = ?').get(Number(videoGenId));
+    if ((latest?.generation_status || legacyGenerationStatus(latest)) === 'completed') {
+      markDownloadFailure(db, log, videoGenId, latest, err);
+    } else {
+      const now2 = new Date().toISOString();
+      const submissionStatus = latest?.provider_task_id
+        ? 'accepted'
+        : submissionStatusForRow(latest) === 'not_sent' ? 'ambiguous' : submissionStatusForRow(latest);
+      setVideoGenFailed(db, videoGenId, err.message, now2, {
+        submission_status: submissionStatus,
+        generation_status: submissionStatus === 'ambiguous' ? 'ambiguous' : 'failed',
+        submission_receipt: parseObject(latest?.submission_receipt_json) || {
+          phase: 'unhandled_dispatch_error', model: row?.model || null, message: err.message,
+        },
+      });
+      if (row && row.task_id) taskService.updateTaskError(db, row.task_id, err.message);
+      log.error('Video generation error', {
+        id: videoGenId, error: err.message, submission_status: submissionStatus,
+      });
+    }
   } finally {
     activeVideoPolls.delete(videoGenId);
   }
@@ -635,7 +1242,14 @@ module.exports = {
   deleteById,
   processVideoGeneration,
   resumeProcessingVideoGenerations,
+  resumeDownloadForVideoGeneration,
   downloadVideoToLocal,
   _rowToItem: rowToItem,
   _buildReferenceTransport: buildReferenceTransport,
+  _backfillVideoDeliveryState: backfillVideoDeliveryState,
+  _acquireDownloadLease: acquireDownloadLease,
+  _markProviderCompleted: markProviderCompleted,
+  _validateDownloadedVideoFile: validateDownloadedVideoFile,
+  _persistVideoSubmissionState: persistVideoSubmissionState,
+  _submissionStatusForRow: submissionStatusForRow,
 };

@@ -51,16 +51,16 @@ describe('production video router', () => {
     assert.equal(route.uses_reference_video, false);
   });
 
-  it('selects the image-only model and prices the effective five-second request', () => {
+  it('selects the lowest estimated total price and prices the effective five-second request', () => {
     const route = selectShotVideoRoute({
       shot: { content: { duration: 2, shot_type: '特写' } }, catalog, policy,
     });
-    assert.equal(route.model, 'cc-seedance2.0 480p-fast-nsp');
+    assert.equal(route.model, 'mg-seedance2.0 -480p mini');
     assert.equal(route.planned_duration, 2);
     assert.equal(route.duration, 5);
     assert.equal(route.duration_adjusted, true);
     assert.equal(route.limits.videos, 0);
-    assert.equal(route.estimated_price, 2.328);
+    assert.equal(route.estimated_price, 1.002);
     assert.equal(route.catalog_verified, true);
   });
 
@@ -118,7 +118,7 @@ describe('production video router', () => {
       catalog,
       policy,
     });
-    assert.equal(route.model, 'cc-seedance2.0 480p-fast-nsp');
+    assert.equal(route.model, 'mg-seedance2.0 -480p mini');
     assert.equal(route.previs_mode, 'force');
     assert.equal(route.requires_director_preview, true);
     assert.equal(route.uses_reference_video, false);
@@ -161,12 +161,31 @@ describe('production video router', () => {
     assert.deepEqual(route.reason_codes, ['shot_model_override']);
   });
 
-  it('rejects a fixed model that is absent from the configured group', () => {
-    assert.throws(() => selectShotVideoRoute({
+  it('keeps a fixed cross-group model selectable and records the catalog warning', () => {
+    const route = selectShotVideoRoute({
       shot: { content: { duration: 5 } },
       catalog,
       policy: { video_routing_mode: 'fixed', video_model: 'cc-seedance2.0 480p-nsp', video_group: '不存在的分组' },
-    }), (error) => error.code === 'VIDEO_ROUTE_GROUP_UNAVAILABLE');
+    });
+    assert.equal(route.model, 'cc-seedance2.0 480p-nsp');
+    assert.equal(route.group_available, false);
+    assert.ok(route.contract_warnings.includes('group_unavailable'));
+  });
+
+  it('keeps an unregistered fixed model authoritative when the live catalog is empty', () => {
+    const route = selectShotVideoRoute({
+      shot: { content: { duration: 7, previs_mode: 'skip' } },
+      catalog: { pricing_version: 'empty', fetched_at: null, video: [] },
+      policy: { video_routing_mode: 'fixed', video_model: 'brand-new-video-model', video_group: 'custom-group' },
+    });
+    assert.equal(route.model, 'brand-new-video-model');
+    assert.equal(route.catalog_verified, false);
+    assert.equal(route.group_available, false);
+    assert.equal(route.contract_status, 'missing');
+    assert.equal(route.limits, null);
+    assert.equal(route.estimated_price, null);
+    assert.ok(route.contract_warnings.includes('unknown_contract'));
+    assert.ok(route.contract_warnings.includes('model_not_in_catalog'));
   });
 
   it('lists incompatible and expensive manual choices without hiding them', () => {
@@ -175,11 +194,65 @@ describe('production video router', () => {
     });
     const fixed15 = options.find((item) => item.model.includes('gz-15s'));
     const expensive = options.find((item) => item.model === '破甲seedance 720p-fast');
-    assert.equal(fixed15.selectable, false);
+    assert.equal(fixed15.selectable, true);
+    assert.equal(fixed15.compatible, false);
     assert.equal(fixed15.incompatibility_code, 'VIDEO_ROUTE_DURATION_UNSUPPORTED');
+    assert.ok(fixed15.warnings.includes('duration_mismatch'));
     assert.equal(expensive.selectable, true);
     assert.equal(expensive.requires_explicit_confirmation, true);
     assert.ok(expensive.warnings.includes('expensive_bypass'));
+  });
+
+  it('uses a local capability hint for manual routing while preserving its advisory status', () => {
+    const localCatalog = {
+      pricing_version: 'local-v1',
+      video: [{
+        ...price('new-local-video', 0.2),
+        contract_status: 'local',
+        capability_source: 'local',
+        capabilities: {
+          duration_mode: 'range', duration_min: 5, duration_max: 12,
+          max_images: 6, max_videos: 2, max_audios: 1,
+          resolution: '720p', quality_tier: 'balanced', automatic_eligible: false,
+          route_profiles: ['short_image_guided', 'long_previs_guided'],
+          roles: { image: ['reference', 'first_frame'], video: ['reference'], audio: ['reference'] },
+        },
+      }],
+    };
+    const route = selectShotVideoRoute({
+      shot: { content: { duration: 8 } },
+      catalog: localCatalog,
+      policy: { video_routing_mode: 'fixed', video_model: 'new-local-video', video_group: '特价视频分组(即梦)' },
+    });
+    assert.equal(route.model, 'new-local-video');
+    assert.equal(route.contract_status, 'local');
+    assert.equal(route.limits.images, 6);
+    const option = listShotVideoRouteOptions({
+      shot: { content: { duration: 8 } }, catalog: localCatalog, policy,
+    })[0];
+    assert.equal(option.selectable, true);
+    assert.equal(option.contract_status, 'local');
+  });
+
+  it('requires explicit automatic authorization before a local hint can enter auto routing', () => {
+    const capability = {
+      duration_mode: 'range', duration_min: 5, duration_max: 12,
+      max_images: 6, max_videos: 2, max_audios: 1,
+      resolution: '720p', quality_tier: 'balanced', automatic_eligible: false,
+      route_profiles: ['short_image_guided', 'long_previs_guided'],
+      roles: { image: ['reference', 'first_frame'], video: ['reference'], audio: ['reference'] },
+    };
+    const localCatalog = {
+      pricing_version: 'local-v1',
+      video: [{ ...price('new-local-video', 0.2), contract_status: 'local', capabilities: capability }],
+    };
+    assert.throws(
+      () => selectShotVideoRoute({ shot: { content: { duration: 8 } }, catalog: localCatalog, policy }),
+      /没有满足媒体、时长和费用策略/,
+    );
+    localCatalog.video[0].capabilities = { ...capability, automatic_eligible: true };
+    const route = selectShotVideoRoute({ shot: { content: { duration: 8 } }, catalog: localCatalog, policy });
+    assert.equal(route.model, 'new-local-video');
   });
 
   it('lets the project-level director switch override a forced long-shot preview', () => {
@@ -199,7 +272,7 @@ describe('production video router', () => {
     const first = selectShotVideoRoute({ shot: { content: { duration: 2 } }, catalog, policy });
     const changed = structuredClone(catalog);
     changed.pricing_version = 'fixture-v2';
-    changed.video[0].prices[0].effective_price = 0.9;
+    changed.video[2].prices[0].effective_price = 0.25;
     const second = selectShotVideoRoute({ shot: { content: { duration: 2 } }, catalog: changed, policy });
     assert.equal(routingMaterialSignature(first), routingMaterialSignature(second));
     assert.notEqual(first.estimated_price, second.estimated_price);

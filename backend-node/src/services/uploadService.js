@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const http = require('http');
-const { randomUUID } = require('crypto');
+const { createHash, randomUUID } = require('crypto');
 
 /**
  * 用 Node.js 原生 http/https 模块下载 URL 到 Buffer。
@@ -67,15 +67,40 @@ function resolveCategoryPaths(storagePath, category, projectSubdir) {
 function uploadFile(storagePath, baseUrl, log, fileBuffer, originalName, mimeType, category, projectSubdir = null) {
   const { dir: categoryPath, relPrefix } = resolveCategoryPaths(storagePath, category, projectSubdir);
   ensureDir(categoryPath);
-  const ext = path.extname(originalName) || '.png';
-  const timestamp = new Date().toISOString().replace(/[-:]/g, '').slice(0, 15);
-  const name = `${timestamp}_${randomUUID()}${ext}`;
+  const rawExt = path.extname(originalName || '').toLowerCase();
+  const ext = /^\.[a-z0-9]{1,10}$/.test(rawExt) ? rawExt : '.bin';
+  const sha256 = createHash('sha256').update(fileBuffer).digest('hex');
+  const name = `${sha256}${ext}`;
   const filePath = path.join(categoryPath, name);
-  fs.writeFileSync(filePath, fileBuffer);
+  let deduplicated = false;
+  if (fs.existsSync(filePath)) {
+    const currentSize = fs.statSync(filePath).size;
+    if (currentSize !== fileBuffer.length) {
+      throw new Error(`Content-addressed upload integrity mismatch for ${name}`);
+    }
+    deduplicated = true;
+  } else {
+    const temporaryPath = path.join(categoryPath, `.${name}.${randomUUID()}.tmp`);
+    try {
+      fs.writeFileSync(temporaryPath, fileBuffer, { flag: 'wx' });
+      try {
+        fs.copyFileSync(temporaryPath, filePath, fs.constants.COPYFILE_EXCL);
+      } catch (error) {
+        if (error.code !== 'EEXIST') throw error;
+        const currentSize = fs.statSync(filePath).size;
+        if (currentSize !== fileBuffer.length) {
+          throw new Error(`Content-addressed upload race mismatch for ${name}`);
+        }
+        deduplicated = true;
+      }
+    } finally {
+      try { fs.unlinkSync(temporaryPath); } catch (_) { /* already removed or never created */ }
+    }
+  }
   const relativePath = `${relPrefix}/${name}`.replace(/\\/g, '/');
   const url = baseUrl ? `${baseUrl.replace(/\/$/, '')}/${relativePath}` : `/static/${relativePath}`;
-  log.info('File uploaded', { path: filePath, url });
-  return { url, local_path: relativePath };
+  log.info('File uploaded', { path: filePath, url, sha256, deduplicated });
+  return { url, local_path: relativePath, sha256, deduplicated };
 }
 
 /**
