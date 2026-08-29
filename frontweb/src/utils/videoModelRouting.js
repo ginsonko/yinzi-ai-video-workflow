@@ -124,7 +124,15 @@ export function catalogModelOption(catalog = [], model = '', group = '') {
       audios: Number(capability.max_audios),
     },
     contract_status: contractStatus,
-    catalog_verified: true,
+    // Preserve the backend evidence boundary. Public smart-route offers and
+    // locally entered models remain selectable, but must not look like they
+    // were verified by the current credential.
+    catalog_verified: item.catalog_verified === true,
+    credential_verified: item.credential_verified === true,
+    public_catalog: item.public_catalog === true,
+    smart_routing_candidate: item.smart_routing_candidate === true,
+    availability_scope: item.availability_scope || null,
+    scope_verified: item.scope_verified === true,
     group_available: groupAvailable,
     billing_unit: price.billing_unit || null,
     unit_price: price.effective_price ?? null,

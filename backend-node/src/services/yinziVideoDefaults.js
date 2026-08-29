@@ -15,6 +15,9 @@ function price(model, group, billingUnit, effectivePrice, options = {}) {
     effective_input_usd: null,
     effective_output_usd: null,
     fixed_duration_seconds: options.fixedDurationSeconds ?? null,
+    allowed_durations: Array.isArray(options.allowedDurations)
+      ? Object.freeze([...new Set(options.allowedDurations.map(Number).filter(Number.isFinite))].sort((a, b) => a - b))
+      : null,
     currency: options.currency || 'CNY',
     source: DEFAULT_PRICE_SOURCE,
   });
@@ -24,8 +27,11 @@ const DEFAULT_VIDEO_PRICES = Object.freeze([
   price('官转-seedance2.0 720p-fast', '特价视频分组(即梦)', 'per_second', 1.014),
   price('官转-seedance2.0 720p-pro', '特价视频分组(即梦)', 'per_second', 1.17),
   price('破甲seedance 720p-fast', '特价视频分组(即梦)', 'per_second', 2.1528),
-  price('特价seedance-2.5-480p', '特价视频分组(即梦)', 'per_second', 0.3354),
-  price('特价seedance-2.5-720p', '特价视频分组(即梦)', 'per_second', 0.4654),
+  // Seedance 2.5 is a fixed 30-second, per-request product. The final edit
+  // may retain a shorter creative segment, but the provider request unit is
+  // always one 30-second generation.
+  price('特价seedance-2.5-480p', '特价视频分组(即梦)', 'per_request', 3.5, { fixedDurationSeconds: 30, allowedDurations: [30] }),
+  price('特价seedance-2.5-720p', '特价视频分组(即梦)', 'per_request', 3.5, { fixedDurationSeconds: 30, allowedDurations: [30] }),
   price('af-seedance-2.0', '特价视频分组(即梦)', 'per_request', 0.3484),
   price('af-seedance-2.0-fast', '特价视频分组(即梦)', 'per_request', 0.2587),
   price('ca-seedance 2.0 720pro-15s', '特价视频分组(即梦)', 'per_request', 3.874),
@@ -36,8 +42,8 @@ const DEFAULT_VIDEO_PRICES = Object.freeze([
   price('mg-seedance2.0 -720p fast', '特价视频分组(即梦)', 'per_second', 0.3484),
   price('mg-seedance2.0 -720p mini', '特价视频分组(即梦)', 'per_second', 0.2574),
   price('mg-seedance2.0 -720p pro', '特价视频分组(即梦)', 'per_second', 0.4784),
-  price('seedance-2.5-480p', '特价视频分组(即梦)', 'per_second', 0.5044),
-  price('seedance-2.5-720p', '特价视频分组(即梦)', 'per_second', 0.672),
+  price('seedance-2.5-480p', '特价视频分组(即梦)', 'per_request', 3.5, { fixedDurationSeconds: 30, allowedDurations: [30] }),
+  price('seedance-2.5-720p', '特价视频分组(即梦)', 'per_request', 3.5, { fixedDurationSeconds: 30, allowedDurations: [30] }),
   price('seedance2.0 -720p-15s', '特价视频分组(即梦)', 'per_request', 6.344),
   price('seedance2.0 -720p-gz-15s', '特价视频分组(即梦)', 'per_request', 6.474),
   price('cm-seedance2.0 -720p-15s', '特价视频分组(即梦)', 'per_request', 8.0808),
@@ -48,7 +54,10 @@ const DEFAULT_VIDEO_PRICES = Object.freeze([
   price('seedance2.0特价pro-720p-gz-15s-nsp', '特价视频分组(即梦)', 'per_request', 5.16, { fixedDurationSeconds: 15 }),
   price('grok-imagine-video', '视频模型渠道', 'per_request', 0.1125),
   price('MiniMax-H3-2k', 'minimax/可灵视频', 'per_second', 0.20475),
+  price('MiniMax-H3-4k', 'minimax/可灵视频', 'per_request', 0.325),
   price('Kling VIDEO 3.0 Omni', 'minimax/可灵视频', 'per_request', 0.25),
+  price('Kling VIDEO 3.0 Omni-1080p', 'minimax/可灵视频', 'per_second', 0.325),
+  price('Kling VIDEO 3.0 Omni-4k', 'minimax/可灵视频', 'per_second', 0.4225),
 ]);
 
 const DEFAULT_VIDEO_PRICE_BY_MODEL = new Map(

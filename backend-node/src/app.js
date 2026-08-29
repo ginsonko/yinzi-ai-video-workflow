@@ -60,6 +60,16 @@ function createApp(options = {}) {
   const taskService = require('./services/taskService');
   taskService.failOrphanedAsyncTasksOnStartup(db, log);
 
+  // Staged browser uploads are recoverable for a bounded period. Startup
+  // cleanup is best-effort and can never block the local application.
+  try {
+    const importService = require('./services/assetImportService');
+    const cleanup = importService.cleanupExpiredStaging(db, config, log);
+    if (cleanup.cleaned) log.info('asset import staging cleanup', cleanup);
+  } catch (error) {
+    log.warn('asset import staging cleanup failed', { error: error.message });
+  }
+
   const { resumeProcessingVideoGenerations } = require('./services/videoService');
   resumeProcessingVideoGenerations(db, log);
 

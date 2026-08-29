@@ -16,6 +16,8 @@ const CURRENT_YINZI_VIDEO_MODELS = [
   'cav2-seedance 2.0 720pro-15s',
   'grok-imagine-video',
   'Kling VIDEO 3.0 Omni',
+  'Kling VIDEO 3.0 Omni-1080p',
+  'Kling VIDEO 3.0 Omni-4k',
   'mg-seedance2.0 -480p',
   'mg-seedance2.0 -480p fast',
   'mg-seedance2.0 -480p mini',
@@ -23,6 +25,7 @@ const CURRENT_YINZI_VIDEO_MODELS = [
   'mg-seedance2.0 -720p mini',
   'mg-seedance2.0 -720p pro',
   'MiniMax-H3-2k',
+  'MiniMax-H3-4k',
   'seedance2.0 -720p-15s',
   'seedance2.0 -720p-gz-15s',
   'seedance-2.5-480p',
@@ -91,17 +94,31 @@ describe('Yinzi video capability contract', () => {
     assert.equal(seedance25.max_videos, 10);
     assert.equal(seedance25.max_audios, 10);
     assert.equal(seedance25.max_reference_video_seconds_total, 29);
-    assert.equal(seedance25.duration_min, 5);
-    assert.equal(seedance25.duration_max, 15);
+    assert.equal(seedance25.duration_mode, 'fixed');
+    assert.equal(seedance25.fixed_duration_seconds, 30);
+    assert.deepEqual(seedance25.allowed_durations, [30]);
+    assert.equal(seedance25.duration_min, 30);
+    assert.equal(seedance25.duration_max, 30);
 
-    for (const model of ['grok-imagine-video', 'MiniMax-H3-2k', 'Kling VIDEO 3.0 Omni']) {
+    const grok = getYinziVideoCapability('grok-imagine-video');
+    assert.equal(grok.automatic_eligible, true);
+    for (const model of [
+      'MiniMax-H3-2k', 'MiniMax-H3-4k', 'Kling VIDEO 3.0 Omni',
+      'Kling VIDEO 3.0 Omni-1080p', 'Kling VIDEO 3.0 Omni-4k',
+    ]) {
       const capability = getYinziVideoCapability(model);
       assert.equal(capability.automatic_eligible, false);
+      assert.equal(capability.manual_eligible, true);
+      assert.equal(capability.automatic_availability, 'temporarily_unavailable');
       assert.equal(capability.max_images, 1);
       assert.equal(capability.max_videos, 0);
       assert.equal(capability.max_audios, 0);
       assert.equal(capabilitySupportsRole(capability, 'image', 'first_frame'), false);
     }
+    assert.equal(getYinziVideoCapability('seedance2.0 720p-pro-nv-nsp').automatic_eligible, false);
+    assert.equal(getYinziVideoCapability('seedance2.0特价pro-720p-gz-15s-nsp').automatic_eligible, false);
+    assert.equal(getYinziVideoCapability('Kling VIDEO 3.0 Omni-1080p').resolution, '1080p');
+    assert.equal(getYinziVideoCapability('Kling VIDEO 3.0 Omni-4k').resolution, '4k');
   });
 
   it('matches the current ten-model YinziAPI offer matrix and local CNY prices', () => {
@@ -111,7 +128,7 @@ describe('Yinzi video capability contract', () => {
       '破甲seedance 720p-fast': { media: [9, 3, 3], duration: ['free', 5, 15], price: ['per_second', 2.1528] },
       'cm-seedance2.0 -720p-15s': { media: [9, 3, 3], duration: ['free', 5, 15], price: ['per_request', 8.0808] },
       'cm-seedance2.0特价fast-720p-gz-15s': { media: [9, 3, 3], duration: ['fixed', 15, 15], price: ['per_request', 4.68] },
-      'seedance-2.5-720p': { media: [30, 0, 10], duration: ['range', 4, 30], price: ['per_second', 0.672] },
+      'seedance-2.5-720p': { media: [30, 10, 10], duration: ['fixed', 30, 30], price: ['per_request', 3.5] },
       'seedance2.0 -720p-fast-15s': { media: [9, 3, 3], duration: ['free', 5, 15], price: ['per_request', 5.58] },
       'seedance2.0 720p-pro-nv-nsp': { media: [9, 0, 3], duration: ['free', 5, 15], price: ['per_request', 0.44928] },
       'seedance2.0特价pro-720p-gz-15s': { media: [9, 3, 3], duration: ['fixed', 15, 15], price: ['fixed_duration', 6.24] },
@@ -139,10 +156,10 @@ describe('Yinzi video capability contract', () => {
     }
 
     const seedance25 = getYinziVideoCapability('seedance-2.5-720p');
-    assert.equal(capabilityAcceptsDuration(seedance25, 4), true);
+    assert.equal(capabilityAcceptsDuration(seedance25, 4), false);
     assert.equal(capabilityAcceptsDuration(seedance25, 4, { automatic: true }), false);
-    assert.equal(capabilityAcceptsDuration(seedance25, 15, { automatic: true }), true);
-    assert.equal(capabilityAcceptsDuration(seedance25, 16, { automatic: true }), false);
+    assert.equal(capabilityAcceptsDuration(seedance25, 30, { automatic: true }), true);
+    assert.equal(capabilityAcceptsDuration(seedance25, 15, { automatic: true }), false);
     assert.equal(getYinziVideoCapability('破甲seedance 720p-fast').automatic_eligible, false);
   });
 });

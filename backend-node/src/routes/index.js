@@ -23,6 +23,8 @@ const promptOverridesRoutes = require('./promptOverrides');
 const sceneModelMapRoutes = require('./sceneModelMap');
 const productionRoutes = require('./production');
 const advancedSettingsRoutes = require('./advancedSettings');
+const assetImportRoutes = require('./assetImport');
+const seriesGroupRoutes = require('./seriesGroups');
 
 function setupRouter(cfg, db, log, injected = {}) {
   const r = express.Router();
@@ -51,6 +53,8 @@ function setupRouter(cfg, db, log, injected = {}) {
   const promptOverrides = promptOverridesRoutes.routes(db, log);
   const production = productionRoutes(db, cfg, log, injected.production || {});
   const advancedSettings = advancedSettingsRoutes(db, cfg, log, injected.advancedSettings || {});
+  const assetImports = assetImportRoutes(db, cfg, log, injected);
+  const seriesGroups = seriesGroupRoutes(db, log);
 
   // ---------- production workflow ----------
   r.get('/production-graph', production.graph);
@@ -79,6 +83,12 @@ function setupRouter(cfg, db, log, injected = {}) {
   r.post('/production-runs/:id/shots/:shotId/split', production.splitShot);
   r.post('/production-runs/:id/shots/pickup', production.pickupShot);
   r.post('/production-runs/:id/cancel', production.cancel);
+  r.post('/production-runs/:id/detach', production.detach);
+  r.post('/production-runs/:id/cancel-action', production.cancelAction);
+  // Explicit aliases make the three P2 semantics discoverable to clients
+  // while keeping the compact action endpoint backward compatible.
+  r.post('/production-runs/:id/cancel-local', production.cancelLocal);
+  r.post('/production-runs/:id/cancel-provider', production.cancelProvider);
   r.post('/production-runs/:id/transition', production.transition);
   r.post('/production-runs/:id/return', production.returnToStage);
   r.get('/production-runs/:id/artifacts', production.listArtifacts);
@@ -94,6 +104,26 @@ function setupRouter(cfg, db, log, injected = {}) {
   r.post('/production-artifacts/:artifactId/restore', production.restoreArtifact);
   r.post('/production-artifacts/:artifactId/suggest', production.suggestArtifact);
   r.post('/production-assist', production.assist);
+
+  // ---------- V0.4 P3 imports and series groups ----------
+  r.get('/asset-import-sessions', assetImports.list);
+  r.post('/asset-import-sessions', assetImports.create);
+  r.get('/asset-import-sessions/:id', assetImports.get);
+  r.post('/asset-import-sessions/:id/upload', ...assetImports.upload);
+  r.post('/asset-import-sessions/:id/scan', assetImports.scan);
+  r.post('/asset-import-sessions/:id/reorganize', assetImports.reorganize);
+  r.patch('/asset-import-sessions/:id/plan', assetImports.updatePlan);
+  r.get('/asset-import-sessions/:id/plan', assetImports.plan);
+  r.post('/asset-import-sessions/:id/apply', assetImports.apply);
+  r.post('/asset-import-sessions/:id/rollback', assetImports.rollback);
+  r.get('/series-groups', seriesGroups.list);
+  r.post('/series-groups', seriesGroups.create);
+  r.get('/series-groups/:id', seriesGroups.get);
+  r.post('/series-groups/:id/episodes', seriesGroups.addEpisode);
+  r.get('/series-groups/:id/assets', seriesGroups.assets);
+  r.post('/series-groups/:id/assets', seriesGroups.upsertAsset);
+  r.post('/series-groups/:id/reuse', seriesGroups.reuse);
+  r.post('/series-groups/:id/fork', seriesGroups.fork);
 
   // ---------- dramas ----------
   r.get('/dramas', drama.listDramas);
@@ -143,7 +173,11 @@ function setupRouter(cfg, db, log, injected = {}) {
   r.post('/ai-configs/test', aiConfig.testConnection);
   r.post('/ai-configs/discover-models', aiConfig.discoverModels);
   r.get('/ai-configs/yinzi/catalog', aiConfig.yinziCatalog);
+  r.get('/ai-configs/distribution-profile', aiConfig.distributionProfile);
+  r.post('/ai-configs/yinzi/preview', aiConfig.previewYinzi);
   r.post('/ai-configs/yinzi/setup', aiConfig.setupYinzi);
+  r.post('/ai-configs/image-yinzi/setup', aiConfig.setupImageYinzi);
+  r.post('/ai-configs/laoli/setup', aiConfig.setupLaoli);
   r.post('/ai-configs/jimeng2-list-assets', aiConfig.listJimeng2MaterialAssets);
   r.post('/ai-configs/model-ark-asset', aiConfig.modelArkAsset);
   r.get('/ai-configs/vendor-lock', aiConfig.vendorLock);  // 必须在 /:id 之前

@@ -1,12 +1,16 @@
 const crypto = require('node:crypto');
+const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const repo = require('./productionRepository');
 const imageService = require('./imageService');
+const imageClient = require('./imageClient');
 const videoService = require('./videoService');
 const videoClient = require('./videoClient');
 const taskService = require('./taskService');
 const validation = require('./productionMediaValidation');
 const boundaryFrames = require('./productionBoundaryFrames');
+const videoMergeService = require('./videoMergeService');
 const textStages = require('./productionTextStages');
 const promptRegistry = require('./productionPromptRegistry');
 const promptRuntime = require('./productionPromptRuntime');
@@ -17,11 +21,16 @@ const {
   getYinziVideoCapability,
   capabilitySupportsRole,
 } = require('./yinziVideoCapabilities');
-const { fetchYinziCatalog, fetchYinziCatalogForConfig } = require('./yinziService');
+const {
+  fetchYinziCatalog,
+  fetchYinziCatalogForConfig,
+  isYinziSmartRoutingConfig,
+} = require('./yinziService');
 const aiConfigService = require('./aiConfigService');
 const {
   listShotVideoRouteOptions,
   selectShotVideoRoute,
+  fixedModelRoute,
   routingMaterialSignature,
 } = require('./productionVideoRouter');
 const { prepareYinziReferenceVideo } = require('./yinziReferenceMedia');
@@ -33,6 +42,19 @@ const {
   normalizeProductionAspectRatio,
   productionAspectPrompt,
 } = require('./productionAspectRatio');
+const {
+  identityForConfig,
+  identityFromSnapshot,
+  sameIdentity,
+} = require('./productionConfigIdentity');
+const {
+  classifyFallbackFailure,
+  canAutomaticallyFallback,
+  isSeedance25Model,
+  isSeedance20Model,
+  planSeedanceFallback,
+  nextFallbackSegment,
+} = require('./yinziSmartRouteRecovery');
 
 function approvedIncluded(db, runId, stage) {
   return repo.listArtifacts(db, runId, { stage, current: true, status: 'approved', page_size: 200 }).items
@@ -101,6 +123,252 @@ function catalogWithStoredVideoPrices(db, catalog, run) {
   };
 }
 
+// A legacy run may predate persisted video_config_id.  The routing picker still
+// needs the active config's credential-scoped catalog, but resolving that
+// context must never mutate the run policy or dispatch binding.
+function readOnlyVideoConfigId(db, preferredModel = '') {
+  const rows = db.prepare(
+    `SELECT id FROM ai_service_configs
+     WHERE deleted_at IS NULL AND is_active = 1 AND service_type = 'video'
+     ORDER BY is_default DESC, priority DESC, created_at DESC, id ASC`
+  ).all();
+  if (!rows.length) return null;
+  const configs = rows.map((row) => aiConfigService.getConfig(db, row.id)).filter(Boolean);
+  const target = String(preferredModel || '').trim().toLowerCase();
+  if (target) {
+    const matched = configs.find((config) => {
+      const configured = [
+        ...(Array.isArray(config.model) ? config.model : config.model ? [config.model] : []),
+        config.default_model,
+        ...(Array.isArray(config.model_catalog_snapshot?.models)
+          ? config.model_catalog_snapshot.models.map((item) => item?.model || item)
+          : []),
+      ].map((item) => String(item || '').trim().toLowerCase());
+      return configured.includes(target);
+    });
+    if (matched) return Number(matched.id);
+  }
+  return Number(configs[0].id);
+}
+
+const SNAPSHOT_DISCOVERY_FALLBACK_CODES = new Set([
+  'MODEL_DISCOVERY_NETWORK_ERROR',
+  'MODEL_DISCOVERY_HTTP_ERROR',
+]);
+
+function canReuseModelCatalogSnapshot(error) {
+  const code = String(error?.code || '');
+  if (code === 'MODEL_DISCOVERY_NETWORK_ERROR') return true;
+  if (!SNAPSHOT_DISCOVERY_FALLBACK_CODES.has(code)) return false;
+  const status = Number(error?.status || String(error?.message || '').match(/HTTP\s+(\d+)/i)?.[1]);
+  return status === 408 || status === 425 || status === 429 || (status >= 500 && status <= 599);
+}
+
+function discoveryFromStoredSnapshot(config, error) {
+  const stored = config?.model_catalog_snapshot;
+  if (!stored || typeof stored !== 'object' || !Array.isArray(stored.models) || !stored.models.length) {
+    throw error;
+  }
+  const fallbackReason = String(error?.message || '模型目录刷新失败');
+  const snapshot = {
+    ...stored,
+    reused_after_refresh_failure: true,
+    stale_snapshot: true,
+    fallback_code: String(error?.code || 'MODEL_DISCOVERY_ERROR'),
+    fallback_reason: fallbackReason,
+    fallback_at: new Date().toISOString(),
+  };
+  return {
+    models: stored.models,
+    snapshot,
+    source_url: stored.source_url || null,
+    availability_scope: stored.availability_scope || 'credential',
+    discovery_outcome: 'snapshot_reused',
+    stale_snapshot: true,
+    warnings: [`实时模型目录暂不可用（${fallbackReason}），已使用此视频配置保存的目录快照`],
+  };
+}
+
+async function discoverVideoCatalogForConfig(db, config, run = null, fetchImpl = fetch) {
+  let discovery;
+  try {
+    discovery = await aiConfigService.discoverModels(config, { db, fetchImpl });
+  } catch (error) {
+    if (!canReuseModelCatalogSnapshot(error)) throw error;
+    discovery = discoveryFromStoredSnapshot(config, error);
+  }
+  let pricing = null;
+  const provider = String(config.provider || '').toLowerCase();
+  if (provider === 'yinzi') {
+    try {
+      pricing = await fetchYinziCatalogForConfig(config, fetchImpl, { include_public_catalog: true });
+    } catch (_) {
+      pricing = null;
+    }
+  }
+  return aiConfigService.mergeDiscoveredCatalog(discovery, pricing, {
+    provider: config.provider,
+    service_type: 'video',
+    group: run?.policy?.video_group || '',
+    capability_overrides: aiConfigService.getModelCapabilityOverrides(config),
+    include_public_catalog: provider === 'yinzi',
+    smart_routing: provider === 'yinzi' && isYinziSmartRoutingConfig(config),
+  });
+}
+
+function routingCatalogRun(db, run, shot) {
+  const policy = run?.policy && typeof run.policy === 'object' ? run.policy : {};
+  const currentId = Number(policy.video_config_id);
+  if (Number.isSafeInteger(currentId) && currentId > 0) return run;
+  const preferredModel = configuredVideoModelForShot(run, shot);
+  let configId = null;
+  try { configId = readOnlyVideoConfigId(db, preferredModel); } catch (_) { configId = null; }
+  if (!configId) return run;
+  return { ...run, policy: { ...policy, video_config_id: configId } };
+}
+
+function videoConfigForRun(db, run, shot = null) {
+  const policy = run?.policy && typeof run.policy === 'object' ? run.policy : {};
+  let configId = Number(policy.video_config_id);
+  if (!Number.isSafeInteger(configId) || configId <= 0) {
+    try { configId = readOnlyVideoConfigId(db, configuredVideoModelForShot(run, shot)); }
+    catch (_) { configId = null; }
+  }
+  if (!Number.isSafeInteger(configId) || configId <= 0) return null;
+  return aiConfigService.getConfig(db, configId);
+}
+
+function decorateVideoRouteWithConfig(route, config) {
+  const identity = identityForConfig(config);
+  const decorated = {
+    ...(route || {}),
+    video_config_id: identity?.id || null,
+    video_config_updated_at: identity?.updated_at || null,
+    video_config_fingerprint: identity?.fingerprint || null,
+    video_config_identity_version: identity?.version || null,
+  };
+  decorated.material_signature = routingMaterialSignature(decorated);
+  return decorated;
+}
+
+function currentImageConfig(db, run, stage, model = '') {
+  const serviceType = stage === 'storyboard_images' ? 'storyboard_image' : 'image';
+  const explicit = stage === 'storyboard_images'
+    ? run?.policy?.storyboard_image_config_id
+    : run?.policy?.asset_image_config_id;
+  try {
+    return imageClient.getDefaultImageConfig(
+      db,
+      String(model || '').trim() || undefined,
+      undefined,
+      serviceType,
+      explicit == null ? undefined : Number(explicit)
+    );
+  } catch (_) {
+    return null;
+  }
+}
+
+function imageRequestIdentity(db, run, stage, request = {}) {
+  const model = String(request.model || '').trim();
+  const config = currentImageConfig(db, run, stage, model);
+  const identity = identityForConfig(config);
+  return {
+    config,
+    identity,
+    model: model || config?.default_model || config?.model?.[0] || '',
+  };
+}
+
+function configuredImageModelForStage(run, stage) {
+  const policy = run?.policy || {};
+  return String(stage === 'storyboard_images'
+    ? (policy.storyboard_image_model || policy.image_model || '')
+    : (policy.asset_image_model || policy.image_model || '')).trim();
+}
+
+function imageActionConfigurationChanged(db, run, stage, action) {
+  if (!action || !['failed', 'cancelled'].includes(action.status)) return false;
+  const current = imageRequestIdentity(
+    db,
+    run,
+    stage,
+    { model: configuredImageModelForStage(run, stage) }
+  );
+  const previousModel = String(action.request?.model || '').trim();
+  if (previousModel && current.model && previousModel !== current.model) return true;
+  const previousIdentity = identityFromSnapshot(action.request || {});
+  if (previousIdentity && current.identity) return !sameIdentity(previousIdentity, current.identity);
+  const previousId = Number(action.request?.image_config_id);
+  return Number.isSafeInteger(previousId) && previousId > 0
+    && current.identity?.id != null
+    && previousId !== Number(current.identity.id);
+}
+
+function requestConfigurationChanged(previousRequest, currentRequest) {
+  const previousModel = String(previousRequest?.model || '').trim();
+  const currentModel = String(currentRequest?.model || '').trim();
+  if (previousModel && currentModel && previousModel !== currentModel) return true;
+  const previousIdentity = identityFromSnapshot(previousRequest || {});
+  const currentIdentity = identityFromSnapshot(currentRequest || {});
+  if (!previousIdentity || !currentIdentity) {
+    const previousId = Number(previousRequest?.video_config_id ?? previousRequest?.image_config_id);
+    const currentId = Number(currentRequest?.video_config_id ?? currentRequest?.image_config_id);
+    return Number.isSafeInteger(previousId) && previousId > 0
+      && Number.isSafeInteger(currentId) && currentId > 0
+      && previousId !== currentId;
+  }
+  return !sameIdentity(previousIdentity, currentIdentity);
+}
+
+function videoActionRouteChanged(action, route) {
+  if (!action || !route) return false;
+  const previousModel = String(action.request?.model || action.request?.routing_receipt?.model || '').trim();
+  const currentModel = String(route.model || '').trim();
+  if (previousModel && currentModel && previousModel !== currentModel) return true;
+  const previousSignature = String(
+    action.request?.routing_material_signature
+      || action.request?.routing_receipt?.material_signature
+      || action.result?.routing_material_signature
+      || ''
+  ).trim();
+  const currentSignature = String(route.material_signature || '').trim();
+  if (previousSignature && currentSignature && previousSignature !== currentSignature) return true;
+  const previousIdentity = identityFromSnapshot({
+    ...(action.request || {}),
+    ...(action.request?.routing_receipt || {}),
+  });
+  const currentIdentity = {
+    id: route.video_config_id,
+    updated_at: route.video_config_updated_at,
+    fingerprint: route.video_config_fingerprint,
+  };
+  if (previousIdentity && currentIdentity.id != null) return !sameIdentity(previousIdentity, currentIdentity);
+  return false;
+}
+
+function supersedeTerminalVideoAction(db, action, route, reason = 'live_video_route_changed') {
+  if (!action || !['failed', 'cancelled'].includes(action.status) || !videoActionRouteChanged(action, route)) {
+    return action;
+  }
+  return repo.updateAction(db, action.id, {
+    status: 'cancelled',
+    result: {
+      ...(action.result || {}),
+      superseded_by_route_change: true,
+      retry_authorized: true,
+      retry_reason: reason,
+      previous_route_model: action.request?.model || action.request?.routing_receipt?.model || null,
+      replacement_route_model: route.model || null,
+      previous_routing_material_signature: action.request?.routing_material_signature
+        || action.request?.routing_receipt?.material_signature
+        || null,
+      replacement_routing_material_signature: route.material_signature || null,
+      superseded_at: new Date().toISOString(),
+    },
+  });
+}
+
 function configuredVideoModelForShot(run, shot) {
   const policy = run?.policy || {};
   const overrides = policy.video_model_overrides && typeof policy.video_model_overrides === 'object'
@@ -126,6 +394,16 @@ function assertVideoDispatchContract({ run, shot, route, bundle, request, persis
   const bundleReceiptSignature = String(bundle?.content?.routing_receipt?.material_signature || '').trim();
   const requestSignature = String(request?.routing_material_signature || '').trim();
   const requestReceiptSignature = String(request?.routing_receipt?.material_signature || '').trim();
+  const fallbackChild = request?.fallback_parent_action_id != null;
+  const routeConfigIdentity = {
+    id: route?.video_config_id,
+    updated_at: route?.video_config_updated_at,
+    fingerprint: route?.video_config_fingerprint,
+  };
+  const requestConfigIdentity = identityFromSnapshot({
+    ...(request || {}),
+    ...(request?.routing_receipt || {}),
+  });
   const errors = [];
 
   if (!routeModel) errors.push('resolved route model is empty');
@@ -138,18 +416,30 @@ function assertVideoDispatchContract({ run, shot, route, bundle, request, persis
     ['request route model', requestRouteModel],
     ['persisted generation model', persistedGenerationModel],
   ]) {
-    if (value && routeModel && value !== routeModel) errors.push(`${label} does not match resolved route`);
+    // A fallback child intentionally uses the alternate model while retaining
+    // the parent shot's immutable request.  Its parent action and plan are
+    // the explicit authority for that model change; do not mistake it for a
+    // stale live-config race.
+    if (value && routeModel && value !== routeModel
+      && !(fallbackChild && ['configured model', 'bundle model'].includes(label))) {
+      errors.push(`${label} does not match resolved route`);
+    }
   }
-  if (!bundleModel) errors.push('reference bundle model is empty');
+  if (!bundleModel && !fallbackChild) errors.push('reference bundle model is empty');
   if (!requestModel) errors.push('request model is empty');
   if (!requestRouteModel) errors.push('request routing receipt model is empty');
+  if (routeConfigIdentity.id != null && requestConfigIdentity
+    && !sameIdentity(routeConfigIdentity, requestConfigIdentity)) {
+    errors.push('request video config identity does not match resolved route');
+  }
   for (const [label, value] of [
     ['bundle signature', bundleSignature],
     ['bundle receipt signature', bundleReceiptSignature],
     ['request signature', requestSignature],
     ['request receipt signature', requestReceiptSignature],
   ]) {
-    if (!value) errors.push(`${label} is empty`);
+    if (!value && !(fallbackChild && label.startsWith('bundle '))) errors.push(`${label} is empty`);
+    else if (fallbackChild && label.startsWith('bundle ')) continue;
     else if (value !== routeSignature) errors.push(`${label} does not match resolved route`);
   }
   if (errors.length) {
@@ -167,6 +457,9 @@ function assertVideoDispatchContract({ run, shot, route, bundle, request, persis
     request_model: requestModel,
     dispatched_model: persistedGenerationModel || requestModel,
     persisted_generation_model: persistedGenerationModel || null,
+    video_config_id: requestConfigIdentity?.id || routeConfigIdentity.id || null,
+    video_config_updated_at: requestConfigIdentity?.updated_at || routeConfigIdentity.updated_at || null,
+    video_config_fingerprint: requestConfigIdentity?.fingerprint || routeConfigIdentity.fingerprint || null,
     bundle_artifact_id: Number(bundle.id),
     routing_material_signature: routeSignature,
     contract_status: route?.contract_status || 'missing',
@@ -442,10 +735,26 @@ function buildProviderPromptPackage(db, run, shot, bundle, providerPrompt, expli
   const content = shot?.content || {};
   const transitionMode = transitionModeForShot(shot);
   const routeReceipt = bundle?.content?.routing_receipt || {};
-  const plannedDuration = Math.max(1, Number(routeReceipt.planned_duration || content.duration) || 5);
-  const providerDuration = Math.max(5, Number(routeReceipt.duration || plannedDuration) || 5);
+  const capability = explicitCapability || getYinziVideoCapability(String(
+    routeReceipt.model || run.policy?.video_model || ''
+  ).trim());
+  const plannedDuration = Math.max(1, Number(
+    routeReceipt.planned_duration
+      ?? content.creative_duration_seconds
+      ?? content.duration
+  ) || 1);
+  // Never apply a global five-second floor here.  The route already carries
+  // the concrete provider execution unit (fixed 30s for Seedance 2.5,
+  // enumerated 5/10/15s for Seedance 2.0, etc.).  Unknown capabilities remain
+  // open and use the user's planned duration until the provider validates it.
+  const providerDuration = Math.max(1, Number(
+    routeReceipt.provider_duration
+      ?? routeReceipt.duration
+      ?? content.provider_duration_seconds
+      ?? plannedDuration
+  ) || plannedDuration);
   const durationAdjusted = providerDuration > plannedDuration;
-  const capability = explicitCapability || getYinziVideoCapability(String(run.policy?.video_model || '').trim());
+  const durationMode = capability?.duration_mode || routeReceipt.capability_snapshot?.duration_mode || null;
   const maxChars = Number(capability?.max_prompt_chars) || PROVIDER_PROMPT_MAX_CHARS;
   const providerHardMaxChars = Number(capability?.provider_prompt_hard_max_chars) || maxChars;
   const sectionBudgets = providerPromptSectionBudgets(maxChars);
@@ -494,8 +803,8 @@ function buildProviderPromptPackage(db, run, shot, bundle, providerPrompt, expli
       entries: [
         `时长 ${providerDuration} 秒，画幅 ${compactPromptValue(run.policy?.aspect_ratio || '16:9', 30)}。${compactPromptValue(run.policy?.style || run.policy?.visual_style, 1200)}`,
         durationAdjusted
-          ? `原分镜按 ${plannedDuration} 秒设计，但即梦上游最低接受 ${providerDuration} 秒。必须在前 ${plannedDuration} 秒内完成原动作和剪辑点，剩余 ${Number((providerDuration - plannedDuration).toFixed(2))} 秒保持 cut_out 规定的最终状态，不新增动作、人物、道具、运镜或场景变化。`
-          : '',
+          ? `原分镜按 ${plannedDuration} 秒设计，供应商本次执行单元为 ${providerDuration} 秒（${durationMode === 'fixed' ? '固定时长' : durationMode === 'enumerated' ? '枚举时长' : '能力边界'}）。必须在前 ${plannedDuration} 秒内完成原动作和剪辑点，剩余 ${Number((providerDuration - plannedDuration).toFixed(2))} 秒保持 cut_out 规定的最终状态，不新增动作、人物、道具、运镜或场景变化；最终成片在本地按 final_edit_duration_seconds 裁剪。`
+          : '供应商执行时长与创作目标一致；最终成片仍以 final_edit_duration_seconds 为准。',
         '单个视频请求必须完成一个完整摄影镜头，镜头内部连续，不使用分屏或快速蒙太奇。',
       ],
     },
@@ -590,15 +899,28 @@ function sourceGenerationAttemptCount(db, runId, stage, source, kind) {
   )).length;
 }
 
+function rejectedReviewFeedback(review) {
+  const verdict = review?.evidence?.review_verdict;
+  const feedback = {
+    review_id: review.id,
+    artifact_id: review.artifact_id,
+    artifact_revision: review.artifact_revision,
+    reason: String(review.reason || verdict?.reason || '').trim().slice(0, 4000),
+    created_at: review.created_at,
+  };
+  if (verdict && typeof verdict === 'object') {
+    feedback.severity = String(verdict.severity || '').trim().slice(0, 40) || null;
+    feedback.blocking_issues = (Array.isArray(verdict.blocking_issues) ? verdict.blocking_issues : [])
+      .map((item) => String(item || '').trim().slice(0, 1600)).filter(Boolean).slice(0, 12);
+    feedback.improvement_notes = (Array.isArray(verdict.improvement_notes) ? verdict.improvement_notes : [])
+      .map((item) => String(item || '').trim().slice(0, 1200)).filter(Boolean).slice(0, 8);
+  }
+  return feedback;
+}
+
 function rejectedVideoEvidence(db, run, shot) {
   const reviews = repo.listRejectedReviewEvidence(db, run.id, 'shot_video', 'shot', shot.scope_id)
-    .map((review) => ({
-      review_id: review.id,
-      artifact_id: review.artifact_id,
-      artifact_revision: review.artifact_revision,
-      reason: String(review.reason || '').trim().slice(0, 4000),
-      created_at: review.created_at,
-    }))
+    .map(rejectedReviewFeedback)
     .filter((review) => review.reason);
   const failures = repo.listActions(db, run.id, { page_size: 200 }).items
     .filter((action) => action.stage === 'shot_video'
@@ -621,13 +943,7 @@ function rejectedVideoEvidence(db, run, shot) {
 function rejectedImageEvidence(db, run, stage, source) {
   const reviews = repo.listRejectedReviewEvidence(db, run.id, stage, source.scope_type, source.scope_id)
     .slice(-5)
-    .map((review) => ({
-      review_id: review.id,
-      artifact_id: review.artifact_id,
-      artifact_revision: review.artifact_revision,
-      reason: String(review.reason || '').trim().slice(0, 4000),
-      created_at: review.created_at,
-    }))
+    .map(rejectedReviewFeedback)
     .filter((review) => review.reason);
   const failures = repo.listActions(db, run.id, { page_size: 200 }).items
     .filter((action) => action.stage === stage
@@ -649,13 +965,15 @@ function rejectedImageEvidence(db, run, stage, source) {
 
 function appendImageRevisionFeedback(prompt, evidence, hasRevisionReference) {
   if (!evidence.length) return prompt;
-  const requirements = evidence.map((review, index) => (
-    `${index + 1}. ${review.reason}`
-  )).join('\n');
+  const requirements = evidence.map((review, index) => {
+    const blocking = (review.blocking_issues || []).map((item) => `   - MUST FIX: ${item}`).join('\n');
+    const improvements = (review.improvement_notes || []).map((item) => `   - OPTIONAL IF COMPATIBLE: ${item}`).join('\n');
+    return [`${index + 1}. REVIEW REASON: ${review.reason}`, blocking, improvements].filter(Boolean).join('\n');
+  }).join('\n');
   const referenceInstruction = hasRevisionReference
     ? 'The first reference image is the previous rejected revision. Preserve its useful identity, face, hairstyle, proportions, layout, and other uncriticized traits; change the criticized details only.'
     : 'Preserve every source-defined trait that is not criticized below.';
-  return `${prompt}\n\nHIGH-PRIORITY REVISION REQUIREMENTS (override conflicting visual details):\n${referenceInstruction}\n${requirements}\nDo not merely describe these corrections: render every corrected state visibly and consistently in the new image.`;
+  return `${prompt}\n\nHIGH-PRIORITY REVISION REQUIREMENTS (override conflicting visual details):\n${referenceInstruction}\n${requirements}\nEvery MUST FIX item is mandatory. OPTIONAL items must never override approved facts or create a new subject, object, location, event, or visual state. Do not merely describe these corrections: render every corrected state visibly and consistently in the new image.`;
 }
 
 function rejectedImageReferenceOptedIn(run, source) {
@@ -743,15 +1061,11 @@ function createDefaultAdapters(db, cfg, log) {
       const timestamp = new Date().toISOString();
       const videoConfigId = videoConfig.id;
       const providerProtocol = videoClient.resolveVideoProtocol(videoConfig, request.model);
-      const providerConfigSnapshot = {
-        config_id: videoConfig.id,
-        provider: videoConfig.provider || null,
-        api_protocol: videoConfig.api_protocol || null,
-        base_url: videoConfig.base_url || null,
-        endpoint: videoConfig.endpoint || null,
-        query_endpoint: videoConfig.query_endpoint || null,
-        model: request.model || videoConfig.default_model || null,
-      };
+      const providerConfigSnapshot = videoClient.buildProviderConfigSnapshot(
+        videoConfig,
+        request.model,
+        request.routing_receipt
+      );
       const info = db.prepare(
         `INSERT INTO video_generations (
           drama_id, storyboard_id, provider, prompt, prompt_contract_json, model, duration, aspect_ratio, resolution,
@@ -806,6 +1120,28 @@ function createDefaultAdapters(db, cfg, log) {
     probeHardCutBoundary: (previousPath, generatedPath) => (
       boundaryFrames.probeHardCutBoundary(cfg, previousPath, generatedPath)
     ),
+    mergeVideoSegments: async (mediaPaths, options = {}) => {
+      const storageRoot = validation.resolveLocalMediaPath(cfg, mediaPaths[0]).storage_root;
+      const relative = `production/fallback/${crypto.createHash('sha256')
+        .update(mediaPaths.join('|')).digest('hex').slice(0, 24)}.mp4`;
+      const output = path.join(storageRoot, relative.replace(/\//g, path.sep));
+      fs.mkdirSync(path.dirname(output), { recursive: true });
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'yinzi-fallback-'));
+      try {
+        const resolved = mediaPaths.map((mediaPath) => validation.resolveLocalMediaPath(cfg, mediaPath).absolute_path);
+        const ok = videoMergeService.runStrictNormalizedMerge(
+          resolved,
+          output,
+          { aspect_ratio: options.aspect_ratio || '16:9' },
+          log,
+          tempDir
+        );
+        if (!ok) throw codedError('VIDEO_FALLBACK_MERGE_FAILED', '两段备用视频无法在本地合成为一个逻辑镜头');
+        return { relative_path: relative, absolute_path: output };
+      } finally {
+        try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (_) {}
+      }
+    },
     prepareReferenceVideoTransport(mediaPath, options) {
       const resolved = validation.resolveLocalMediaPath(cfg, mediaPath);
       const prepared = prepareYinziReferenceVideo(resolved.absolute_path, {
@@ -841,17 +1177,7 @@ function createDefaultAdapters(db, cfg, log) {
         error.code = 'VIDEO_CONFIG_UNAVAILABLE';
         throw error;
       }
-      const discovery = await aiConfigService.discoverModels(config, { db });
-      let pricing = null;
-      if (String(config.provider || '').toLowerCase() === 'yinzi') {
-        try { pricing = await fetchYinziCatalogForConfig(config); } catch (_) { pricing = null; }
-      }
-      return aiConfigService.mergeDiscoveredCatalog(discovery, pricing, {
-        provider: config.provider,
-        service_type: 'video',
-        group: run?.policy?.video_group || '',
-        capability_overrides: aiConfigService.getModelCapabilityOverrides(config),
-      });
+      return discoverVideoCatalogForConfig(db, config, run, fetch);
     },
   };
 }
@@ -1086,11 +1412,11 @@ function referenceSheetPrompt(source, run) {
     const location = source.content?.location ? `\n固定地点：${source.content.location}` : '';
     const state = source.content?.reference_state ? `\n唯一参考状态：${source.content.reference_state}` : '';
     const exclusions = source.content?.negative_prompt ? `\n此状态必须排除：${source.content.negative_prompt}` : '';
-    return `${style}。场景空间设定四视图，同一地点的全景、主方向、反方向、关键区域，建筑与空间锚点严格一致。\n名称：${source.content.name}${location}${state}\n生成要求：${source.content.visual_prompt}\n状态约束：本设定图只表现上述唯一参考状态，不得引入其它镜头中的过去、未来或过渡状态。${exclusions}`;
+    return `${style}。同一地点恰好四格空间设定板：全景、主方向、反方向、关键区域各一格；门窗、地标、建筑、植被、固定陈设、材质、昼夜和空间拓扑严格一致，只改变观察方向。\n名称：${source.content.name}${location}${state}\n生成要求：${source.content.visual_prompt}\n状态约束：本设定板只表现上述唯一参考状态，不得引入其它镜头中的过去、未来、人物动作或过渡状态。${exclusions}`;
   }
   const typeLabel = source.scope_type === 'character'
-    ? '角色一致性四视图，同一角色的正面、左侧面、背面、右侧面，全身，白色干净背景，每格造型完全一致'
-    : '关键道具多角度产品设定图，正面、侧面、背面、细节特写，形状材质和标识完全一致';
+    ? '同一角色恰好四格一致性设定板：正面、左侧面、背面、右侧面各一格；全身中性站姿、同尺度、干净背景，每格同脸、同发型、同体型、同服装、同固定装备'
+    : '同一件关键道具恰好四格产品设定板：正面、侧面、背面、关键结构角度各一格；四格是同一件物体，形状、尺寸、材质、颜色、磨损和标识完全一致，无人物和剧情环境';
   return `${style}。${typeLabel}。\n名称：${source.content.name}\n设定：${source.content.description}\n固定视觉锚点：${JSON.stringify(source.content.identity_anchors || source.content.continuity_rules || '')}\n生成要求：${source.content.visual_prompt}`;
 }
 
@@ -1165,18 +1491,218 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
   const adapters = { ...createDefaultAdapters(db, cfg, log), ...injected };
   const resolveVideoCapability = injected.getVideoCapability || getYinziVideoCapability;
 
+  function capabilityForRoute(route) {
+    if (!route || typeof route !== 'object') return null;
+    if (Object.prototype.hasOwnProperty.call(route, 'capability')) {
+      if (route.capability) return route.capability;
+      return injected.getVideoCapability ? (resolveVideoCapability(route.model) || null) : null;
+    }
+    if (Object.prototype.hasOwnProperty.call(route, 'capability_snapshot')) {
+      if (route.capability_snapshot) return route.capability_snapshot;
+      return injected.getVideoCapability ? (resolveVideoCapability(route.model) || null) : null;
+    }
+    return resolveVideoCapability(route.model) || null;
+  }
+
+  function routingReceiptForRoute(route) {
+    const { capability: _capability, ...receipt } = route || {};
+    return {
+      ...receipt,
+      capability_model: String(route?.model || ''),
+      capability_snapshot: capabilityForRoute(route),
+      capability_source: route?.capability_source
+        || (capabilityForRoute(route) ? 'builtin' : 'unknown'),
+      contract_status: route?.contract_status
+        || (capabilityForRoute(route) ? 'known' : 'missing'),
+      catalog_verified: route?.catalog_verified === true,
+    };
+  }
+
+  /**
+   * Stop/observe controls used by the V0.4 task drawer.  These helpers never
+   * infer a provider cancellation capability from a model name or contract;
+   * callers must inject an explicit cancelProviderTask adapter.  Unknown
+   * provider support therefore remains truthful and billable state is kept
+   * pending/uncertain instead of being released or marked refunded.
+   */
+  async function cancelRunAction(runId, input = {}) {
+    const requestedMode = String(input.cancel_mode || 'auto').trim().toLowerCase();
+    const cancelMode = ['cancel_local_request', 'cancel_provider_task', 'auto'].includes(requestedMode)
+      ? requestedMode
+      : 'auto';
+    const actionId = Number(input.action_id || 0);
+    const action = actionId > 0 ? repo.getAction(db, actionId) : repo.getLatestAction(db, runId, {
+      stage: input.stage || null,
+      scope_type: input.scope_type || null,
+      scope_id: input.scope_id == null ? null : input.scope_id,
+      kind: input.kind || null,
+    });
+    if (!action || String(action.run_id) !== String(runId)) {
+      return { status: 'not_found', run_id: runId, action: null };
+    }
+    if (action.status === 'reserved' && !action.task_id && !action.generation_id && !action.provider_id) {
+      const cancelled = repo.cancelReservedAction(db, action.id, {
+        cancel_mode: 'cancel_local_request',
+        external_outcome: 'not_submitted',
+        cancelled_reason: String(input.reason || '用户停止本地请求').slice(0, 500),
+      });
+      return {
+        status: 'cancelled_local',
+        action: cancelled,
+        paid_submission: false,
+        retryable: true,
+        message: '请求尚未外发，已在本地取消并释放预留额度',
+      };
+    }
+    if (action.status === 'completed' || action.status === 'failed' || action.status === 'cancelled') {
+      return {
+        status: action.status,
+        action,
+        paid_submission: Boolean(action.task_id || action.generation_id || action.provider_id),
+        retryable: action.status !== 'completed',
+        message: action.status === 'cancelled' ? '该请求已经取消' : '该请求已经结束，未再次发送取消操作',
+      };
+    }
+    // A previous request may already have stopped local observation or
+    // recorded a provider cancellation.  Never poll or send a second remote
+    // cancellation request on a repeated click/runner tick.
+    if (action.result?.local_observation_stopped === true) {
+      return {
+        status: 'local_observation_stopped',
+        action,
+        paid_submission: Boolean(action.task_id || action.generation_id || action.provider_id),
+        billable_status: 'uncertain',
+        retryable: true,
+        message: '已停止本地等待；供应商任务和费用状态保留待查询',
+      };
+    }
+    if (action.result?.provider_cancel_confirmed === true) {
+      return {
+        status: 'cancelled_provider',
+        action,
+        paid_submission: true,
+        billable_status: 'provider_cancelled_pending_refund',
+        retryable: false,
+        message: '已收到供应商取消确认；费用是否退款以供应商账单回执为准',
+      };
+    }
+    if (action.result?.cancel_requested_provider_unknown === true) {
+      return {
+        status: 'cancel_requested_provider_unknown',
+        action,
+        paid_submission: true,
+        billable_status: 'uncertain',
+        retryable: true,
+        message: '供应商取消尚未确认；已停止本地等待，任务和费用仍可能继续',
+      };
+    }
+    // Explicit local cancellation never discovers/polls a provider task and
+    // never invokes a provider adapter.  It only detaches this process from
+    // the remote task while preserving its identity and accounting state.
+    if (cancelMode === 'cancel_local_request') {
+      const updated = repo.markLocalObservationStopped(db, action.id, {
+        cancel_reason: String(input.reason || '用户停止本地等待').slice(0, 500),
+      });
+      return {
+        status: 'local_observation_stopped',
+        action: updated,
+        paid_submission: Boolean(action.task_id || action.generation_id || action.provider_id),
+        billable_status: action.task_id || action.generation_id || action.provider_id ? 'uncertain' : 'not_submitted',
+        retryable: true,
+        message: '已停止本地等待；供应商任务和费用状态保留待查询',
+      };
+    }
+    let providerTaskId = action.provider_id || null;
+    if (!providerTaskId && action.generation_id && typeof adapters.getVideo === 'function') {
+      try {
+        const generation = await adapters.getVideo(action.generation_id);
+        providerTaskId = generation?.provider_task_id || generation?.task_id || null;
+      } catch (_) {
+        // A failed status lookup must not turn an accepted action into a
+        // locally released reservation; leave the external outcome unknown.
+      }
+    }
+    const cancelAdapter = adapters.cancelProviderTask;
+    // `auto` preserves the compact legacy endpoint.  The explicit provider
+    // endpoint is the only path that may invoke the adapter; when no task id
+    // is available we still record an unknown external outcome truthfully.
+    if ((cancelMode === 'cancel_provider_task' || cancelMode === 'auto')
+      && typeof cancelAdapter === 'function' && providerTaskId) {
+      try {
+        const result = await cancelAdapter({
+          run_id: runId,
+          action,
+          provider_task_id: providerTaskId,
+          reason: String(input.reason || '用户请求停止供应商任务').slice(0, 500),
+        });
+        const confirmed = result?.cancelled === true || result?.status === 'cancelled';
+        const updated = repo.markProviderCancelRequested(db, action.id, {
+          provider_cancel_confirmed: confirmed,
+          provider_cancel_receipt: result || null,
+          cancel_requested_at: new Date().toISOString(),
+          cancel_reason: String(input.reason || '').slice(0, 500) || null,
+        });
+        return {
+          status: confirmed ? 'cancelled_provider' : 'cancel_requested_provider_unknown',
+          action: updated,
+          paid_submission: true,
+          billable_status: confirmed ? 'provider_cancelled_pending_refund' : 'uncertain',
+          retryable: !confirmed,
+          message: confirmed
+            ? '已收到供应商取消确认；费用是否退款以供应商账单回执为准'
+            : '供应商未确认取消；已停止本地等待，任务和费用仍可能继续',
+        };
+      } catch (error) {
+        const updated = repo.markProviderCancelRequested(db, action.id, {
+          cancel_requested_at: new Date().toISOString(),
+          cancel_reason: String(input.reason || '').slice(0, 500) || null,
+          provider_cancel_error: String(error?.message || error).slice(0, 800),
+          cancel_requested_provider_unknown: true,
+        });
+        return {
+          status: 'cancel_requested_provider_unknown',
+          action: updated,
+          paid_submission: true,
+          billable_status: 'uncertain',
+          retryable: true,
+          message: '取消请求未获供应商确认；已停止本地等待，任务和费用仍可能继续',
+        };
+      }
+    }
+    const updated = repo.markProviderCancelRequested(db, action.id, {
+      cancel_requested_at: new Date().toISOString(),
+      cancel_reason: String(input.reason || '').slice(0, 500) || null,
+      cancel_requested_provider_unknown: true,
+    });
+    return {
+      status: 'cancel_requested_provider_unknown',
+      action: updated,
+      paid_submission: true,
+      billable_status: 'uncertain',
+      retryable: true,
+      message: '当前供应商未声明可取消接口；已停止本地等待，任务和费用仍可能继续',
+    };
+  }
+
   async function resolveShotVideoRoute(run, shot) {
-    const catalog = catalogWithStoredVideoPrices(db, await adapters.fetchVideoCatalog(run), run);
-    return selectShotVideoRoute({ shot, catalog, policy: run.policy || {} });
+    const catalogRun = routingCatalogRun(db, run, shot);
+    const catalog = catalogWithStoredVideoPrices(db, await adapters.fetchVideoCatalog(catalogRun), catalogRun);
+    const route = selectShotVideoRoute({ shot, catalog, policy: catalogRun.policy || {} });
+    return decorateVideoRouteWithConfig(route, videoConfigForRun(db, catalogRun, shot));
   }
 
   async function listVideoRoutingOptions(run, shot) {
-    const catalog = catalogWithStoredVideoPrices(db, await adapters.fetchVideoCatalog(run), run);
+    const catalogRun = routingCatalogRun(db, run, shot);
+    const catalog = catalogWithStoredVideoPrices(db, await adapters.fetchVideoCatalog(catalogRun), catalogRun);
     return {
       pricing_version: String(catalog?.pricing_version || ''),
       fetched_at: catalog?.fetched_at || null,
-      group: String(run?.policy?.video_group || ''),
-      options: listShotVideoRouteOptions({ shot, catalog, policy: run?.policy || {} }),
+      source: catalog?.source || null,
+      discovery_outcome: catalog?.discovery_outcome || 'live',
+      stale_snapshot: catalog?.stale_snapshot === true,
+      warnings: Array.isArray(catalog?.warnings) ? catalog.warnings : [],
+      group: String(catalogRun?.policy?.video_group || ''),
+      options: listShotVideoRouteOptions({ shot, catalog, policy: catalogRun?.policy || {} }),
     };
   }
 
@@ -1356,8 +1882,13 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
       promptPackage.prompt, retryEvidence, revisionReference.length > 0
     );
     const references = referenceArtifacts.map((item) => item.path);
+    const assetLayoutExclusions = source.scope_type === 'character'
+      ? 'single narrative scene, action pose, interaction, second character, different faces, different outfits, cropped head, cropped feet, missing view, duplicate view, three panels, five panels'
+      : source.scope_type === 'scene'
+        ? 'four different places, changing architecture, changing landmarks, changing vegetation, changing time of day, character action, battle scene, missing view, duplicate view, three panels, five panels'
+        : 'person holding the object, character, battle, blood, narrative environment, four different objects, changing geometry, missing view, duplicate view, three panels, five panels';
     const negativePrompt = stage === 'asset_images'
-      ? [source.content?.negative_prompt, 'text', 'watermark', 'labels', 'inconsistent identity', 'inconsistent geometry'].filter(Boolean).join(', ')
+      ? [source.content?.negative_prompt, assetLayoutExclusions, 'text', 'watermark', 'labels', 'inconsistent identity', 'inconsistent geometry'].filter(Boolean).join(', ')
       : [source.content?.negative_prompt, 'split panels', 'collage', 'text watermark', 'inconsistent identity'].filter(Boolean).join(', ');
     const configuredModel = stage === 'storyboard_images'
       ? (run.policy?.storyboard_image_model || run.policy?.image_model)
@@ -1366,13 +1897,20 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
     const imageConfigId = stage === 'storyboard_images'
       ? run.policy?.storyboard_image_config_id
       : run.policy?.asset_image_config_id;
+    const imageConfigState = imageRequestIdentity(db, run, stage, configuredModel || '');
+    const effectiveImageModel = configuredModel || imageConfigState.model || undefined;
+    const effectiveImageConfigId = imageConfigState.identity?.id
+      || (imageConfigId == null ? undefined : Number(imageConfigId));
     return {
       request: {
         drama_id: run.drama_id,
         provider: 'openai',
-        model: configuredModel || undefined,
+        model: effectiveImageModel,
         image_service_type: imageServiceType,
-        image_config_id: imageConfigId == null ? undefined : Number(imageConfigId),
+        image_config_id: effectiveImageConfigId,
+        image_config_identity_version: imageConfigState.identity?.version || null,
+        image_config_updated_at: imageConfigState.identity?.updated_at || null,
+        image_config_fingerprint: imageConfigState.identity?.fingerprint || null,
         prompt,
         prompt_snapshot: {
           ...promptPackage.receipt,
@@ -1391,6 +1929,7 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
         rejected_reference_artifact_id: target?.status === 'rejected' && target.media_path ? target.id : null,
         rejected_reference_excluded: Boolean(target?.status === 'rejected' && target.media_path && !rejectedReferenceOptedIn),
         rejected_review_evidence: retryEvidence,
+        revision_brief_hash: retryEvidence.length ? repo.hashJson(retryEvidence) : null,
       },
       retryEvidence,
     };
@@ -1401,6 +1940,24 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
     let action = repo.getLatestAction(db, run.id, {
       stage, scope_type: source.scope_type, scope_id: source.scope_id, kind: 'image_generate',
     });
+    // A failed/cancelled image action is retryable automatically when the
+    // user changed the live image model or configuration.  Keep the old
+    // action as history, but never let its request snapshot block a fresh
+    // request using the newly selected channel.
+    if (imageActionConfigurationChanged(db, run, stage, action)) {
+      const previous = action;
+      action = repo.updateAction(db, action.id, {
+        status: 'cancelled',
+        result: {
+          ...(action.result || {}),
+          superseded_by_config_change: true,
+          retry_authorized: true,
+          previous_model: previous.request?.model || null,
+          previous_image_config_id: previous.request?.image_config_id || null,
+          superseded_at: new Date().toISOString(),
+        },
+      });
+    }
     if (action?.status === 'cancelled'
       && (action.result?.retry_authorized || (rejectedTarget && isVerifiedDuplicateCancellation(action)))) action = null;
     const selection = selectGenerationAction(action, source, rejectedTarget, {
@@ -1812,7 +2369,7 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
     const previousShot = shotIndex > 0 ? shots[shotIndex - 1] : null;
     const transitionMode = transitionModeForShot(shot);
     const route = await resolveShotVideoRoute(run, shot);
-    const capability = route.capability || resolveVideoCapability(route.model);
+    const capability = capabilityForRoute(route);
     const usesContinuityFrame = ['reference_continuation', 'strict_continuation'].includes(transitionMode);
     const strictFirstFrame = transitionMode === 'strict_continuation';
     const continuityVideo = usesContinuityFrame && previousShot
@@ -1893,7 +2450,7 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
     const videoBudget = route.uses_reference_video
       ? await applyReferenceVideoBudget(run, capability, videoRefs.slice(0, videoLimit))
       : { videos: [], receipt: { enforced: false, reason: 'reference_video_not_selected' } };
-    const { capability: _capability, ...routingReceipt } = route;
+    const routingReceipt = routingReceiptForRoute(route);
     const dependencyIds = [...new Set([
       shot.id,
       ...(storyboardImage?.id ? [storyboardImage.id] : []),
@@ -2175,6 +2732,12 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
     return Boolean(liveShot && liveShot.content?.included === false);
   }
 
+  function actionStoppedLocally(action) {
+    return action?.result?.local_observation_stopped === true
+      || action?.result?.cancel_requested_provider_unknown === true
+      || action?.result?.provider_cancel_confirmed === true;
+  }
+
   function videoSubmissionStatus(generation) {
     const status = String(generation?.submission_status || '').trim().toLowerCase();
     if (['not_sent', 'rejected', 'accepted', 'ambiguous'].includes(status)) return status;
@@ -2272,6 +2835,386 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
     };
   }
 
+  function fallbackSelectionMode(run, shot) {
+    const policy = run?.policy || {};
+    const shotOverride = String(shot?.content?.video_model_override || '').trim()
+      || String(policy.video_model_overrides?.[String(shot?.scope_id || '')] || '').trim();
+    if (shotOverride) return 'shot_override';
+    const routingMode = String(policy.video_routing_mode || '').toLowerCase();
+    if (routingMode === 'auto') return 'auto';
+    if (routingMode === 'fixed' || String(policy.video_model || '').trim()) return 'project_fixed';
+    return 'auto';
+  }
+
+  function fallbackModelForShot(run) {
+    return String(
+      run?.policy?.video_fallback_model
+      || run?.policy?.fallback_video_model
+      || 'seedance2.0 -720p-fast-15s'
+    ).trim();
+  }
+
+  function fallbackRouteForShot(run, shot, model) {
+    const policy = {
+      ...(run?.policy || {}),
+      video_model: model,
+      video_routing_mode: 'fixed',
+      video_duration_min: 15,
+      video_duration_max: 15,
+    };
+    const capability = getYinziVideoCapability(model) || null;
+    const route = fixedModelRoute(shot, model, policy, capability);
+    return decorateVideoRouteWithConfig(route, videoConfigForRun(db, run, shot));
+  }
+
+  function fallbackPlanForAction(action) {
+    const plan = action?.result?.fallback_plan;
+    return plan && typeof plan === 'object' && plan.eligible === true ? plan : null;
+  }
+
+  async function submitFallbackSegment({ run, shot, bundle, parentAction, plan, segment, firstFrame = null }) {
+    if (!segment || !plan || !parentAction) return { state: 'waiting_review', reason: 'fallback_segment_missing' };
+    const route = fallbackRouteForShot(run, shot, segment.model);
+    const capability = capabilityForRoute(route);
+    const parentRequest = parentAction.request || {};
+    const parentReceipt = parentRequest.routing_receipt || {};
+    const references = Array.isArray(parentRequest.reference_image_urls)
+      ? [...parentRequest.reference_image_urls]
+      : [];
+    const firstFramePath = String(
+      firstFrame?.path || firstFrame?.relative_path || firstFrame?.media_path || ''
+    ).trim();
+    let strictFirstFrame = null;
+    let continuityMode = firstFramePath ? 'continuity_advisory' : 'original_bundle';
+    if (firstFramePath) {
+      const supportsStrict = capabilitySupportsRole(capability, 'image', 'first_frame');
+      if (supportsStrict) {
+        strictFirstFrame = firstFramePath;
+        continuityMode = 'strict_first_frame';
+      } else {
+        references.unshift(firstFramePath);
+      }
+    }
+    const config = videoConfigForRun(db, run, shot);
+    const identity = identityForConfig(config);
+    const request = {
+      ...parentRequest,
+      video_config_id: identity?.id || parentRequest.video_config_id || null,
+      video_config_identity_version: identity?.version || parentRequest.video_config_identity_version || null,
+      video_config_updated_at: identity?.updated_at || parentRequest.video_config_updated_at || null,
+      video_config_fingerprint: identity?.fingerprint || parentRequest.video_config_fingerprint || null,
+      model: segment.model,
+      duration: 15,
+      resolution: parentRequest.resolution || capability?.resolution || '720p',
+      first_frame_url: strictFirstFrame || undefined,
+      reference_image_urls: references,
+      reference_video_urls: [],
+      reference_audio_urls: Array.isArray(parentRequest.reference_audio_urls)
+        ? parentRequest.reference_audio_urls
+        : [],
+      transition_mode: strictFirstFrame ? 'strict_continuation' : 'reference_continuation',
+      fallback_parent_action_id: parentAction.id,
+      fallback_parent_action_key: plan.parent_action_key,
+      fallback_plan_id: plan.plan_id,
+      fallback_segment_index: segment.index,
+      fallback_continuity_mode: continuityMode,
+      routing_receipt: routingReceiptForRoute(route),
+      routing_material_signature: routingMaterialSignature(route),
+      provider_prompt: `${String(parentRequest.prompt || '').trim()}\n\n备用分段 ${segment.index}/2：保持同一角色、场景、道具与光线状态；这是同一逻辑镜头的连续执行片段，不添加刻意遮挡转场。${strictFirstFrame ? '严格从提供的首帧开始。' : '如未支持严格首帧，只把尾帧作为普通参考，最终剪辑在镜头边界处硬切。'}`,
+    };
+    request.prompt = request.provider_prompt;
+    // Check the stable child key before mutating accounting state. Refreshes
+    // and runner retries must reuse an existing child action rather than
+    // consuming the parent reservation a second time.
+    const existing = repo.getActionByKey(db, run.id, segment.action_key);
+    if (existing) return { state: ['submitted', 'waiting'].includes(existing.status) ? 'waiting_provider' : 'progressed', action: existing, shot };
+    const dispatchReceipt = assertVideoDispatchContract({ run, shot, route, bundle, request });
+    const segmentPrice = accounting.videoReservation(db, run, request, {
+      ...route,
+      billing_unit: 'per_request',
+      unit_price: Number(plan.segment_cost || 3),
+      estimated_price: Number(plan.segment_cost || 3),
+      price_override: {
+        provider: request.provider || 'yinzi',
+        service_type: 'video',
+        model: segment.model,
+        group_name: route.group || run.policy?.video_group || '',
+        billing_unit: 'per_request',
+        unit_price_microusd: Math.round(Number(plan.segment_cost || 3) * 1000000),
+        source: 'seedance_fallback_plan',
+        source_version: String(plan.plan_id || ''),
+      },
+    });
+    const attempt = Number(segment.index) + Number(parentAction.attempt || 1);
+    const reservation = repo.reserveAction(db, {
+      run_id: run.id,
+      action_key: segment.action_key,
+      stage: 'shot_video',
+      scope_type: 'shot',
+      scope_id: shot.scope_id,
+      kind: 'video_generate',
+      attempt,
+      request,
+      parent_action_id: parentAction.id,
+      parent_action_key: plan.parent_action_key,
+      segment_index: segment.index,
+      reserved_video_seconds: 15,
+      cost: segmentPrice,
+    });
+    const action = reservation.action;
+    const costMicrousd = Number(segmentPrice.estimated_microusd || 0);
+    if (costMicrousd > 0) {
+      try {
+        repo.consumeFallbackBudget(db, run.id, plan.parent_action_key, costMicrousd);
+      } catch (error) {
+        const cancelled = repo.cancelReservedAction(db, action.id, {
+          fallback_budget_consume_failed: true,
+          fallback_budget_error: error.message,
+        });
+        repo.updateRun(db, run.id, {
+          status: 'waiting_review', waiting_reason: 'fallback_budget_exhausted',
+          error_code: error.code || 'COST_FALLBACK_SEGMENT_BUDGET_EXHAUSTED',
+          error_message: error.message,
+        });
+        return { state: 'waiting_review', reason: 'fallback_budget_exhausted', action: cancelled, shot, error };
+      }
+    }
+    if (action.status !== 'reserved') return { state: 'waiting_provider', action, shot };
+    repo.updateAction(db, action.id, { status: 'submitted' });
+    let created;
+    try {
+      created = await adapters.createVideo(request);
+    } catch (error) {
+      const failed = repo.updateAction(db, action.id, {
+        status: 'failed',
+        error_code: error.code || 'VIDEO_FALLBACK_CREATE_FAILED',
+        error_message: error.message,
+        cost_status: 'released',
+        result: { fallback_plan_id: plan.plan_id, fallback_segment_index: segment.index, dispatch_receipt: dispatchReceipt },
+      });
+      return { state: 'waiting_review', reason: 'fallback_segment_create_failed', action: failed, shot };
+    }
+    const persistedReceipt = assertVideoDispatchContract({
+      run, shot, route, bundle, request, persistedModel: created.model || null,
+    });
+    const waiting = repo.updateAction(db, action.id, {
+      status: 'waiting',
+      task_id: created.task_id,
+      generation_id: created.id,
+      result: {
+        fallback_plan_id: plan.plan_id,
+        fallback_segment_index: segment.index,
+        parent_action_id: parentAction.id,
+        source_artifact_id: shot.id,
+        bundle_artifact_id: bundle.id,
+        routing_material_signature: routingMaterialSignature(route),
+        dispatch_receipt: persistedReceipt,
+      },
+    });
+    repo.updateRun(db, run.id, { status: 'waiting_provider', waiting_reason: `video_fallback_segment_${segment.index}` });
+    return { state: 'waiting_provider', action: waiting, shot, fallback_segment: segment };
+  }
+
+  function fallbackFailureInput(action, generation) {
+    return {
+      error_code: generation?.error_code || action?.error_code || generation?.submission_receipt?.error_code,
+      message: generation?.error_msg || generation?.error_message || action?.error_message,
+      result: generation || action,
+      generation,
+    };
+  }
+
+  async function advanceSeedanceFallback(run, shot, bundle, action, generation = null) {
+    // A child action is always handled by this one state machine.  This keeps
+    // the legacy automatic model switch from creating a second, competing
+    // retry for the same logical shot.
+    const parent = action?.parent_action_id ? repo.getAction(db, action.parent_action_id) : action;
+    const existingPlan = fallbackPlanForAction(parent);
+    let plan = existingPlan;
+    if (!plan) {
+      const failure = fallbackFailureInput(parent, generation);
+      const selectionMode = fallbackSelectionMode(run, shot);
+      if (!canAutomaticallyFallback({
+        selection_mode: selectionMode,
+        policy: run.policy || {},
+        allow_shot_fallback: shot?.content?.allow_auto_model_switch === true,
+        failure,
+      })) return null;
+      const sourceModel = String(parent?.request?.model || parent?.request?.routing_receipt?.model || '').trim();
+      const fallbackModel = fallbackModelForShot(run);
+      plan = planSeedanceFallback({
+        runId: run.id,
+        shotId: shot.scope_id,
+        parentActionKey: parent.action_key,
+        fromModel: sourceModel,
+        fallbackModel,
+        failure,
+        firstPrice: Number(parent?.cost?.estimated_usd || parent?.request?.estimated_price || 3.5),
+        segmentPrice: 3,
+        requestedDuration: 30,
+        maxSegments: 2,
+        strictFirstFrame: Boolean(parent?.request?.first_frame_url),
+      });
+      if (!plan.eligible) return null;
+      const existingResult = parent.result || {};
+      const saved = repo.updateAction(db, parent.id, {
+        result: {
+          ...existingResult,
+          fallback_plan: plan,
+          fallback_trigger: failure,
+          fallback_selection_mode: selectionMode,
+        },
+      });
+      if (saved) parent.result = saved.result;
+    }
+
+    const reserveAmount = Math.max(0, Math.round(Number(plan.segment_cost || 3) * Number(plan.max_segments || 2) * 1000000));
+    if (reserveAmount > 0) {
+      try {
+        repo.reserveFallbackBudget(db, run.id, {
+          reservation_key: plan.parent_action_key,
+          amount_microusd: reserveAmount,
+          reason: `Seedance 2.5 失败后的 ${plan.max_segments} 段 2.0 备用预算`,
+          stage: 'shot_video', scope_type: 'shot', scope_id: shot.scope_id,
+        });
+      } catch (error) {
+        repo.updateRun(db, run.id, {
+          status: 'waiting_review', waiting_reason: 'fallback_budget_exhausted',
+          error_code: error.code || 'COST_FALLBACK_BUDGET_EXHAUSTED', error_message: error.message,
+        });
+        return { state: 'waiting_review', reason: 'fallback_budget_exhausted', action: parent, error };
+      }
+    }
+
+    const children = repo.listActions(db, run.id, { page_size: 200 }).items
+      .filter((item) => item.parent_action_key === plan.parent_action_key && item.kind === 'video_generate')
+      .sort((left, right) => Number(left.segment_index || 0) - Number(right.segment_index || 0));
+    const completed = children.filter((item) => item.status === 'completed');
+    const next = nextFallbackSegment(plan, completed.map((item) => ({ index: item.segment_index })));
+    if (next) {
+      const nextAction = children.find((item) => Number(item.segment_index) === Number(next.index));
+      if (nextAction && ['failed', 'ambiguous', 'cancelled'].includes(nextAction.status)) {
+        repo.updateRun(db, run.id, {
+          status: 'waiting_review', waiting_reason: 'video_fallback_segment_failed',
+          error_code: nextAction.error_code || 'VIDEO_FALLBACK_GENERATION_FAILED',
+          error_message: nextAction.error_message || '备用视频分段未完成，无法继续创建后续分段',
+        });
+        return { state: 'waiting_review', reason: 'video_fallback_segment_failed', action: nextAction };
+      }
+      if (!nextAction) {
+        const predecessor = Number(next.index) === 2
+          ? children.find((item) => Number(item.segment_index) === 1 && item.status === 'completed')
+          : null;
+        const predecessorFrame = predecessor?.result?.tail_frame || null;
+        const submitted = await submitFallbackSegment({
+          run, shot, bundle, parentAction: parent, plan, segment: next,
+          firstFrame: predecessorFrame,
+        });
+        return { ...submitted, fallback_parent_action: parent };
+      }
+      if (nextAction && ['submitted', 'waiting'].includes(nextAction.status)) {
+        const nextGeneration = nextAction.generation_id ? await adapters.getVideo(nextAction.generation_id) : null;
+        if (!nextGeneration || ['pending', 'processing'].includes(nextGeneration.status)) {
+          repo.updateRun(db, run.id, { status: 'waiting_provider', waiting_reason: `video_fallback_segment_${next.index}` });
+          return { state: 'waiting_provider', reason: `video_fallback_segment_${next.index}`, action: nextAction, generation: nextGeneration };
+        }
+        if (nextGeneration.status !== 'completed') {
+          const failed = failVideoActionFromGeneration(nextAction, nextGeneration, {
+            error_code: 'VIDEO_FALLBACK_GENERATION_FAILED',
+            error_message: nextGeneration.error_msg || '备用视频分段生成失败',
+          });
+          repo.updateRun(db, run.id, { status: 'waiting_review', waiting_reason: 'video_fallback_generation_failed', error_code: failed.error_code, error_message: failed.error_message });
+          return { state: 'waiting_review', reason: 'video_fallback_generation_failed', action: failed, generation: nextGeneration };
+        }
+        const refreshedChildren = repo.listActions(db, run.id, { page_size: 200 }).items
+          .filter((item) => item.parent_action_key === plan.parent_action_key && item.kind === 'video_generate')
+          .sort((left, right) => Number(left.segment_index || 0) - Number(right.segment_index || 0));
+        const segmentOne = refreshedChildren.find((item) => Number(item.segment_index) === 1);
+        const segmentOnePath = segmentOne?.result?.receipt?.relative_path || segmentOne?.result?.local_path || null;
+        if (Number(next.index) === 2 && !segmentOnePath) {
+          return { state: 'waiting_review', reason: 'fallback_segment_one_receipt_missing', action: nextAction };
+        }
+        const parentBundle = bundle || currentArtifacts(db, run.id, 'reference_bundle').find((item) => item.scope_id === shot.scope_id);
+        const receipt = await adapters.validateVideo(nextGeneration.local_path || nextGeneration.video_url, {
+          expected_duration: 15,
+          duration_tolerance: 4,
+          expected_aspect_ratio: normalizeProductionAspectRatio(run.policy?.aspect_ratio),
+        });
+        let tailFrame = null;
+        if (Number(next.index) === 1) {
+          tailFrame = await adapters.extractContinuityFrame(receipt.relative_path, {
+            run_id: run.id, shot_scope_id: shot.scope_id,
+            source_action_id: nextAction.id, source_hash: receipt.sha256,
+          });
+        }
+        const updatedChild = repo.updateAction(db, nextAction.id, {
+          status: 'completed',
+          result: {
+            ...(nextAction.result || {}),
+            receipt,
+            local_path: receipt.relative_path,
+            ...(tailFrame ? { tail_frame: tailFrame } : {}),
+          },
+        });
+        if (Number(next.index) === 1) {
+          const second = plan.segments.find((item) => Number(item.index) === 2);
+          const submitted = await submitFallbackSegment({
+            run, shot, bundle: parentBundle, parentAction: parent, plan, segment: second,
+            firstFrame: tailFrame,
+          });
+          return { ...submitted, fallback_parent_action: parent, completed_segment: updatedChild };
+        }
+      }
+    }
+
+    const latestChildren = repo.listActions(db, run.id, { page_size: 200 }).items
+      .filter((item) => item.parent_action_key === plan.parent_action_key && item.kind === 'video_generate')
+      .sort((left, right) => Number(left.segment_index || 0) - Number(right.segment_index || 0));
+    if (latestChildren.length < plan.max_segments || latestChildren.some((item) => item.status !== 'completed')) {
+      repo.updateRun(db, run.id, { status: 'waiting_provider', waiting_reason: 'video_fallback_segments' });
+      return { state: 'waiting_provider', reason: 'video_fallback_segments', action: parent };
+    }
+    if (parent.result?.artifact_id) return { state: 'progressed', reason: 'video_fallback_converged', action: parent, artifact: repo.getArtifact(db, parent.result.artifact_id) };
+    const paths = latestChildren.map((item) => item.result?.receipt?.relative_path || item.result?.local_path).filter(Boolean);
+    if (paths.length !== plan.max_segments) return { state: 'waiting_review', reason: 'fallback_segment_receipt_missing', action: parent };
+    const merged = await adapters.mergeVideoSegments(paths, { aspect_ratio: normalizeProductionAspectRatio(run.policy?.aspect_ratio) });
+    const mergedReceipt = await adapters.validateVideo(merged.relative_path, {
+      expected_aspect_ratio: normalizeProductionAspectRatio(run.policy?.aspect_ratio),
+    });
+    const finalBundle = bundle || currentArtifacts(db, run.id, 'reference_bundle').find((item) => item.scope_id === shot.scope_id);
+    const artifact = repo.createArtifact(db, {
+      run_id: run.id, stage: 'shot_video', scope_type: 'shot', scope_id: shot.scope_id,
+      title: shot.title,
+      content: {
+        source_artifact_id: shot.id,
+        bundle_artifact_id: finalBundle?.id || null,
+        fallback: {
+          plan_id: plan.plan_id, parent_action_id: parent.id,
+          child_action_ids: latestChildren.map((item) => item.id),
+          models: latestChildren.map((item) => item.request?.model),
+          provider_durations: latestChildren.map(() => 15),
+          continuity_mode: latestChildren[1]?.request?.fallback_continuity_mode || 'reference_continuation',
+          original_failure: plan.trigger_category,
+        },
+        provider_generation_ids: latestChildren.map((item) => item.generation_id).filter(Boolean),
+        validation: mergedReceipt,
+        dispatch_transport: {
+          first_frame: latestChildren[1]?.request?.first_frame_url || null,
+          reference_images: latestChildren[1]?.request?.reference_image_urls || [],
+          reference_videos: [], reference_audios: latestChildren[1]?.request?.reference_audio_urls || [],
+        },
+        included: true,
+      },
+      status: 'draft', media_path: mergedReceipt.relative_path, mime_type: 'video/mp4',
+      content_hash: mergedReceipt.sha256, source_action_id: parent.id,
+      depends_on: [shot.id, ...(finalBundle?.id ? [finalBundle.id] : [])],
+    });
+    repo.updateAction(db, parent.id, { status: 'completed', result: { ...(parent.result || {}), artifact_id: artifact.id, merged_receipt: mergedReceipt } });
+    repo.releaseFallbackBudget(db, run.id, plan.parent_action_key, 'fallback_converged');
+    repo.updateRun(db, run.id, { status: 'running', waiting_reason: null, error_code: null, error_message: null });
+    return { state: 'progressed', reason: 'video_fallback_converged', action: repo.getAction(db, parent.id), artifact };
+  }
+
   async function ensureShotVideos(run) {
     const shots = scopeShotItems(
       approvedIncluded(db, run.id, 'storyboard_plan').sort(compareShots),
@@ -2285,6 +3228,50 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
       let action = repo.getLatestAction(db, run.id, {
         stage: 'shot_video', scope_type: 'shot', scope_id: shot.scope_id, kind: 'video_generate',
       });
+      if (action && !action.parent_action_id && ['failed', 'cancelled'].includes(action.status)
+        && !action.result?.retry_authorized) {
+        // Re-resolve the live route before reusing a terminal action.  This is
+        // the missing link behind the old "I changed the model but retry still
+        // called the old one" bug: settings changes happen outside the run
+        // route picker, so the old action must be compared with the current
+        // catalog/config identity here as well.
+        let liveRoute = null;
+        try {
+          liveRoute = await resolveShotVideoRoute(repo.getRun(db, run.id), shot);
+        } catch (error) {
+          log.warn?.('Could not refresh live video route while checking failed action', {
+            run_id: run.id, shot: shot.scope_id, error: error.message,
+          });
+        }
+        const liveConfig = videoConfigForRun(db, repo.getRun(db, run.id), shot);
+        const liveIdentity = identityForConfig(liveConfig);
+        const previousIdentity = identityFromSnapshot({
+          ...(action.request || {}),
+          ...(action.request?.routing_receipt || {}),
+        });
+        const configuredModel = configuredVideoModelForShot(repo.getRun(db, run.id), shot);
+        const previousModel = String(action.request?.model || action.request?.routing_receipt?.model || '').trim();
+        const localConfigChanged = previousIdentity && liveIdentity
+          ? !sameIdentity(previousIdentity, liveIdentity)
+          : (Number(action.request?.video_config_id || 0) > 0
+            && liveIdentity?.id != null
+            && Number(action.request.video_config_id) !== Number(liveIdentity.id));
+        const modelChanged = Boolean(configuredModel && previousModel && configuredModel !== previousModel);
+        if (liveRoute && videoActionRouteChanged(action, liveRoute)) {
+          action = supersedeTerminalVideoAction(db, action, liveRoute, 'live_model_or_config_changed');
+        } else if (localConfigChanged || modelChanged) {
+          action = repo.updateAction(db, action.id, {
+            status: 'cancelled',
+            result: {
+              ...(action.result || {}),
+              superseded_by_route_change: true,
+              retry_authorized: true,
+              retry_reason: 'live_model_or_config_changed',
+              superseded_at: new Date().toISOString(),
+            },
+          });
+        }
+      }
       const explicitRetryGrant = action?.status === 'cancelled' && action.result?.retry_authorized === true;
       if (explicitRetryGrant) action = null;
       const selection = selectGenerationAction(action, shot, rejectedTarget, {
@@ -2320,21 +3307,52 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
       }
       action = selection.action;
       let actionSourceChanged = selection.sourceChanged === true;
+      // Cancellation controls are intentionally terminal for the local
+      // observer.  Keep the provider task id and accounting receipt readable,
+      // but do not call getVideo(), create another child segment, or resume a
+      // fallback chain until the user explicitly resumes/retries the action.
+      if (actionStoppedLocally(action)) {
+        const reason = action.result?.provider_cancel_confirmed === true
+          ? 'provider_cancelled_pending_refund'
+          : 'local_observation_stopped';
+        return { state: 'waiting_review', reason, action, shot };
+      }
+      // Resume an existing Seedance fallback chain before considering the
+      // legacy single-action path. This is important after a browser refresh:
+      // the latest action may be a child segment, while the parent owns the
+      // immutable plan and final logical-shot artifact.
+      if (action && (action.parent_action_id || fallbackPlanForAction(action))) {
+        const parentAction = action.parent_action_id ? repo.getAction(db, action.parent_action_id) : action;
+        const parentBundleId = Number(parentAction?.request?.bundle_artifact_id || action.request?.bundle_artifact_id || 0);
+        const fallbackBundle = parentBundleId > 0
+          ? repo.getArtifact(db, parentBundleId)
+          : currentArtifacts(db, run.id, 'reference_bundle').find((item) => item.scope_id === shot.scope_id);
+        const childGeneration = action.parent_action_id && action.generation_id
+          ? await adapters.getVideo(action.generation_id)
+          : null;
+        if (action.status === 'failed' && !action.parent_action_id && !fallbackPlanForAction(action)) {
+          // The parent is handled by the normal provider poll below so that
+          // its immutable failure receipt is available to the classifier.
+        } else {
+          const advanced = await advanceSeedanceFallback(repo.getRun(db, run.id), shot, fallbackBundle, action, childGeneration);
+          if (advanced) return advanced;
+        }
+      }
       let route = action?.request?.routing_receipt
         ? {
           ...action.request.routing_receipt,
-          capability: resolveVideoCapability(action.request.routing_receipt.model),
+          capability: capabilityForRoute(action.request.routing_receipt),
         }
         : null;
       let model = route?.model || '';
-      let capability = route?.capability || resolveVideoCapability(model);
+      let capability = capabilityForRoute(route);
       let duration = Number(route?.duration || shot.content.duration);
       if (!action) {
         const bundleState = await ensureReferenceBundleForShot(run, shot);
         let bundle = bundleState.artifact;
         route = bundleState.route;
         model = route?.model || '';
-        capability = route?.capability || resolveVideoCapability(model);
+        capability = capabilityForRoute(route);
         duration = Number(route?.duration || shot.content.duration);
         if (!model) throw new Error(`镜头 ${shot.scope_id} 没有可用的视频模型`);
         if (!bundle) throw new Error(`Shot ${shot.scope_id} is missing a reference bundle`);
@@ -2422,7 +3440,7 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
         bundle = validatedBundle;
         route = validatedBundleState.route;
         model = route?.model || '';
-        capability = route?.capability || resolveVideoCapability(model);
+        capability = capabilityForRoute(route);
         duration = Number(route?.duration || shot.content.duration);
         if (!model) throw new Error(`镜头 ${shot.scope_id} 没有可用的视频模型`);
         const dispatchRefs = bundle.content || {};
@@ -2452,10 +3470,15 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
           promptPlan.plan.provider_prompt,
           capability
         );
+        const dispatchConfig = videoConfigForRun(db, dispatchRun, shot);
+        const dispatchConfigIdentity = identityForConfig(dispatchConfig);
         const request = {
           drama_id: dispatchRun.drama_id,
           provider: dispatchRun.policy?.video_provider || 'yinzi',
-          video_config_id: dispatchRun.policy?.video_config_id || null,
+          video_config_id: dispatchConfigIdentity?.id || dispatchRun.policy?.video_config_id || null,
+          video_config_identity_version: dispatchConfigIdentity?.version || null,
+          video_config_updated_at: dispatchConfigIdentity?.updated_at || null,
+          video_config_fingerprint: dispatchConfigIdentity?.fingerprint || null,
           contract_validation_mode: 'advisory',
           model,
           duration,
@@ -2477,7 +3500,7 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
           reference_audio_urls: (dispatchRefs.audios || []).map((item) => item.path),
           reference_video_budget: dispatchRefs.reference_video_budget || null,
           reference_warnings: [...new Set(dispatchWarnings)],
-          routing_receipt: (() => { const { capability: _capability, ...receipt } = route; return receipt; })(),
+          routing_receipt: routingReceiptForRoute(route),
           routing_material_signature: routingMaterialSignature(route),
         };
         const dispatchReceipt = assertVideoDispatchContract({
@@ -2488,6 +3511,33 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
           kind: 'video_generate', attempt, request, reserved_video_seconds: duration,
           cost: accounting.videoReservation(db, dispatchRun, request, route),
         }).action;
+        // One last local read closes the race between route resolution and
+        // provider submission.  If the settings page changed the selected
+        // video config meanwhile, release this reservation and let the next
+        // progression build a request from the new live snapshot.
+        const liveBeforeSubmitRun = repo.getRun(db, run.id);
+        const liveBeforeSubmitConfig = videoConfigForRun(db, liveBeforeSubmitRun, shot);
+        const liveBeforeSubmitIdentity = identityForConfig(liveBeforeSubmitConfig);
+        const requestIdentity = identityFromSnapshot(request);
+        const liveModel = configuredVideoModelForShot(liveBeforeSubmitRun, shot);
+        const submitConfigChanged = requestIdentity && liveBeforeSubmitIdentity
+          ? !sameIdentity(requestIdentity, liveBeforeSubmitIdentity)
+          : (Number(request.video_config_id || 0) > 0
+            && liveBeforeSubmitIdentity?.id != null
+            && Number(request.video_config_id) !== Number(liveBeforeSubmitIdentity.id));
+        const submitModelChanged = Boolean(liveModel && request.model && liveModel !== request.model);
+        if (submitConfigChanged || submitModelChanged) {
+          const cancelled = repo.cancelReservedAction(db, action.id, {
+            superseded_by_route_change: true,
+            superseded_before_submission: true,
+            retry_authorized: true,
+            retry_reason: 'live_model_or_config_changed_before_submit',
+          });
+          repo.updateRun(db, run.id, {
+            status: 'running', waiting_reason: null, error_code: null, error_message: null,
+          });
+          return { state: 'progressed', reason: 'video_config_changed_before_submit', action: cancelled, shot };
+        }
         repo.updateAction(db, action.id, { status: 'submitted' });
         let created;
         try { created = await adapters.createVideo(request); }
@@ -2526,7 +3576,7 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
       }
       if (!route) route = await resolveShotVideoRoute(repo.getRun(db, run.id), shot);
       model = route?.model || '';
-      capability = route?.capability || resolveVideoCapability(model);
+      capability = capabilityForRoute(route);
       duration = Number(route?.duration || shot.content.duration);
       if (!model) throw new Error(`镜头 ${shot.scope_id} 没有可用的视频模型`);
       if (action.status === 'submitted' && !action.generation_id) {
@@ -2575,6 +3625,10 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
             error_code: 'VIDEO_GENERATION_FAILED',
             error_message: errorMessage,
           });
+          const fallback = await advanceSeedanceFallback(
+            repo.getRun(db, run.id), shot, liveBundle || null, failedAction, generation
+          );
+          if (fallback) return fallback;
           const ambiguous = failedAction.status === 'ambiguous';
           const reason = ambiguous ? 'ambiguous_video_create' : 'video_generation_failed';
           const errorCode = ambiguous ? 'VIDEO_CREATE_AMBIGUOUS' : 'VIDEO_GENERATION_FAILED';
@@ -2840,6 +3894,7 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
     requestDirectorCapture,
     acceptDirectorCapture,
     ensureShotVideos,
+    cancelRunAction,
     resolveShotVideoRoute,
     listVideoRoutingOptions,
     selectImageReferences: (run, shot, limit) => selectImageReferences(db, run, shot, limit),
@@ -2849,6 +3904,9 @@ function createProductionMediaService(db, cfg, log, injected = {}) {
 
 module.exports = {
   createProductionMediaService,
+  canReuseModelCatalogSnapshot,
+  discoveryFromStoredSnapshot,
+  discoverVideoCatalogForConfig,
   assertVideoDispatchContract,
   isAmbiguousImageGenerationFailure,
   buildProviderPrompt,

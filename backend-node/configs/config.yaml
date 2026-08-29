@@ -1,8 +1,11 @@
 app:
   name: 银子AI视频工作流 API
-  version: 0.1.3-beta.4
+  version: 0.1.3-beta.7
   debug: false
   language: zh
+  # Onboarding edition: yinzi or universal. This only changes defaults/copy;
+  # it is never a model or capability allow-list.
+  distribution_profile: universal
 server:
   port: 5679
   host: 0.0.0.0
@@ -20,6 +23,10 @@ storage:
   type: local
   local_path: ./data/storage
   base_url: http://localhost:5679/static
+# Browser-upload staging is temporary and is cleaned on startup after this TTL.
+# Confirmed imports are stored separately and are never removed by this job.
+asset_import:
+  staging_ttl_hours: 24
 # 异步视频任务轮询总超时（分钟）；省略或 ≤0 时默认 30
 video:
   generation_timeout_minutes: 30

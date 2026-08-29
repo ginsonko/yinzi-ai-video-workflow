@@ -66,15 +66,15 @@ jobs:
 
       - name: Build Windows installer and portable package
         working-directory: desktop
-        run: npm run dist
+        run: npm run dist:universal
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:
           name: windows-x64
           path: |
-            desktop/release/*.exe
-            desktop/release/*.yml
+            desktop/release-universal/*.exe
+            desktop/release-universal/*.yml
           if-no-files-found: error
           retention-days: 14
 
@@ -90,6 +90,7 @@ jobs:
             runner: macos-15
     runs-on: ${{ matrix.runner }}
     env:
+      AI_VIDEO_MAC_VARIANT: universal
       CSC_LINK: ${{ secrets.CSC_LINK }}
       CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
       APPLE_ID: ${{ secrets.APPLE_ID }}
@@ -163,8 +164,10 @@ jobs:
         run: |
           set -euo pipefail
           VERSION=$(node -p "require('./package.json').version")
-          DMG="release-mac/银子AI视频工作流-${VERSION}-mac-${{ matrix.arch }}.dmg"
-          ZIP="release-mac/银子AI视频工作流-${VERSION}-mac-${{ matrix.arch }}.zip"
+          PRODUCT_NAME='银子AI视频工作流-通用版-老李兼容'
+          APP_ID='top.yinziapi.ai-video-workflow.universal'
+          DMG="release-mac-universal/${PRODUCT_NAME}-${VERSION}-mac-${{ matrix.arch }}.dmg"
+          ZIP="release-mac-universal/${PRODUCT_NAME}-${VERSION}-mac-${{ matrix.arch }}.zip"
           test -s "$DMG"
           test -s "$ZIP"
           hdiutil verify "$DMG"
@@ -172,8 +175,9 @@ jobs:
           ditto -x -k "$ZIP" "$VERIFY_DIR"
           APP=$(find "$VERIFY_DIR" -maxdepth 1 -name '*.app' -type d -print -quit)
           test -n "$APP"
-          MAIN="$APP/Contents/MacOS/银子AI视频工作流"
+          MAIN="$APP/Contents/MacOS/${PRODUCT_NAME}"
           test -x "$MAIN"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")" = "$APP_ID"
           test "$(lipo -archs "$MAIN")" = "${{ matrix.arch == 'arm64' && 'arm64' || 'x86_64' }}"
           test -f "$APP/Contents/Resources/app.asar"
           test -x "$APP/Contents/Resources/ffmpeg/ffmpeg"
@@ -195,14 +199,15 @@ jobs:
           fi
 
       - name: Write SHA-256 manifest
-        working-directory: desktop/release-mac
+        working-directory: desktop/release-mac-universal
         shell: bash
         run: |
           set -euo pipefail
           VERSION=$(node -p "require('../package.json').version")
           ARCH="${{ matrix.arch }}"
-          DMG="银子AI视频工作流-${VERSION}-mac-${ARCH}.dmg"
-          ZIP="银子AI视频工作流-${VERSION}-mac-${ARCH}.zip"
+          PRODUCT_NAME='银子AI视频工作流-通用版-老李兼容'
+          DMG="${PRODUCT_NAME}-${VERSION}-mac-${ARCH}.dmg"
+          ZIP="${PRODUCT_NAME}-${VERSION}-mac-${ARCH}.zip"
           RECEIPT="native-mac-build-${ARCH}.json"
           shasum -a 256 "$DMG" "$ZIP" "$RECEIPT" > "SHA256SUMS-${ARCH}.txt"
 
@@ -211,10 +216,10 @@ jobs:
         with:
           name: macos-${{ matrix.arch }}
           path: |
-            desktop/release-mac/*.dmg
-            desktop/release-mac/*.zip
-            desktop/release-mac/*.json
-            desktop/release-mac/SHA256SUMS-*.txt
+            desktop/release-mac-universal/*.dmg
+            desktop/release-mac-universal/*.zip
+            desktop/release-mac-universal/native-mac-build-${{ matrix.arch }}.json
+            desktop/release-mac-universal/SHA256SUMS-*.txt
           if-no-files-found: error
           retention-days: 14
 
@@ -224,6 +229,9 @@ jobs:
     needs: [build-windows, build-macos]
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout release notes
+        uses: actions/checkout@v4
+
       - name: Download all platform artifacts
         uses: actions/download-artifact@v4
         with:
@@ -238,7 +246,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: release-assets/*
-          generate_release_notes: true
+          body_path: .github/RELEASE_NOTES_v0.1.3-beta.7.md
+          generate_release_notes: false
           draft: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

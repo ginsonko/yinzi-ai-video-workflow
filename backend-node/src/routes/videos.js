@@ -4,17 +4,8 @@ const taskService = require('../services/taskService');
 const videoClient = require('../services/videoClient');
 const { normalizeAspectRatioForApi } = videoClient;
 
-function publicVideoConfigSnapshot(config, model) {
-  if (!config) return null;
-  return {
-    config_id: config.id,
-    provider: config.provider || null,
-    api_protocol: config.api_protocol || null,
-    base_url: config.base_url || null,
-    endpoint: config.endpoint || null,
-    query_endpoint: config.query_endpoint || null,
-    model: model || config.default_model || null,
-  };
+function publicVideoConfigSnapshot(config, model, routingReceipt = null) {
+  return videoClient.buildProviderConfigSnapshot(config, model, routingReceipt);
 }
 
 function routes(db, log) {
@@ -50,7 +41,11 @@ function routes(db, log) {
         const videoConfig = videoClient.getDefaultVideoConfig(db, model, body.video_config_id);
         const videoConfigId = videoConfig?.id || null;
         const providerProtocol = videoConfig ? videoClient.resolveVideoProtocol(videoConfig, model) : null;
-        const providerConfigSnapshot = publicVideoConfigSnapshot(videoConfig, model);
+        const routingHint = {
+          ...(body.routing_receipt && typeof body.routing_receipt === 'object' ? body.routing_receipt : {}),
+          requested_model_explicit: Boolean(String(model || '').trim()),
+        };
+        const providerConfigSnapshot = publicVideoConfigSnapshot(videoConfig, model, routingHint);
         const duration = body.duration ?? null;
         // 画幅：请求体归一化（全角冒号等）后写入 DB；未传则从 drama.metadata 读取并同样归一化
         let aspectRatio = null;
@@ -88,7 +83,11 @@ function routes(db, log) {
         const promptContractJson = body.prompt_contract && typeof body.prompt_contract === 'object'
           ? JSON.stringify(body.prompt_contract)
           : null;
-        const contractValidationMode = videoClient.normalizeContractValidationMode(body.contract_validation_mode);
+        const contractValidationMode = body.contract_validation_mode != null
+          ? videoClient.normalizeContractValidationMode(body.contract_validation_mode)
+          : (videoConfig && videoClient.resolveVideoProtocol(videoConfig, model) === 'yinzi'
+            ? 'advisory'
+            : 'strict');
         db.prepare(
           `INSERT INTO video_generations (
              drama_id, storyboard_id, provider, prompt, prompt_contract_json, model, duration, aspect_ratio,

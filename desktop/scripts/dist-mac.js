@@ -4,10 +4,14 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
-const { assertArch, ensureDirectory, normalizeMacSigningEnvironment } = require('./mac-build-utils');
+const {
+  assertArch,
+  ensureDirectory,
+  normalizeMacSigningEnvironment,
+  resolveMacVariant,
+} = require('./mac-build-utils');
 
 const desktopDir = path.join(__dirname, '..');
-const releaseDir = path.join(desktopDir, 'release-mac');
 const packageJson = JSON.parse(fs.readFileSync(path.join(desktopDir, 'package.json'), 'utf8'));
 
 function run(command, args, options = {}) {
@@ -26,8 +30,12 @@ function sha256(filePath) {
   return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
 }
 
-function artifactPath(arch, extension) {
-  return path.join(releaseDir, `银子AI视频工作流-${packageJson.version}-mac-${arch}.${extension}`);
+function artifactPath(variant, arch, extension) {
+  return path.join(
+    desktopDir,
+    variant.output,
+    `${variant.productName}-${packageJson.version}-mac-${arch}.${extension}`
+  );
 }
 
 function assertNativeRunner(arch) {
@@ -39,13 +47,15 @@ function assertNativeRunner(arch) {
   }
 }
 
-function prepareInputs(arch) {
+function prepareInputs(arch, variant) {
   run('npm', ['run', 'prepare-backend']);
   run('npm', ['run', 'build:front']);
   run('npm', ['run', 'copy-front']);
   run('npm', ['run', 'prepare:icon']);
   run(process.execPath, ['scripts/prepare-mac-resources.js', arch]);
-  run(process.execPath, ['scripts/verify-mac-inputs.js', arch]);
+  run(process.execPath, ['scripts/verify-mac-inputs.js', arch], {
+    env: { AI_VIDEO_MAC_VARIANT: variant.id },
+  });
 }
 
 function rebuildAndProbe(arch) {
@@ -53,24 +63,25 @@ function rebuildAndProbe(arch) {
   run(require('electron'), ['test/electron-native-probe.js'], { timeout: 5 * 60 * 1000 });
 }
 
-function build(arch) {
+function build(arch, variant) {
   const builder = require.resolve('electron-builder/cli.js');
   run(process.execPath, [
     builder,
     '--mac',
     `--${arch}`,
     '--config',
-    'electron-builder-mac-v012.json',
+    variant.config,
     '--publish',
     'never',
   ], { timeout: 90 * 60 * 1000 });
 }
 
-function writeReceipt(arch) {
+function writeReceipt(arch, variant) {
+  const releaseDir = path.join(desktopDir, variant.output);
   const artifacts = ['dmg', 'zip'].map((extension) => {
-    const filePath = artifactPath(arch, extension);
+    const filePath = artifactPath(variant, arch, extension);
     if (!fs.existsSync(filePath) || fs.statSync(filePath).size < 20 * 1024 * 1024) {
-      throw new Error(`macOS ${arch} ${extension.toUpperCase()} 缺失或异常过小：${filePath}`);
+      throw new Error(`${variant.id} macOS ${arch} ${extension.toUpperCase()} 缺失或异常过小：${filePath}`);
     }
     return {
       artifact: path.basename(filePath),
@@ -81,7 +92,9 @@ function writeReceipt(arch) {
   ensureDirectory(releaseDir);
   const receipt = {
     schema_version: 1,
-    product: packageJson.build?.productName || '银子AI视频工作流',
+    variant: variant.id,
+    product: variant.productName,
+    app_id: variant.appId,
     version: packageJson.version,
     platform: 'darwin',
     arch,
@@ -98,18 +111,19 @@ function writeReceipt(arch) {
     `${JSON.stringify(receipt, null, 2)}\n`,
     'utf8'
   );
-  console.log(`[mac-native] ${arch} DMG/ZIP 构建完成：${artifacts.map((item) => item.artifact).join(', ')}`);
+  console.log(`[mac-native] ${variant.id} ${arch} DMG/ZIP 构建完成：${artifacts.map((item) => item.artifact).join(', ')}`);
 }
 
 function main() {
   const requested = process.argv[2] || process.env.YINZI_MAC_ARCH || process.arch;
   const arch = assertArch(requested);
+  const variant = resolveMacVariant();
   assertNativeRunner(arch);
-  ensureDirectory(releaseDir);
-  prepareInputs(arch);
+  ensureDirectory(path.join(desktopDir, variant.output));
+  prepareInputs(arch, variant);
   rebuildAndProbe(arch);
-  build(arch);
-  writeReceipt(arch);
+  build(arch, variant);
+  writeReceipt(arch, variant);
 }
 
 try {

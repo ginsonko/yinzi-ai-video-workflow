@@ -1,6 +1,7 @@
 {
   "appId": "top.yinziapi.ai-video-workflow",
   "productName": "银子AI视频工作流",
+  "executableName": "银子AI视频工作流",
   "copyright": "Copyright (c) 2026 银子 (ginsonko) and contributors",
   "npmRebuild": true,
   "electronVersion": "43.4.0",

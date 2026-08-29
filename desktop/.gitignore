@@ -9,6 +9,8 @@ release-acceptance/
 *.log
 mac-stage/
 release-mac/
+release-mac-universal/
+release-universal/
 mac-resources/
 mac-build-work/
 mac-build-cache/*.tgz

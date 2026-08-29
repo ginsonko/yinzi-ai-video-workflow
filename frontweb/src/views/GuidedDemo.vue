@@ -189,6 +189,7 @@ const directorMode = ref('跳过 3D 预演')
 const directorOptions = ['携带 3D 预演', '跳过 3D 预演']
 const configs = ref([])
 const readiness = computed(() => getConfigReadiness(configs.value))
+const distributionProfile = ref({ id: 'universal', smart_routing_entry: false })
 
 const steps = [
   { key: 'story', label: '故事', short: '剧本审批' },
@@ -233,11 +234,12 @@ function restartDemo() {
 }
 
 function startReal() {
-  router.push({ path: '/', query: readiness.value.isReady ? { start: '1' } : { config: 'yinzi' } })
+  router.push({ path: '/', query: readiness.value.isReady ? { start: '1' } : { config: distributionProfile.value.smart_routing_entry ? 'yinzi' : 'laoli' } })
 }
 
 onMounted(async () => {
   try { configs.value = await aiAPI.list() } catch (_) { configs.value = [] }
+  try { distributionProfile.value = await aiAPI.getDistributionProfile() } catch (_) { /* universal-safe fallback */ }
 })
 </script>
 

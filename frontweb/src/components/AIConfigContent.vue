@@ -3,6 +3,21 @@
     <el-tabs v-model="activeTab" class="config-tabs">
       <el-tab-pane label="AI 配置" name="configs">
         <div class="tab-content">
+          <el-alert
+            v-if="distributionProfile"
+            class="distribution-profile-alert"
+            type="info"
+            :closable="false"
+            show-icon
+          >
+            <template #title>{{ distributionProfile.name }}</template>
+            <div class="distribution-profile-copy">{{ distributionProfile.description }}</div>
+            <div class="distribution-profile-copy">
+              {{ distributionProfile.smart_routing_entry
+                ? '银子 API：可使用一个智能路由 Key；image.yinziapi.top 仍按文本、图片、视频三个 Key 配置。'
+                : '通用版：文本、图片、视频分别配置 Key；image.yinziapi.top 同样按三个 Key 配置，不使用智能路由。' }}
+            </div>
+          </el-alert>
           <!-- 普通模式操作栏 -->
           <div v-if="!vendorLock.enabled" class="content-actions">
             <div class="actions-left">
@@ -23,9 +38,17 @@
                 高级设置
               </el-button>
               <input ref="importFileRef" type="file" accept=".json" style="display:none" @change="importConfigs" />
-              <el-button type="primary" plain @click="openOneKeyYinzi">
+              <el-button v-if="distributionProfile?.smart_routing_entry" type="primary" plain @click="openOneKeyYinzi">
                 <el-icon><MagicStick /></el-icon>
                 配置 YinziAPI
+              </el-button>
+          <el-button v-if="distributionProfile?.id === 'universal'" type="primary" plain @click="openOneKeyLaoli">
+                <el-icon><MagicStick /></el-icon>
+                配置老李站点（三 Key）
+              </el-button>
+              <el-button type="primary" plain @click="openOneKeyImageYinzi">
+                <el-icon><MagicStick /></el-icon>
+                配置银子媒体站
               </el-button>
               <el-button type="success" plain @click="openOneKeyVolc">
                 <el-icon><MagicStick /></el-icon>
@@ -1005,6 +1028,105 @@ input_reference = (图片文件，可选)</pre>
     </el-dialog>
 
     <!-- 一键配置通义 -->
+    <!-- 银子媒体站（三 Key，兼容老李协议） -->
+    <el-dialog
+      v-model="oneKeyImageYinziVisible"
+      title="配置银子媒体站（image.yinziapi.top）"
+      width="620px"
+      :close-on-click-modal="false"
+      @closed="resetOneKeyImageYinzi"
+    >
+      <div class="one-key-help">
+        <div class="one-key-section">
+          <div class="one-key-section-title">📋 分别填写三类服务，自动创建 4 个配置</div>
+          <ul class="one-key-list">
+            <li><b>文本 / 剧本</b>：老李站点没有文本模型，请填写其它兼容文本站点；默认 gpt-5.6-sol</li>
+            <li><b>图片 / 分镜图</b>：默认 gpt-image-2</li>
+            <li><b>视频</b>：默认 Seedance 2.5-720（固定 30 秒），Seedance 2.0-720（5 / 10 / 15 秒）作为备用</li>
+          </ul>
+        </div>
+        <div class="one-key-section">
+          <div class="one-key-section-title">🔑 配置说明</div>
+          <p class="one-key-note">这是普通三 Key 站点，不使用智能路由。三个 Key 可以来自不同分组；模型和协议已按老李站点兼容方式预置，保存后仍可在配置列表中自由修改。当前发行版：{{ distributionProfile?.name || '通用版' }}。</p>
+          <p class="one-key-note">站点地址：<a href="https://image.yinziapi.top/" target="_blank" class="one-key-link">image.yinziapi.top</a>。如果站点目录返回了新模型，仍可在对应配置的“发现模型”中刷新；未知能力不会阻止手动提交。</p>
+        </div>
+      </div>
+      <el-form label-position="top" class="yinzi-config-form" style="margin-top: 12px">
+        <el-form-item label="API Base URL">
+          <el-input v-model="oneKeyImageYinziForm.base_url" placeholder="https://image.yinziapi.top/v1" clearable />
+        </el-form-item>
+        <div class="yinzi-field-grid">
+          <el-form-item label="文本 Key" required><el-input v-model="oneKeyImageYinziForm.text_api_key" type="password" show-password clearable autocomplete="new-password" placeholder="文本分组 Key" /></el-form-item>
+          <el-form-item label="文本模型"><el-input v-model="oneKeyImageYinziForm.text_model" /></el-form-item>
+          <el-form-item label="图片 Key" required><el-input v-model="oneKeyImageYinziForm.image_api_key" type="password" show-password clearable autocomplete="new-password" placeholder="图片分组 Key" /></el-form-item>
+          <el-form-item label="图片模型"><el-input v-model="oneKeyImageYinziForm.image_model" /></el-form-item>
+          <el-form-item label="视频 Key" required><el-input v-model="oneKeyImageYinziForm.video_api_key" type="password" show-password clearable autocomplete="new-password" placeholder="视频分组 Key" /></el-form-item>
+          <el-form-item label="默认视频模型"><el-select v-model="oneKeyImageYinziForm.video_model" filterable allow-create default-first-option><el-option label="Seedance 2.5-720（30 秒）" value="Seedance 2.5-720" /><el-option label="Seedance 2.0-720（5/10/15 秒）" value="Seedance 2.0-720" /></el-select></el-form-item>
+        </div>
+      </el-form>
+      <template #footer>
+        <el-button @click="oneKeyImageYinziVisible = false">取消</el-button>
+        <el-button type="primary" :loading="oneKeyImageYinziSaving" :disabled="!oneKeyImageYinziReady" @click="submitOneKeyImageYinzi">确定，一键创建配置</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 老李 NewAPI（三 Key，即梦 2.5/2.0 兼容） -->
+    <el-dialog
+      v-model="oneKeyLaoliVisible"
+      title="配置老李站点（通用三 Key）"
+      width="620px"
+      :close-on-click-modal="false"
+      @closed="resetOneKeyLaoli"
+    >
+      <div class="one-key-help">
+        <div class="one-key-section">
+          <div class="one-key-section-title">📋 一次填写三个 Key，自动创建 4 个配置</div>
+          <ul class="one-key-list">
+            <li><b>文本 / 剧本</b>：默认 gpt-5.6-sol</li>
+            <li><b>图片 / 分镜图</b>：默认 gpt-image-2（图片 Key 共用）</li>
+            <li><b>视频</b>：默认 3.5（即梦 2.5，固定 30 秒），3.0（即梦 2.0，5/10/15 秒）备用</li>
+          </ul>
+        </div>
+        <div class="one-key-section">
+          <div class="one-key-section-title">🔑 老李站点与文本服务</div>
+          <p class="one-key-note">本版本无需 YinziAPI 智能路由。老李站点只提供图片和视频，所以图片、视频各填自己的地址和 Key；文本服务必须单独填写其它兼容文本站点的地址和 Key，三者不会串用。</p>
+          <p class="one-key-note">图片 Key 同时用于资源图和分镜图。视频 3.5 固定 30 秒，3.0 支持 5 / 10 / 15 秒。保存后仍可在配置列表中自由修改。</p>
+        </div>
+      </div>
+      <el-form label-position="top" class="yinzi-config-form" style="margin-top: 12px">
+        <div class="laoli-service-block">
+          <div class="one-key-section-title">文本服务（必填，独立站点）</div>
+          <p class="one-key-note">老李没有文本模型；可填写任意兼容 OpenAI Chat Completions 的 NewAPI / sub2 地址。</p>
+          <div class="yinzi-field-grid">
+            <el-form-item label="文本 Base URL" required><el-input v-model="oneKeyLaoliForm.text_base_url" placeholder="https://你的文本站点/v1" clearable /></el-form-item>
+            <el-form-item label="文本 Key" required><el-input v-model="oneKeyLaoliForm.text_api_key" type="password" show-password clearable autocomplete="new-password" placeholder="文本分组 Key" /></el-form-item>
+            <el-form-item label="文本模型"><el-input v-model="oneKeyLaoliForm.text_model" placeholder="gpt-5.6-sol" /></el-form-item>
+          </div>
+        </div>
+        <div class="laoli-service-block">
+          <div class="one-key-section-title">图片服务（老李）</div>
+          <div class="yinzi-field-grid">
+            <el-form-item label="图片 Base URL" required><el-input v-model="oneKeyLaoliForm.image_base_url" placeholder="https://video.laoliimage2.win/v1" clearable /></el-form-item>
+            <el-form-item label="图片 Key" required><el-input v-model="oneKeyLaoliForm.image_api_key" type="password" show-password clearable autocomplete="new-password" placeholder="图片分组 Key" /></el-form-item>
+            <el-form-item label="图片模型"><el-input v-model="oneKeyLaoliForm.image_model" placeholder="gpt-image-2" /></el-form-item>
+          </div>
+        </div>
+        <div class="laoli-service-block">
+          <div class="one-key-section-title">视频服务（老李）</div>
+          <div class="yinzi-field-grid">
+            <el-form-item label="视频 Base URL" required><el-input v-model="oneKeyLaoliForm.video_base_url" placeholder="https://video.laoliimage2.win/v1" clearable /></el-form-item>
+            <el-form-item label="视频 Key" required><el-input v-model="oneKeyLaoliForm.video_api_key" type="password" show-password clearable autocomplete="new-password" placeholder="视频分组 Key" /></el-form-item>
+            <el-form-item label="默认视频模型"><el-select v-model="oneKeyLaoliForm.video_model" filterable allow-create default-first-option><el-option label="3.5（即梦 2.5，30 秒）" value="3.5" /><el-option label="3.0（即梦 2.0，5/10/15 秒）" value="3.0" /></el-select></el-form-item>
+          </div>
+        </div>
+      </el-form>
+      <template #footer>
+        <el-button @click="oneKeyLaoliVisible = false">取消</el-button>
+        <el-button type="primary" :loading="oneKeyLaoliSaving" :disabled="!oneKeyLaoliReady" @click="submitOneKeyLaoli">确定，一键创建配置</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 一键配置通义 -->
     <el-dialog
       v-model="oneKeyTongyiVisible"
       title="一键配置通义千问 / 万象（不推荐）"
@@ -1160,26 +1282,41 @@ input_reference = (图片文件，可选)</pre>
     >
       <div class="yinzi-catalog-bar">
         <div>
-          <strong>公开模型目录</strong>
+          <strong>{{ yinziCatalogTitle }}</strong>
           <span v-if="yinziCatalog.pricing_version" class="yinzi-catalog-version">{{ yinziCatalog.pricing_version }}</span>
           <p>{{ yinziCatalogMessage }}</p>
         </div>
-        <el-button :icon="Refresh" circle :loading="oneKeyYinziCatalogLoading" title="刷新模型目录" @click="loadYinziCatalog" />
+        <div class="yinzi-catalog-actions">
+          <el-button
+            v-if="oneKeyYinziReady"
+            plain
+            :loading="oneKeyYinziCatalogLoading"
+            @click="loadCurrentYinziCatalog"
+          >读取当前 Key 模型</el-button>
+          <el-button :icon="Refresh" circle :loading="oneKeyYinziCatalogLoading" title="刷新公开模型目录" @click="loadYinziCatalog" />
+        </div>
       </div>
 
       <el-form label-position="top" class="yinzi-config-form">
-        <el-form-item label="API Base URL" required>
+        <el-form-item label="API Base URL">
           <el-input v-model="oneKeyYinziForm.base_url" placeholder="https://api.yinziapi.top/v1" clearable />
         </el-form-item>
 
-        <el-form-item label="通用 API Key" required>
-          <el-input v-model="oneKeyYinziForm.api_key" type="password" show-password clearable autocomplete="new-password" placeholder="填写一次即可；不同分组再展开高级设置" />
+        <el-form-item label="智能路由 Key（唯一必填）" required>
+          <el-input v-model="oneKeyYinziForm.api_key" type="password" show-password clearable autocomplete="new-password" placeholder="粘贴 sk- 开头的智能路由 Key，其余配置自动完成" />
+          <p class="yinzi-field-help">填写一次即可读取当前 Key 可用的文本、生图和视频模型；只有当前 Key 确实返回 Seedance 时才会优先选用。站点报价仍可手动选择，普通分组 Key 可在高级设置中分别覆盖。</p>
         </el-form-item>
 
         <div class="yinzi-auto-summary">
           <span><small>文本</small><strong>{{ oneKeyYinziForm.text_model || 'gpt-5.6-sol' }}</strong></span>
           <span><small>生图</small><strong>{{ oneKeyYinziForm.image_model || 'gpt-image-2' }}</strong></span>
-          <span><small>视频</small><strong>{{ oneKeyYinziForm.video_model || '按镜头预计总价自动选择' }}</strong></span>
+          <span><small>视频</small><strong>{{ oneKeyYinziForm.video_model || '优先 Seedance，再按镜头自动选择' }}</strong></span>
+        </div>
+
+        <div v-if="yinziCatalogScope === 'credential'" class="yinzi-video-scope-summary">
+          <span><strong>{{ yinziCredentialVideoCount }}</strong> Key 目录直接返回</span>
+          <span><strong>{{ yinziPublicVideoCount }}</strong> 站点报价手选</span>
+          <span><strong>{{ yinziSelectionReason }}</strong> 默认策略</span>
         </div>
 
         <el-collapse v-model="oneKeyYinziAdvanced" class="yinzi-advanced">
@@ -1207,9 +1344,10 @@ input_reference = (图片文件，可选)</pre>
                 <el-input v-model="oneKeyYinziForm.video_api_key" type="password" show-password clearable autocomplete="new-password" placeholder="留空使用通用 Key" />
               </el-form-item>
               <el-form-item label="固定视频模型">
-                <el-select v-model="oneKeyYinziForm.video_model" filterable allow-create default-first-option clearable placeholder="留空：每个镜头自动选择最便宜的合格模型">
-                  <el-option v-for="item in yinziCatalog.video" :key="item.model" :label="catalogOptionLabel(item)" :value="item.model" />
+                <el-select v-model="oneKeyYinziForm.video_model" filterable allow-create default-first-option clearable placeholder="留空：当前 Key 内优先 Seedance，按镜头自动选择" @change="oneKeyYinziVideoModelManual = true">
+                  <el-option v-for="item in yinziCatalog.video" :key="item.model" :label="catalogOptionLabel(item, 'video')" :value="item.model" />
                 </el-select>
+                <p class="yinzi-field-help">任何模型都可手动输入。站点报价项只用于手动选择，不会冒充当前 Key 可自动路由的模型；最终能力以站点实际响应为准。</p>
               </el-form-item>
             </div>
           </el-collapse-item>
@@ -1223,7 +1361,7 @@ input_reference = (图片文件，可选)</pre>
       <template #footer>
         <el-button @click="oneKeyYinziVisible = false">取消</el-button>
         <el-button type="primary" :loading="oneKeyYinziSaving" :disabled="!oneKeyYinziReady" @click="submitOneKeyYinzi">
-          保存并设为默认
+          检测并自动配置
         </el-button>
       </template>
     </el-dialog>
@@ -1339,6 +1477,8 @@ import Sd2AssetManagement from '@/components/Sd2AssetManagement.vue'
 const props = defineProps({
   initialAction: { type: String, default: '' },
 })
+
+const distributionProfile = ref(null)
 
 const activeTab = ref('configs')
 const importFileRef = ref(null)
@@ -1551,6 +1691,10 @@ const oneKeyYinziSaving = ref(false)
 const oneKeyYinziCatalogLoading = ref(false)
 const oneKeyYinziAdvanced = ref([])
 const yinziCatalogError = ref('')
+const yinziCatalogScope = ref('public')
+const yinziCatalogWarning = ref('')
+const yinziCatalogMeta = ref({})
+const oneKeyYinziVideoModelManual = ref(false)
 const yinziCatalog = ref({ pricing_version: '', text: [], image: [], video: [] })
 const oneKeyYinziForm = ref({
   base_url: 'https://api.yinziapi.top/v1',
@@ -1561,6 +1705,47 @@ const oneKeyYinziForm = ref({
   text_model: 'gpt-5.6-sol',
   image_model: '',
   video_model: '',
+})
+const oneKeyImageYinziVisible = ref(false)
+const oneKeyImageYinziSaving = ref(false)
+const oneKeyImageYinziForm = ref({
+  base_url: 'https://image.yinziapi.top/v1',
+  text_api_key: '',
+  image_api_key: '',
+  video_api_key: '',
+  text_model: 'gpt-5.6-sol',
+  image_model: 'gpt-image-2',
+  video_model: 'Seedance 2.5-720',
+})
+const oneKeyImageYinziReady = computed(() => {
+  const form = oneKeyImageYinziForm.value
+  return Boolean(String(form.base_url || '').trim()
+    && String(form.text_api_key || '').trim()
+    && String(form.image_api_key || '').trim()
+    && String(form.video_api_key || '').trim())
+})
+
+const oneKeyLaoliVisible = ref(false)
+const oneKeyLaoliSaving = ref(false)
+const oneKeyLaoliForm = ref({
+  text_base_url: '',
+  image_base_url: 'https://video.laoliimage2.win/v1',
+  video_base_url: 'https://video.laoliimage2.win/v1',
+  text_api_key: '',
+  image_api_key: '',
+  video_api_key: '',
+  text_model: 'gpt-5.6-sol',
+  image_model: 'gpt-image-2',
+  video_model: '3.5',
+})
+const oneKeyLaoliReady = computed(() => {
+  const form = oneKeyLaoliForm.value
+  return Boolean(String(form.text_base_url || '').trim()
+    && String(form.image_base_url || '').trim()
+    && String(form.video_base_url || '').trim()
+    && String(form.text_api_key || '').trim()
+    && String(form.image_api_key || '').trim()
+    && String(form.video_api_key || '').trim())
 })
 
 const oneKeyYinziReady = computed(() => {
@@ -1576,9 +1761,22 @@ const yinziCatalogMessage = computed(() => {
   if (yinziCatalogError.value) return yinziCatalogError.value
   const catalog = yinziCatalog.value
   if (catalog.image.length || catalog.video.length) {
-    return `${catalog.text.length} 个文本模型，${catalog.image.length} 个生图模型，${catalog.video.length} 个视频模型`
+    const count = `${catalog.text.length} 个文本模型，${catalog.image.length} 个生图模型，${catalog.video.length} 个视频模型`
+    return yinziCatalogWarning.value ? `${count}；${yinziCatalogWarning.value}` : count
   }
   return '尚未加载'
+})
+const yinziCatalogTitle = computed(() => yinziCatalogScope.value === 'credential' ? '智能 Key 模型与路由候选' : 'YinziAPI 公开模型目录')
+const yinziCredentialVideoCount = computed(() => Number(yinziCatalogMeta.value.credential_video_model_count)
+  || yinziCatalog.value.video.filter((item) => item.credential_verified === true).length)
+const yinziPublicVideoCount = computed(() => Number(yinziCatalogMeta.value.public_video_model_count)
+  || yinziCatalog.value.video.filter((item) => item.public_catalog === true && item.credential_verified !== true).length)
+const yinziSelectionReason = computed(() => {
+  const reason = yinziCatalogMeta.value.selection_reason
+  if (reason === 'user_selected') return '手动指定'
+  if (reason === 'current_key_seedance_preferred') return 'Seedance 优先'
+  if (reason === 'only_current_key_video_model') return '唯一可用模型'
+  return '当前 Key 内自动选择'
 })
 
 /** 预设厂商与模型（与参考前端一致） */
@@ -2526,10 +2724,17 @@ async function onBatchDelete() {
   await loadList()
 }
 
-function catalogOptionLabel(item) {
+function catalogOptionLabel(item, serviceType = '') {
   if (!item) return ''
+  const scopeLabel = serviceType === 'video'
+    ? item.credential_verified === true
+      ? '当前 Key 已验证'
+      : item.smart_routing_candidate === true
+        ? '站点报价 · 手动'
+        : item.public_catalog === true ? '站点报价 · 手动' : ''
+    : ''
   const value = item.cheapest_effective_price
-  if (value == null) return item.model
+  if (value == null) return [item.model, scopeLabel].filter(Boolean).join('  ·  ')
   const priced = (item.prices || []).find((price) => price.effective_price === value)
   const unitMap = {
     per_second: '秒',
@@ -2539,7 +2744,7 @@ function catalogOptionLabel(item) {
   const unit = unitMap[priced?.billing_unit] || priced?.billing_unit || '计费单位'
   const currency = String(priced?.currency || '').toUpperCase()
   const symbol = currency === 'CNY' ? '¥' : currency === 'USD' ? '$' : currency ? `${currency} ` : ''
-  return `${item.model}  ·  ${symbol}${Number(value).toFixed(4).replace(/0+$/, '').replace(/\.$/, '')}/${unit}`
+  return [item.model, scopeLabel, `${symbol}${Number(value).toFixed(4).replace(/0+$/, '').replace(/\.$/, '')}/${unit}`].filter(Boolean).join('  ·  ')
 }
 
 function applyYinziCatalogDefaults() {
@@ -2552,8 +2757,11 @@ function applyYinziCatalogDefaults() {
 async function loadYinziCatalog() {
   oneKeyYinziCatalogLoading.value = true
   yinziCatalogError.value = ''
+  yinziCatalogWarning.value = ''
   try {
     const catalog = await aiAPI.getYinziCatalog()
+    yinziCatalogScope.value = 'public'
+    yinziCatalogMeta.value = {}
     yinziCatalog.value = {
       pricing_version: catalog?.pricing_version || '',
       text: Array.isArray(catalog?.text) ? catalog.text : [],
@@ -2563,6 +2771,57 @@ async function loadYinziCatalog() {
     applyYinziCatalogDefaults()
   } catch (error) {
     yinziCatalogError.value = '目录加载失败，可直接输入模型名'
+  } finally {
+    oneKeyYinziCatalogLoading.value = false
+  }
+}
+
+function oneKeyYinziPayload() {
+  const form = oneKeyYinziForm.value
+  return {
+    base_url: form.base_url.trim(),
+    api_key: form.api_key.trim(),
+    routing_mode: 'smart',
+    smart_routing: true,
+    text_api_key: form.text_api_key.trim(),
+    image_api_key: form.image_api_key.trim(),
+    video_api_key: form.video_api_key.trim(),
+    distribution_profile: distributionProfile.value?.id || undefined,
+    text_model: form.text_model,
+    image_model: form.image_model,
+    video_model: oneKeyYinziVideoModelManual.value ? form.video_model : '',
+  }
+}
+
+async function loadCurrentYinziCatalog() {
+  if (!oneKeyYinziReady.value) return
+  oneKeyYinziCatalogLoading.value = true
+  yinziCatalogError.value = ''
+  yinziCatalogWarning.value = ''
+  try {
+    const preview = await aiAPI.previewYinzi(oneKeyYinziPayload(), { suppressGlobalError: true })
+    const warnings = Array.isArray(preview?.catalog?.warnings) ? preview.catalog.warnings : []
+    const credentialVideoCount = Number(preview?.catalog?.credential_video_model_count) || 0
+    const publicVideoCount = Number(preview?.catalog?.public_video_model_count) || 0
+    yinziCatalogScope.value = 'credential'
+    yinziCatalogMeta.value = preview?.catalog || {}
+    yinziCatalogWarning.value = warnings.length
+      ? `当前 Key 有 ${credentialVideoCount} 个自动可用视频模型；另有 ${publicVideoCount} 个站点报价可手动尝试。能力信息稍后自动同步`
+      : `当前 Key 的 ${credentialVideoCount} 个视频模型与能力信息已同步`
+    yinziCatalog.value = {
+      pricing_version: preview?.catalog?.pricing_version || '',
+      text: Array.isArray(preview?.text) ? preview.text : [],
+      image: Array.isArray(preview?.image) ? preview.image : [],
+      video: Array.isArray(preview?.video) ? preview.video : [],
+    }
+    const form = oneKeyYinziForm.value
+    if (!form.text_model) form.text_model = preview?.text_model || ''
+    if (!form.image_model) form.image_model = preview?.image_model || ''
+    if (!oneKeyYinziVideoModelManual.value && preview?.video_model) form.video_model = preview.video_model
+    ElMessage.success(`已读取：${credentialVideoCount} 个当前 Key 自动候选，${publicVideoCount} 个站点报价手动候选`)
+  } catch (error) {
+    yinziCatalogError.value = error.message || '当前 Key 模型目录读取失败'
+    ElMessage.error(yinziCatalogError.value)
   } finally {
     oneKeyYinziCatalogLoading.value = false
   }
@@ -2579,31 +2838,102 @@ function resetOneKeyYinzi() {
   oneKeyYinziForm.value.image_api_key = ''
   oneKeyYinziForm.value.video_api_key = ''
   oneKeyYinziAdvanced.value = []
+  yinziCatalogScope.value = 'public'
+  yinziCatalogWarning.value = ''
+  yinziCatalogMeta.value = {}
+  oneKeyYinziVideoModelManual.value = false
 }
 
 async function submitOneKeyYinzi() {
   if (!oneKeyYinziReady.value) return
   oneKeyYinziSaving.value = true
   try {
-    const form = oneKeyYinziForm.value
-    const result = await aiAPI.setupYinzi({
-      base_url: form.base_url.trim(),
-      api_key: form.api_key.trim(),
-      text_api_key: form.text_api_key.trim(),
-      image_api_key: form.image_api_key.trim(),
-      video_api_key: form.video_api_key.trim(),
-      text_model: form.text_model,
-      image_model: form.image_model,
-      video_model: form.video_model,
-    })
+    const result = await aiAPI.setupYinzi(oneKeyYinziPayload(), { suppressGlobalError: true })
     const selectedVideo = result?.catalog?.selected_video_model
-    ElMessage.success(selectedVideo
-      ? `YinziAPI 已配置，视频将自动路由；当前最低成本首选 ${selectedVideo}`
-      : 'YinziAPI 文本、生图、分镜图和视频配置已设为默认')
+    const videoCount = Number(result?.catalog?.video_model_count) || 0
+    const credentialVideoCount = Number(result?.catalog?.credential_video_model_count) || 0
+    const publicVideoCount = Number(result?.catalog?.public_video_model_count) || 0
+    const warnings = Array.isArray(result?.catalog?.warnings) ? result.catalog.warnings : []
+    ElMessage({
+      type: warnings.length ? 'warning' : 'success',
+      duration: warnings.length ? 6000 : 3500,
+      message: selectedVideo
+      ? `YinziAPI 已配置 ${videoCount} 个视频选项（${credentialVideoCount} 个当前 Key 自动候选，${publicVideoCount} 个站点报价手动候选）；当前首选 ${selectedVideo}${warnings.length ? '。能力信息稍后自动同步' : ''}`
+      : 'YinziAPI 文本、生图、分镜图和视频配置已设为默认',
+    })
     oneKeyYinziVisible.value = false
     await loadList()
+  } catch (error) {
+    ElMessage.error(error.message || 'YinziAPI 一键配置失败')
   } finally {
     oneKeyYinziSaving.value = false
+  }
+}
+
+function openOneKeyImageYinzi() {
+  oneKeyImageYinziVisible.value = true
+}
+
+function openOneKeyLaoli() {
+  oneKeyLaoliVisible.value = true
+}
+
+function resetOneKeyLaoli() {
+  oneKeyLaoliForm.value.text_base_url = ''
+  oneKeyLaoliForm.value.image_base_url = 'https://video.laoliimage2.win/v1'
+  oneKeyLaoliForm.value.video_base_url = 'https://video.laoliimage2.win/v1'
+  oneKeyLaoliForm.value.text_api_key = ''
+  oneKeyLaoliForm.value.image_api_key = ''
+  oneKeyLaoliForm.value.video_api_key = ''
+  oneKeyLaoliForm.value.text_model = 'gpt-5.6-sol'
+  oneKeyLaoliForm.value.image_model = 'gpt-image-2'
+  oneKeyLaoliForm.value.video_model = '3.5'
+}
+
+async function submitOneKeyLaoli() {
+  if (!oneKeyLaoliReady.value) return
+  oneKeyLaoliSaving.value = true
+  try {
+    const result = await aiAPI.setupLaoli({
+      ...oneKeyLaoliForm.value,
+      distribution_profile: distributionProfile.value?.id || 'universal',
+    }, { suppressGlobalError: true })
+    const count = Array.isArray(result?.configured) ? result.configured.length : 4
+    ElMessage.success(`已配置 ${count} 个服务；文本、图片、视频使用各自的 URL 与 Key，默认视频为 3.5（即梦 2.5，固定 30 秒）`)
+    oneKeyLaoliVisible.value = false
+    await loadList()
+  } catch (error) {
+    ElMessage.error(error.message || '老李站点一键配置失败')
+  } finally {
+    oneKeyLaoliSaving.value = false
+  }
+}
+
+function resetOneKeyImageYinzi() {
+  oneKeyImageYinziForm.value.text_api_key = ''
+  oneKeyImageYinziForm.value.image_api_key = ''
+  oneKeyImageYinziForm.value.video_api_key = ''
+  oneKeyImageYinziForm.value.text_model = 'gpt-5.6-sol'
+  oneKeyImageYinziForm.value.image_model = 'gpt-image-2'
+  oneKeyImageYinziForm.value.video_model = 'Seedance 2.5-720'
+}
+
+async function submitOneKeyImageYinzi() {
+  if (!oneKeyImageYinziReady.value) return
+  oneKeyImageYinziSaving.value = true
+  try {
+    const result = await aiAPI.setupImageYinzi({
+      ...oneKeyImageYinziForm.value,
+      distribution_profile: distributionProfile.value?.id || undefined,
+    }, { suppressGlobalError: true })
+    const count = Array.isArray(result?.configured) ? result.configured.length : 4
+    ElMessage.success(`银子媒体站已配置 ${count} 个服务：文本、图片、分镜图和视频；默认视频为 Seedance 2.5-720`)
+    oneKeyImageYinziVisible.value = false
+    await loadList()
+  } catch (error) {
+    ElMessage.error(error.message || '银子媒体站一键配置失败')
+  } finally {
+    oneKeyImageYinziSaving.value = false
   }
 }
 
@@ -2785,14 +3115,34 @@ async function loadVendorLock() {
   }
 }
 
+async function loadDistributionProfile() {
+  try {
+    distributionProfile.value = await aiAPI.getDistributionProfile()
+  } catch (_) {
+    // The profile endpoint is additive; older backends keep the configuration
+    // page fully usable with the universal copy fallback.
+    distributionProfile.value = {
+      id: 'universal',
+      name: '通用 NewAPI / sub2 版',
+      description: '文本、图片、视频分别填写 Key；站点能力只作提示。',
+      smart_routing_entry: false,
+    }
+  }
+}
+
 onMounted(async () => {
   await Promise.all([
     loadVendorLock(),
+    loadDistributionProfile(),
     loadList(),
     loadGenerationSettings(),
   ])
-  if (props.initialAction === 'yinzi') {
+  if (props.initialAction === 'yinzi' && distributionProfile.value?.smart_routing_entry) {
     openOneKeyYinzi()
+  } else if (props.initialAction === 'yinzi' && !distributionProfile.value?.smart_routing_entry) {
+    openOneKeyLaoli()
+  } else if (props.initialAction === 'laoli') {
+    openOneKeyLaoli()
   } else if (props.initialAction.startsWith('service:')) {
     openAdd(props.initialAction.slice('service:'.length))
   } else if (props.initialAction.startsWith('capability:')) {
@@ -2846,6 +3196,13 @@ onMounted(async () => {
   justify-content: space-between;
   gap: 8px;
   margin-bottom: 16px;
+}
+.distribution-profile-alert {
+  margin-bottom: 14px;
+}
+.distribution-profile-copy {
+  margin-top: 3px;
+  line-height: 1.5;
 }
 .actions-left {
   display: flex;
@@ -3317,6 +3674,7 @@ code {
   color: var(--text-secondary, #606266);
   font-size: 12px;
 }
+.yinzi-catalog-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
 .yinzi-catalog-version {
   margin-left: 8px;
   color: var(--text-tertiary, #909399);
@@ -3331,6 +3689,35 @@ code {
 .yinzi-field-grid .el-select {
   width: 100%;
 }
+.yinzi-field-help {
+  margin: 6px 0 0;
+  color: var(--text-tertiary, #737b87);
+  font-size: 12px;
+  line-height: 1.55;
+}
+.yinzi-video-scope-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0 0 12px;
+}
+.yinzi-video-scope-summary span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--border-color, #dcdfe6);
+  background: var(--bg-subtle, #f7f8fa);
+  color: var(--text-secondary, #606266);
+  font-size: 11px;
+}
+.yinzi-video-scope-summary strong {
+  overflow: hidden;
+  color: var(--text-primary, #303133);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .yinzi-local-note {
   padding: 10px 12px;
   border-left: 3px solid var(--el-color-primary);
@@ -3340,7 +3727,27 @@ code {
   line-height: 1.6;
 }
 @media (max-width: 720px) {
+  .yinzi-catalog-bar {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .yinzi-catalog-bar > div:first-child {
+    min-width: 0;
+  }
+  .yinzi-catalog-actions {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    width: 100%;
+  }
+  .yinzi-catalog-actions .el-button:first-child {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
   .yinzi-field-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .yinzi-video-scope-summary {
     grid-template-columns: minmax(0, 1fr);
   }
   .yinzi-catalog-version {

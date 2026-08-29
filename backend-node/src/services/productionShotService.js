@@ -287,9 +287,12 @@ function createProductionShotService(db, options = {}) {
 
   function operationOptions(run) {
     const capability = getYinziVideoCapability(run.policy?.video_model);
+    const creativeMin = Math.max(1, Number(run.policy?.video_duration_min) || 1);
+    const creativeMax = Math.max(creativeMin, Number(run.policy?.video_duration_max) || 60);
     return {
-      duration_min: Math.max(5, Number(run.policy?.video_duration_min || capability?.duration_min) || 5),
-      duration_max: Math.max(5, Number(capability?.duration_max) || 15),
+      duration_min: creativeMin,
+      duration_max: creativeMax,
+      provider_capability: capability || null,
       strict_first_frame_supported: capabilitySupportsRole(capability, 'image', 'first_frame'),
     };
   }

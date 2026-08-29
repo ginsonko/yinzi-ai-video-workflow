@@ -49,7 +49,29 @@ export const aiAPI = {
   getYinziCatalog() {
     return request.get('/ai-configs/yinzi/catalog')
   },
-  setupYinzi(body) {
-    return request.post('/ai-configs/yinzi/setup', body)
+  getDistributionProfile(profile) {
+    return request.get('/ai-configs/distribution-profile', {
+      params: profile ? { profile } : undefined,
+    })
+  },
+  setupYinzi(body, options = {}) {
+    return request.post('/ai-configs/yinzi/setup', body, {
+      suppressGlobalError: options.suppressGlobalError === true,
+    })
+  },
+  setupImageYinzi(body, options = {}) {
+    return request.post('/ai-configs/image-yinzi/setup', body, {
+      suppressGlobalError: options.suppressGlobalError === true,
+    })
+  },
+  setupLaoli(body, options = {}) {
+    return request.post('/ai-configs/laoli/setup', body, {
+      suppressGlobalError: options.suppressGlobalError === true,
+    })
+  },
+  previewYinzi(body, options = {}) {
+    return request.post('/ai-configs/yinzi/preview', body, {
+      suppressGlobalError: options.suppressGlobalError === true,
+    })
   }
 }

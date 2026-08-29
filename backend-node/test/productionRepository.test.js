@@ -247,6 +247,32 @@ describe('production workflow repository', () => {
     assert.equal(repo.listReviews(db, run.id, { artifact_id: image.id }).items.at(-1).decision, 'rejected');
   });
 
+  it('filters review history by the requested stage and object scope', () => {
+    const run = makeRun({ idempotency_key: 'review-scope-filter' });
+    const assetText = repo.createArtifact(db, {
+      run_id: run.id, stage: 'asset_text', scope_type: 'prop', scope_id: 'prop-1',
+      title: '银白长剑文字设定', content: { description: '同一柄银白长剑' }, status: 'draft',
+    });
+    const propImage = repo.createArtifact(db, {
+      run_id: run.id, stage: 'asset_images', scope_type: 'prop', scope_id: 'prop-1',
+      title: '银白长剑设定图', content: { included: true }, status: 'draft', media_path: 'images/sword.png',
+    });
+    const sceneImage = repo.createArtifact(db, {
+      run_id: run.id, stage: 'asset_images', scope_type: 'scene', scope_id: 'scene-1',
+      title: '断崖古台设定图', content: { included: true }, status: 'draft', media_path: 'images/cliff.png',
+    });
+    repo.reviewArtifact(db, assetText.id, { reviewer_type: 'ai', decision: 'rejected', reason: '文字锚点不够具体' });
+    repo.reviewArtifact(db, propImage.id, { reviewer_type: 'ai', decision: 'rejected', reason: '不是道具四视图' });
+    repo.reviewArtifact(db, sceneImage.id, { reviewer_type: 'ai', decision: 'rejected', reason: '不是同一场景四视图' });
+
+    const scoped = repo.listReviews(db, run.id, {
+      stage: 'asset_images', scope_type: 'prop', scope_id: 'prop-1', decision: 'rejected', page_size: 20,
+    });
+    assert.equal(scoped.pagination.total, 1);
+    assert.equal(scoped.items[0].artifact_id, propImage.id);
+    assert.equal(scoped.items[0].reason, '不是道具四视图');
+  });
+
   it('keeps revisions and invalidates only dependent downstream artifacts', () => {
     const run = makeRun();
     const scriptV1 = repo.createArtifact(db, {
@@ -339,6 +365,34 @@ describe('production workflow repository', () => {
       media_path: 'videos/final.mp4', mime_type: 'video/mp4',
     });
     assert.equal(repo.stageCompletion(db, run.id, 'final_edit').complete, true);
+  });
+
+  it('keeps an empty series selection valid but rejects stale explicit asset references before creating a run', () => {
+    const group = require('../src/services/seriesGroupService').createGroup(db, { name: '续集校验' });
+    const empty = repo.createRun(db, {
+      drama_id: 1, episode_id: 1, idempotency_key: 'series-empty-selection',
+      input: { story: '没有选择复用资产的续集' },
+      policy: { series_group_id: group.id, series_asset_refs: [] },
+    }).run;
+    assert.equal(empty.policy.series_group_id, group.id);
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM series_group_episodes WHERE series_group_id = ?').get(group.id).n, 1);
+    assert.throws(() => repo.createRun(db, {
+      drama_id: 1, episode_id: 1, idempotency_key: 'series-stale-asset',
+      input: { story: '引用不存在资产' },
+      policy: { series_group_id: group.id, series_asset_refs: [{ series_asset_id: 999 }] },
+    }), (error) => error.code === 'SERIES_ASSET_NOT_FOUND');
+    assert.equal(repo.listRuns(db, { drama_id: 1 }).items.some((run) => run.idempotency_key === 'series-stale-asset'), false);
+  });
+
+  it('rejects an explicit version from another asset instead of silently using the current version', () => {
+    const series = require('../src/services/seriesGroupService');
+    const group = series.createGroup(db, { name: '版本校验' });
+    const asset = series.upsertAsset(db, group.id, { asset_key: 'hero', asset_type: 'character', content: { name: 'A' } }).assets[0];
+    assert.throws(() => repo.createRun(db, {
+      drama_id: 1, episode_id: 1, idempotency_key: 'series-wrong-version',
+      input: { story: '引用错误版本' },
+      policy: { series_group_id: group.id, series_asset_refs: [{ series_asset_id: asset.id, series_asset_version_id: 9876 }] },
+    }), (error) => error.code === 'SERIES_ASSET_VERSION_NOT_FOUND');
   });
 
   it('serializes executor ownership with expiring leases', () => {
@@ -475,5 +529,49 @@ describe('production workflow repository', () => {
     assert.equal(result.run.waiting_reason, 'manual_content_required');
     assert.equal(result.run.next_stage_strategy, 'manual_add');
     assert.throws(() => repo.transitionRun(db, run.id, { next_stage_strategy: 'auto_generate' }), /未处理内容/);
+  });
+});
+
+describe('bounded fallback budget repository', () => {
+  it('reserves idempotently, consumes children within the cap, and releases unused capacity', () => {
+    const run = makeRun({
+      idempotency_key: 'fallback-budget-idempotent',
+      budget: { max_cost_usd: 10 },
+    });
+    const amount = 9500000;
+    const first = repo.reserveFallbackBudget(db, run.id, {
+      reservation_key: 'shot:1:seedance-fallback', amount_microusd: amount,
+    });
+    const duplicate = repo.reserveFallbackBudget(db, run.id, {
+      reservation_key: 'shot:1:seedance-fallback', amount_microusd: amount,
+    });
+    assert.equal(first.reused, false);
+    assert.equal(duplicate.reused, true);
+    assert.equal(duplicate.reservation.amount_microusd, amount);
+    assert.equal(repo.getRun(db, run.id).runtime.fallback_reserved_microusd, amount);
+    assert.equal(repo.consumeFallbackBudget(db, run.id, 'shot:1:seedance-fallback', 3000000).remaining_microusd, 6500000);
+    assert.throws(
+      () => repo.consumeFallbackBudget(db, run.id, 'shot:1:seedance-fallback', 7000000),
+      (error) => error.code === 'COST_FALLBACK_SEGMENT_BUDGET_EXHAUSTED',
+    );
+    const released = repo.releaseFallbackBudget(db, run.id, 'shot:1:seedance-fallback', 'test_converged');
+    assert.equal(released.released_microusd, 6500000);
+    assert.equal(repo.getRun(db, run.id).runtime.fallback_reserved_microusd, 0);
+    assert.equal(repo.releaseFallbackBudget(db, run.id, 'shot:1:seedance-fallback').released_microusd, 0);
+  });
+
+  it('does not reserve a fallback chain when its worst case exceeds the run cap', () => {
+    const run = makeRun({
+      idempotency_key: 'fallback-budget-exhausted',
+      budget: { max_cost_usd: 9 },
+    });
+    assert.throws(
+      () => repo.reserveFallbackBudget(db, run.id, {
+        reservation_key: 'shot:1:seedance-fallback', amount_microusd: 9500000,
+      }),
+      (error) => error.code === 'COST_FALLBACK_BUDGET_EXHAUSTED',
+    );
+    assert.equal(repo.getRun(db, run.id).runtime.fallback_reserved_microusd, undefined);
+    assert.equal(repo.listActions(db, run.id).items.length, 0);
   });
 });

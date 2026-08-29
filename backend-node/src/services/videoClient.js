@@ -7,7 +7,6 @@ const { uploadLocalImageToProxy, uploadToImageProxy } = require('./uploadService
 const imageClient = require('./imageClient');
 const {
   getYinziVideoCapability,
-  capabilitySupportsRole,
   clampYinziVideoDuration,
 } = require('./yinziVideoCapabilities');
 const { prepareYinziReferenceVideo, probeReferenceVideo } = require('./yinziReferenceMedia');
@@ -24,6 +23,7 @@ const {
   unsafeDecodeKlingJwtPayload,
   jwtPartLengths,
 } = require('./klingJwt');
+const { identityForConfig, attachSnapshotFields } = require('./productionConfigIdentity');
 
 /**
  * ?? provider ??????????api_protocol ??????????
@@ -974,6 +974,234 @@ function getAgnesApiRoot(baseUrl) {
   return base || 'https://apihub.agnes-ai.com';
 }
 
+function replaceProviderPathParams(template, values = {}) {
+  let output = String(template || '').trim();
+  const encodedTaskId = encodeURIComponent(String(values.taskId || values.id || '').trim());
+  output = output
+    .replace(/\{videoId\}/gi, encodedTaskId)
+    .replace(/\{video_id\}/gi, encodedTaskId)
+    .replace(/\{taskId\}/gi, encodedTaskId)
+    .replace(/\{task_id\}/gi, encodedTaskId)
+    .replace(/\{id\}/gi, encodedTaskId);
+  return output;
+}
+
+function buildProviderEndpointUrl(baseUrl, template, fallback, values = {}) {
+  let endpoint = replaceProviderPathParams(template || fallback, values);
+  if (/^https?:\/\//i.test(endpoint)) return endpoint;
+  if (!endpoint.startsWith('/')) endpoint = '/' + endpoint;
+  const base = String(baseUrl || 'https://api.yinziapi.top/v1').replace(/\/+$/, '');
+  try {
+    const parsed = new URL(base);
+    const basePath = parsed.pathname.replace(/\/+$/, '');
+    if ((endpoint === '/v1' || endpoint.startsWith('/v1/')) && /\/v1$/i.test(basePath)) {
+      parsed.pathname = basePath.replace(/\/v1$/i, '') + endpoint;
+      parsed.search = '';
+      parsed.hash = '';
+      return parsed.toString().replace(/\/$/, '');
+    }
+  } catch (_) {}
+  return base + endpoint;
+}
+
+function normalizeYinziProtocolSnapshot(value = {}) {
+  const raw = value?.provider_protocol_snapshot && typeof value.provider_protocol_snapshot === 'object'
+    ? value.provider_protocol_snapshot : value;
+  const text = (...values) => String(values.find((item) => item != null && String(item).trim()) || '').trim();
+  return {
+    contract: text(raw.contract, raw.provider_contract),
+    create_path: text(raw.create_path, raw.provider_create_path, raw.endpoint),
+    query_path: text(raw.query_path, raw.provider_query_path, raw.query_endpoint),
+    content_path: text(raw.content_path, raw.provider_content_path, raw.content_endpoint),
+    contract_revision: text(raw.contract_revision),
+    source: text(raw.source, raw.capability_source),
+  };
+}
+
+function findYinziCatalogSnapshot(config) {
+  const settings = parseConfigSettingsJson(config);
+  if (settings.model_catalog_snapshot && typeof settings.model_catalog_snapshot === 'object') {
+    return settings.model_catalog_snapshot;
+  }
+  if (config?.model_catalog_snapshot && typeof config.model_catalog_snapshot === 'object') {
+    return config.model_catalog_snapshot;
+  }
+  return null;
+}
+
+function findYinziCatalogModel(config, model) {
+  const snapshot = findYinziCatalogSnapshot(config);
+  const models = Array.isArray(snapshot?.models) ? snapshot.models : [];
+  const target = String(model || '').trim().toLowerCase();
+  return models.find((item) => String(item?.model || '').trim().toLowerCase() === target) || null;
+}
+
+function cloneCapabilitySnapshot(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  try { return JSON.parse(JSON.stringify(value)); } catch (_) { return null; }
+}
+
+function hasOwn(object, key) {
+  return Boolean(object && Object.prototype.hasOwnProperty.call(object, key));
+}
+
+function capabilityHintValue(hint) {
+  if (!hint || typeof hint !== 'object' || Array.isArray(hint)) return { present: false, value: null };
+  for (const key of ['capability_snapshot', 'capability', 'capabilities']) {
+    if (hasOwn(hint, key)) return { present: true, value: cloneCapabilitySnapshot(hint[key]) };
+  }
+  return { present: false, value: null };
+}
+
+function sameOpaqueModel(left, right) {
+  const a = String(left || '').trim().toLowerCase();
+  const b = String(right || '').trim().toLowerCase();
+  return Boolean(a && b && a === b);
+}
+
+/**
+ * Resolve the one capability contract that governs a paid task. An explicit
+ * task snapshot (including an explicit null/unknown contract) is authoritative;
+ * live config and bundled profiles are compatibility fallbacks for older rows.
+ */
+function resolveYinziCapabilityContext(config, model, hint = null) {
+  const targetModel = String(model || '').trim();
+  const hinted = hint && typeof hint === 'object' && !Array.isArray(hint) ? hint : {};
+  const hintedModel = String(hinted.capability_model || hinted.model || '').trim();
+  const hintedCapability = capabilityHintValue(hinted);
+  if (hintedCapability.present && (!hintedModel || sameOpaqueModel(hintedModel, targetModel))) {
+    return {
+      model: targetModel,
+      capability: hintedCapability.value,
+      capability_source: String(hinted.capability_source || hinted.source || 'task_snapshot'),
+      contract_status: String(hinted.contract_status || (hintedCapability.value ? 'known' : 'missing')),
+      catalog_verified: hinted.catalog_verified === true,
+      resolution_source: 'task_snapshot',
+    };
+  }
+
+  const catalogItem = findYinziCatalogModel(config, targetModel);
+  if (catalogItem && hasOwn(catalogItem, 'capabilities')) {
+    const capability = cloneCapabilitySnapshot(catalogItem.capabilities);
+    return {
+      model: targetModel,
+      capability,
+      capability_source: String(catalogItem.capability_source || (capability ? 'model_catalog_snapshot' : 'unknown')),
+      contract_status: String(catalogItem.contract_status || (capability ? 'known' : 'missing')),
+      catalog_verified: catalogItem.catalog_verified === true,
+      resolution_source: 'model_catalog_snapshot',
+    };
+  }
+
+  const builtin = cloneCapabilitySnapshot(getYinziVideoCapability(targetModel));
+  return {
+    model: targetModel,
+    capability: builtin,
+    capability_source: builtin ? 'builtin_fallback' : 'unknown',
+    contract_status: builtin ? 'known' : 'missing',
+    catalog_verified: false,
+    resolution_source: builtin ? 'builtin_fallback' : 'unknown',
+  };
+}
+
+function resolveYinziProtocolSnapshot(config, model, hint = null) {
+  const hinted = normalizeYinziProtocolSnapshot(hint || {});
+  const catalogItem = findYinziCatalogModel(config, model);
+  const catalog = normalizeYinziProtocolSnapshot({
+    ...(catalogItem?.capabilities || {}),
+    ...(catalogItem || {}),
+  });
+  const builtin = normalizeYinziProtocolSnapshot(getYinziVideoCapability(model) || {});
+  const configured = normalizeYinziProtocolSnapshot({
+    contract: config?.provider_contract,
+    create_path: config?.endpoint,
+    query_path: config?.query_endpoint,
+    content_path: config?.content_endpoint,
+  });
+  const pick = (field, fallback = '') => hinted[field] || catalog[field] || configured[field] || builtin[field] || fallback;
+  return {
+    contract: pick('contract', 'yinzi-openai-video-v1'),
+    create_path: pick('create_path', '/videos'),
+    query_path: pick('query_path', '/videos/{taskId}'),
+    content_path: pick('content_path', '/videos/{taskId}/content'),
+    contract_revision: pick('contract_revision'),
+    source: hinted.source ? 'routing_receipt'
+      : catalogItem ? 'model_catalog_snapshot'
+        : configured.create_path || configured.query_path ? 'video_config'
+          : builtin.contract ? 'builtin_fallback' : 'compatibility_default',
+  };
+}
+
+function buildProviderConfigSnapshot(config, model, hint = null) {
+  if (!config) return null;
+  const hintObject = hint && typeof hint === 'object' ? hint : {};
+  const settings = parseConfigSettingsJson(config);
+  const smartRouting = String(settings.routing_mode || '').toLowerCase() === 'smart'
+    || settings.smart_routing_enabled === true
+    || settings.smart_routing === true
+    || hintObject.smart_routing === true;
+  const inferredAutomaticRoute = hintObject.automatic_route === true || hintObject.automatic === true;
+  const requestedModelExplicit = typeof hintObject.requested_model_explicit === 'boolean'
+    ? hintObject.requested_model_explicit
+    : inferredAutomaticRoute ? false : Boolean(String(model || '').trim());
+  const snapshot = {
+    config_id: config.id,
+    provider: config.provider || null,
+    api_protocol: config.api_protocol || null,
+    base_url: config.base_url || null,
+    endpoint: config.endpoint || null,
+    query_endpoint: config.query_endpoint || null,
+    content_endpoint: config.content_endpoint || null,
+    model: model || config.default_model || null,
+  };
+  const configIdentity = identityForConfig(config);
+  const identitySnapshot = attachSnapshotFields(snapshot, configIdentity);
+  if (String(config.provider || '').toLowerCase() === 'yinzi') {
+    const capabilityContext = resolveYinziCapabilityContext(config, identitySnapshot.model, hintObject);
+    identitySnapshot.routing_mode = String(settings.routing_mode || (smartRouting ? 'smart' : 'group'));
+    identitySnapshot.smart_routing = smartRouting;
+    identitySnapshot.smart_routing_enabled = smartRouting;
+    identitySnapshot.requested_model_explicit = requestedModelExplicit;
+    identitySnapshot.automatic_route = inferredAutomaticRoute
+      || (!requestedModelExplicit && !hintObject.manual_model);
+    identitySnapshot.smart_routing_candidate = hintObject.smart_routing_candidate === true;
+    identitySnapshot.smart_route_recovery_attempted = hintObject.smart_route_recovery_attempted === true;
+    const modelCatalogSnapshot = findYinziCatalogSnapshot(config);
+    if (modelCatalogSnapshot) {
+      identitySnapshot.model_catalog_snapshot = modelCatalogSnapshot;
+    }
+    identitySnapshot.capability_model = capabilityContext.model || identitySnapshot.model;
+    identitySnapshot.capability_snapshot = capabilityContext.capability;
+    identitySnapshot.capability_source = capabilityContext.capability_source;
+    identitySnapshot.contract_status = capabilityContext.contract_status;
+    identitySnapshot.catalog_verified = capabilityContext.catalog_verified;
+  }
+  if (resolveVideoProtocol(config, model) === 'yinzi') {
+    const protocol = resolveYinziProtocolSnapshot(config, model, hint);
+    identitySnapshot.provider_contract = protocol.contract || null;
+    identitySnapshot.endpoint = protocol.create_path || identitySnapshot.endpoint;
+    identitySnapshot.query_endpoint = protocol.query_path || identitySnapshot.query_endpoint;
+    identitySnapshot.content_endpoint = protocol.content_path || identitySnapshot.content_endpoint;
+    identitySnapshot.contract_revision = protocol.contract_revision || null;
+    identitySnapshot.protocol_source = protocol.source;
+  }
+  return identitySnapshot;
+}
+
+function applyProviderConfigSnapshot(config, snapshot) {
+  if (!config || !snapshot || typeof snapshot !== 'object') return config;
+  return {
+    ...config,
+    provider: snapshot.provider || config.provider,
+    api_protocol: snapshot.api_protocol || config.api_protocol,
+    base_url: snapshot.base_url || config.base_url,
+    endpoint: snapshot.endpoint || config.endpoint,
+    query_endpoint: snapshot.query_endpoint || config.query_endpoint,
+    content_endpoint: snapshot.content_endpoint || config.content_endpoint,
+    provider_contract: snapshot.provider_contract || config.provider_contract,
+  };
+}
+
 /** 内置/历史默认查询路径：由代码统一按 new-api 拼装，忽略配置里的旧值 */
 function isAgnesBuiltinQueryEndpoint(ep) {
   const s = String(ep || '').trim();
@@ -1010,12 +1238,24 @@ function buildAgnesPollUrl(config, pollId) {
 }
 
 function buildYinziPollUrl(config, pollId) {
-  const root = getAgnesApiRoot(config.base_url);
-  return `${root}/v1/videos/${encodeURIComponent(String(pollId || '').trim())}`;
+  return buildProviderEndpointUrl(
+    config.base_url,
+    config.query_endpoint,
+    '/videos/{taskId}',
+    { taskId: pollId }
+  );
 }
 
 function buildYinziContentUrl(config, pollId) {
-  return `${buildYinziPollUrl(config, pollId)}/content`;
+  if (String(config.content_endpoint || '').trim()) {
+    return buildProviderEndpointUrl(
+      config.base_url,
+      config.content_endpoint,
+      '/videos/{taskId}/content',
+      { taskId: pollId }
+    );
+  }
+  return `${buildYinziPollUrl(config, pollId).replace(/\/$/, '')}/content`;
 }
 
 function normalizeYinziAssetPromptReceipt(payload, expectedPrompt, assetId, checkedAt = new Date().toISOString()) {
@@ -2778,8 +3018,8 @@ function appendContractWarning(warnings, code) {
   if (value && !warnings.includes(value)) warnings.push(value);
 }
 
-function buildYinziVideoRequest({ model, prompt, duration, aspect_ratio, resolution, references }) {
-  const seconds = clampYinziVideoDuration(model, duration);
+function buildYinziVideoRequest({ model, prompt, duration, aspect_ratio, resolution, references, capability }) {
+  const seconds = clampYinziVideoDuration(model, duration, capability);
   const body = {
     model: String(model || ''),
     prompt: String(prompt || ''),
@@ -2817,13 +3057,22 @@ function yinziReference(type, role, source) {
     : { type, role, url: value };
 }
 
-function buildYinziReferences(input, resolved = {}) {
+function capabilityRoleState(capability, mediaType, role) {
+  const roles = capability?.roles?.[mediaType];
+  if (!Array.isArray(roles)) return 'unknown';
+  return roles.includes(role) ? 'supported' : 'unsupported';
+}
+
+function buildYinziReferences(input, resolved = {}, capabilityInput = undefined) {
   const refs = [];
   const rawImages = Array.isArray(input?.reference_urls) ? input.reference_urls.filter(Boolean) : [];
-  const capability = getYinziVideoCapability(input?.model);
-  const advisory = normalizeContractValidationMode(input?.contract_validation_mode) === 'advisory';
-  const strictFirstSupported = capabilitySupportsRole(capability, 'image', 'first_frame');
-  const strictLastSupported = capabilitySupportsRole(capability, 'image', 'last_frame');
+  const capability = capabilityInput === undefined
+    ? getYinziVideoCapability(input?.model)
+    : capabilityInput;
+  const firstRoleState = capabilityRoleState(capability, 'image', 'first_frame');
+  const lastRoleState = capabilityRoleState(capability, 'image', 'last_frame');
+  const firstRole = firstRoleState === 'unsupported' ? 'reference' : 'first_frame';
+  const lastRole = lastRoleState === 'unsupported' ? 'reference' : 'last_frame';
   const appendImage = (role, source) => {
     const reference = yinziReference('image', role, source);
     if (!reference) return;
@@ -2831,16 +3080,15 @@ function buildYinziReferences(input, resolved = {}) {
     refs.push(reference);
   };
   if (rawImages.length) {
-    if (resolved.first && (strictFirstSupported || advisory)) appendImage(strictFirstSupported ? 'first_frame' : 'reference', resolved.first);
+    if (resolved.first) appendImage(firstRole, resolved.first);
     for (const source of resolved.images || resolved.references || []) appendImage('reference', source);
-    if (resolved.last && (strictLastSupported || advisory)) appendImage(strictLastSupported ? 'last_frame' : 'reference', resolved.last);
-  } else if (strictFirstSupported || strictLastSupported) {
-    if (resolved.first) appendImage(strictFirstSupported ? 'first_frame' : (advisory ? 'reference' : 'first_frame'), resolved.first);
-    if (resolved.last) appendImage(strictLastSupported ? 'last_frame' : (advisory ? 'reference' : 'last_frame'), resolved.last);
-  } else if (isYinziAizzzVideoModel(input?.model) || advisory) {
-    appendImage('reference', resolved.first);
-    appendImage('reference', resolved.last);
+    if (resolved.last) appendImage(lastRole, resolved.last);
+  } else if (capability) {
+    if (resolved.first) appendImage(firstRole, resolved.first);
+    if (resolved.last) appendImage(lastRole, resolved.last);
   } else {
+    // Unknown capability is not evidence that a role is unsupported. Preserve
+    // the user's explicit semantics and let the provider return the contract.
     appendImage('first_frame', resolved.first);
     appendImage('last_frame', resolved.last);
   }
@@ -2867,8 +3115,10 @@ function dedupeReferenceInputs(values) {
   return result;
 }
 
-function validateYinziReferenceCounts(model, images, videos, audios) {
-  const capability = getYinziVideoCapability(model);
+function validateYinziReferenceCounts(model, images, videos, audios, capabilityInput = undefined) {
+  const capability = capabilityInput === undefined
+    ? getYinziVideoCapability(model)
+    : capabilityInput;
   if (!capability) return null;
   const checks = [
     ['图片', images.length, capability.max_images],
@@ -2876,9 +3126,12 @@ function validateYinziReferenceCounts(model, images, videos, audios) {
     ['音频', audios.length, capability.max_audios],
   ];
   for (const [label, actual, maximum] of checks) {
-    if (actual > maximum) return `${model} 最多支持 ${maximum} 个参考${label}，当前为 ${actual} 个；已在提交前停止。`;
+    if (Number.isFinite(Number(maximum)) && actual > Number(maximum)) {
+      return `${model} 最多支持 ${maximum} 个参考${label}，当前为 ${actual} 个；已在提交前停止。`;
+    }
   }
-  if (images.length + videos.length + audios.length > capability.max_total_references) {
+  if (Number.isFinite(Number(capability.max_total_references))
+    && images.length + videos.length + audios.length > Number(capability.max_total_references)) {
     return `${model} 的参考媒体总数超过 ${capability.max_total_references}；已在提交前停止。`;
   }
   return null;
@@ -3020,12 +3273,15 @@ async function resolveYinziReferenceSource(config, raw, type, capability, opts, 
 }
 
 async function callYinziVideoApi(db, config, log, opts) {
-  const base = String(config.base_url || 'https://api.yinziapi.top/v1').replace(/\/$/, '');
-  let endpoint = config.endpoint || '/videos';
-  if (!endpoint.startsWith('/')) endpoint = '/' + endpoint;
-  const url = base + endpoint;
+  const endpoint = String(config.endpoint || '/videos');
+  const url = buildProviderEndpointUrl(config.base_url, endpoint, '/videos');
 
-  const capability = getYinziVideoCapability(opts.model);
+  const capabilityContext = resolveYinziCapabilityContext(
+    config,
+    opts.model,
+    opts.capability_context || opts.provider_config_snapshot || null
+  );
+  const capability = capabilityContext.capability;
   const contractValidationMode = normalizeContractValidationMode(opts.contract_validation_mode);
   const contractWarnings = [];
   opts.contract_warnings = contractWarnings;
@@ -3036,7 +3292,10 @@ async function callYinziVideoApi(db, config, log, opts) {
       mode: contractValidationMode,
       advisory: contractValidationMode === 'advisory',
       warnings: [...contractWarnings],
-      catalog_verified: Boolean(capability),
+      catalog_verified: capabilityContext.catalog_verified === true,
+      capability_source: capabilityContext.capability_source,
+      contract_status: capabilityContext.contract_status,
+      resolution_source: capabilityContext.resolution_source,
       model: String(opts.model || ''),
     },
   });
@@ -3088,26 +3347,31 @@ async function callYinziVideoApi(db, config, log, opts) {
   const rawAudioUrls = dedupeReferenceInputs(opts.reference_audio_urls);
   const legacyFirst = String(opts.first_frame_url || opts.image_url || '').trim();
   const legacyLast = String(opts.last_frame_url || '').trim();
-  const strictFirstSupported = capabilitySupportsRole(capability, 'image', 'first_frame');
-  const strictLastSupported = capabilitySupportsRole(capability, 'image', 'last_frame');
+  const firstRoleState = capabilityRoleState(capability, 'image', 'first_frame');
+  const lastRoleState = capabilityRoleState(capability, 'image', 'last_frame');
+  const strictFirstSupported = firstRoleState === 'supported';
+  const strictLastSupported = lastRoleState === 'supported';
+  const strictFirstUnsupported = firstRoleState === 'unsupported';
+  const strictLastUnsupported = lastRoleState === 'unsupported';
   if (contractValidationMode === 'advisory'
-    && legacyFirst && rawReferenceUrls.length && isYinziAizzzVideoModel(opts.model) && !strictFirstSupported) {
+    && legacyFirst && strictFirstUnsupported) {
     warn('first_frame_role_unsupported');
   }
   if (contractValidationMode === 'strict'
-    && legacyFirst && rawReferenceUrls.length && isYinziAizzzVideoModel(opts.model) && !strictFirstSupported) {
+    && legacyFirst && strictFirstUnsupported) {
     return publishSubmission('not_sent', {
-      error: '该 YinziAPI Seedance 路由只有通用 reference，不能同时把 first_frame 当作严格首帧；已在提交前停止，未创建上游任务。',
+      error: '该 YinziAPI 模型能力提示仅支持通用 reference，不能同时把 first_frame 当作严格首帧提交；已在提交前停止，未创建上游任务。',
     }, { phase: 'local_reference_role_validation' });
   }
   const rawImageCount = rawReferenceUrls.length
-    + (legacyFirst && (contractValidationMode === 'advisory' || strictFirstSupported || !rawReferenceUrls.length) ? 1 : 0)
-    + (legacyLast && (contractValidationMode === 'advisory' || strictLastSupported) ? 1 : 0);
+    + (legacyFirst ? 1 : 0)
+    + (legacyLast ? 1 : 0);
   const countError = validateYinziReferenceCounts(
     opts.model,
     { length: rawImageCount },
     rawVideoUrls,
-    rawAudioUrls
+    rawAudioUrls,
+    capability
   );
   if (countError) {
     warn('reference_count_over_contract');
@@ -3160,13 +3424,13 @@ async function callYinziVideoApi(db, config, log, opts) {
   }
 
   if (contractValidationMode === 'advisory'
-    && legacyLast && isYinziAizzzVideoModel(opts.model) && !strictLastSupported) {
+    && legacyLast && strictLastUnsupported) {
     warn('last_frame_role_unsupported');
   }
   if (contractValidationMode === 'strict'
-    && legacyLast && isYinziAizzzVideoModel(opts.model) && !strictLastSupported) {
+    && legacyLast && strictLastUnsupported) {
     return publishSubmission('not_sent', {
-      error: '该 YinziAPI Seedance 路由使用通用 reference，不支持 last_frame 角色；已在提交前停止，未创建上游任务。',
+      error: '该 YinziAPI 模型能力提示使用通用 reference，不支持 last_frame 角色；已在提交前停止，未创建上游任务。',
     }, { phase: 'local_reference_role_validation' });
   }
 
@@ -3203,17 +3467,28 @@ async function callYinziVideoApi(db, config, log, opts) {
 
   let first = null;
   let last = null;
-  if (contractValidationMode === 'advisory' || !rawReferenceUrls.length || strictFirstSupported || strictLastSupported) {
+  if (contractValidationMode === 'advisory'
+    || !rawReferenceUrls.length
+    || strictFirstSupported
+    || strictLastSupported
+    || firstRoleState === 'unknown'
+    || lastRoleState === 'unknown') {
     const rawFirst = legacyFirst;
     const rawLast = legacyLast;
-    if (rawFirst && (!rawReferenceUrls.length || strictFirstSupported || contractValidationMode === 'advisory')) {
+    if (rawFirst && (!rawReferenceUrls.length
+      || strictFirstSupported
+      || firstRoleState === 'unknown'
+      || contractValidationMode === 'advisory')) {
       try {
         first = await resolveYinziReferenceSource(config, rawFirst, 'image', capability, opts, log, 'first');
       } catch (error) {
         return publishSubmission('not_sent', { error: error.message }, { phase: 'first_frame_upload' });
       }
     }
-    if (rawLast && (!rawReferenceUrls.length || strictLastSupported || contractValidationMode === 'advisory')) {
+    if (rawLast && (!rawReferenceUrls.length
+      || strictLastSupported
+      || lastRoleState === 'unknown'
+      || contractValidationMode === 'advisory')) {
       try {
         last = await resolveYinziReferenceSource(config, rawLast, 'image', capability, opts, log, 'last');
       } catch (error) {
@@ -3232,7 +3507,7 @@ async function callYinziVideoApi(db, config, log, opts) {
     audios: resolvedAudios,
     first,
     last,
-  });
+  }, capability);
   const body = buildYinziVideoRequest({
     model: opts.model,
     prompt: opts.prompt,
@@ -3240,6 +3515,7 @@ async function callYinziVideoApi(db, config, log, opts) {
     aspect_ratio: opts.aspect_ratio,
     resolution: opts.resolution,
     references,
+    capability,
   });
   logVideoPostRequest(log, 'YinziAPI', url, body, opts.video_gen_id, {
     model: body.model,
@@ -3298,7 +3574,14 @@ async function callYinziVideoApi(db, config, log, opts) {
     } catch (_) {
       if (raw) message += ' - ' + raw.slice(0, 300);
     }
-    const rejected = res.status >= 400 && res.status < 500;
+    // Yinzi's smart router uses HTTP 503 for a deterministic pre-create
+    // rejection. It carries no task authority and therefore has the same
+    // local accounting semantics as a normal provider 4xx. Keep unrelated
+    // 5xx/transport failures ambiguous because they may have been accepted.
+    const deterministicNoEligibleRoute = errorCode === 'get_channel_failed'
+      && /no eligible automatic route/i.test(message)
+      && !requestId;
+    const rejected = (res.status >= 400 && res.status < 500) || deterministicNoEligibleRoute;
     return publishSubmission(rejected ? 'rejected' : 'ambiguous', {
       error: message,
       ambiguous_submission: !rejected,
@@ -4174,13 +4457,19 @@ async function callVideoApi(db, log, opts) {
     storage_local_path,
     video_gen_id
   } = opts;
-  const config = getDefaultVideoConfig(db, preferredModel, opts.video_config_id);
-  if (!config) {
+  const selectedConfig = getDefaultVideoConfig(db, preferredModel, opts.video_config_id);
+  if (!selectedConfig) {
     throw new Error('???????????AI ?????? video ?????????');
   }
+  const providerConfigSnapshot = opts.provider_config_snapshot
+    || buildProviderConfigSnapshot(selectedConfig, preferredModel, opts.routing_receipt);
+  const config = applyProviderConfigSnapshot(selectedConfig, providerConfigSnapshot);
   const model = getModelFromConfig(config, preferredModel);
   const provider = (config.provider || '').toLowerCase();
   const protocol = resolveVideoProtocol(config, preferredModel);
+  const yinziCapabilityContext = protocol === 'yinzi'
+    ? resolveYinziCapabilityContext(config, model, providerConfigSnapshot)
+    : null;
   if (db && opts.drama_id && VIDEO_PROTOCOLS_SUPPORT_SD2_ASSET_SCHEME.has(protocol)) {
     opts = applySeedance2CertifiedAssetUrlsToVideoOpts(db, log, opts);
   }
@@ -4399,6 +4688,10 @@ async function callVideoApi(db, log, opts) {
       files_base_url: opts.files_base_url,
       storage_local_path: opts.storage_local_path,
       video_gen_id: opts.video_gen_id,
+      contract_validation_mode: opts.contract_validation_mode,
+      provider_config_snapshot: providerConfigSnapshot,
+      capability_context: yinziCapabilityContext,
+      on_submission_state: opts.on_submission_state,
     });
   }
 
@@ -4971,6 +5264,10 @@ module.exports = {
   buildAgnesPollUrl,
   buildYinziPollUrl,
   buildYinziContentUrl,
+  buildProviderConfigSnapshot,
+  applyProviderConfigSnapshot,
+  resolveYinziProtocolSnapshot,
+  resolveYinziCapabilityContext,
   normalizeYinziAssetPromptReceipt,
   inspectYinziAssetPromptReceipt,
   getAgnesApiRoot,

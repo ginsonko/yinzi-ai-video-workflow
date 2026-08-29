@@ -164,10 +164,12 @@ it('runs all 11 production stages with real local media, strict merge, manifest,
     const videoRequests = [];
     const service = createProductionService(db, cfg, log, {
       generateText: async (_user, system) => {
-        if (system.includes('专业短片编剧')) return screenplay;
-        if (system.includes('影视前期资产总监')) return JSON.stringify(resources);
-        if (system.includes('电影导演和分镜师')) return JSON.stringify({ shots });
-        if (system.includes('continuity editor revising one rough shot')) {
+        if (system.includes('输出中文纯文本剧本')) return screenplay;
+        if (system.includes('{"characters"') && system.includes('"scenes"') && system.includes('"props"')) {
+          return JSON.stringify(resources);
+        }
+        if (system.includes('{"shots"')) return JSON.stringify({ shots });
+        if (/逐镜拍摄现场的连续性导演|continuity editor revising one rough shot/.test(system)) {
           const shot = {
             ...shots[refinementIndex],
             continuity_in: `${shots[refinementIndex - 1].continuity_out}（来自已批准前镜）`,

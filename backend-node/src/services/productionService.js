@@ -13,7 +13,15 @@ const videoService = require('./videoService');
 const mediaValidation = require('./productionMediaValidation');
 const autonomy = require('./productionAutonomy');
 const reviewMedia = require('./productionReviewMedia');
-const { getYinziVideoCapability, capabilitySupportsRole } = require('./yinziVideoCapabilities');
+const {
+  getYinziVideoCapability,
+  capabilitySupportsRole,
+  providerDurationForCapability,
+} = require('./yinziVideoCapabilities');
+const {
+  isSeedance25Model,
+  isFallbackEligibleFailure,
+} = require('./yinziSmartRouteRecovery');
 const { classifyShotRoute, routingMaterialSignature } = require('./productionVideoRouter');
 const { hasLocalFfmpeg, hasLocalFfprobe } = require('../utils/ffmpegPath');
 const promptRegistry = require('./productionPromptRegistry');
@@ -22,6 +30,7 @@ const accounting = require('./productionRuntimeAccounting');
 const costLedger = require('./productionCostLedger');
 const aiConfigService = require('./aiConfigService');
 const automationPreferences = require('./productionAutomationPreferences');
+const seriesGroupService = require('./seriesGroupService');
 
 const PRODUCTION_TEXT_SILENCE_TIMEOUT_MS = 180000;
 
@@ -84,6 +93,20 @@ function compareShots(left, right) {
   if (leftHasNumber && rightHasNumber && leftNumber !== rightNumber) return leftNumber - rightNumber;
   if (leftHasNumber !== rightHasNumber) return leftHasNumber ? -1 : 1;
   return String(left.scope_id).localeCompare(String(right.scope_id), undefined, { numeric: true });
+}
+
+function shotExecutionDuration(content = {}, policy = {}) {
+  const explicit = Number(content.provider_duration_seconds
+    ?? content.duration_plan?.provider_seconds);
+  if (Number.isFinite(explicit) && explicit > 0) return explicit;
+  const shotId = content.scope_id ?? content.number;
+  const overrides = policy.video_model_overrides && typeof policy.video_model_overrides === 'object'
+    ? policy.video_model_overrides : {};
+  const model = String(overrides[String(shotId)] || policy.video_model || '').trim();
+  const capability = getYinziVideoCapability(model);
+  if (capability) return providerDurationForCapability(capability, content.creative_duration_seconds ?? content.duration);
+  const creative = Number(content.creative_duration_seconds ?? content.duration);
+  return Number.isFinite(creative) && creative > 0 ? creative : 5;
 }
 
 async function mapWithConcurrency(items, limit, worker) {
@@ -836,7 +859,13 @@ function createProductionService(db, cfg, log, injected = {}) {
     }
     if (artifact.stage === 'storyboard_plan') {
       const duration = Number(content.duration);
-      if (!Number.isFinite(duration) || duration < 5 || duration > 15) throw new Error('即梦单镜头时长必须在 5 到 15 秒之间');
+      const creativeMin = Number.isFinite(Number(content.creative_duration_min))
+        ? Number(content.creative_duration_min) : 1;
+      const creativeMax = Number.isFinite(Number(content.creative_duration_max))
+        ? Number(content.creative_duration_max) : 60;
+      if (!Number.isFinite(duration) || duration < creativeMin || duration > creativeMax) {
+        throw new Error(`分镜创作时长必须在 ${creativeMin} 到 ${creativeMax} 秒之间`);
+      }
       const artifactRun = repo.getRun(db, artifact.run_id);
       const route = classifyShotRoute({ content }, artifactRun?.policy || {});
       if (content.route_profile && content.route_profile !== route.profile) {
@@ -865,7 +894,7 @@ function createProductionService(db, cfg, log, injected = {}) {
       const artifactRun = repo.getRun(db, artifact.run_id);
       director.normalizeDirectorDocument(
         content.document,
-        source?.content?.duration || content.document?.timeline?.duration,
+        source ? shotExecutionDuration(source.content, artifactRun?.policy || {}) : content.document?.timeline?.duration,
         artifactRun?.policy?.aspect_ratio
       );
     }
@@ -1079,6 +1108,9 @@ function createProductionService(db, cfg, log, injected = {}) {
 
   function persistAutonomyAttempt(run, input = {}) {
     const scope = automationScope(run, input);
+    // Run budgets are a snapshot of the defaults and remain the live source
+    // of truth for this production. This prevents a hidden global preference
+    // from overriding a value the user just changed in Project Settings.
     const recorded = autonomy.recordAttempt(run, { ...scope, ...input });
     const updatedRun = repo.updateRun(db, run.id, { runtime: recorded.runtime });
     repo.appendEvent(db, run.id, 'automation.attempt_recorded', {
@@ -1247,15 +1279,287 @@ function createProductionService(db, cfg, log, injected = {}) {
     }
   }
 
-  async function reviseArtifactAutomatically(run, artifact, reason, sourceDecision, actionSuffix = '') {
-    const textRewriteStages = new Set(['script', 'asset_text', 'storyboard_plan']);
+  async function reviseDirectorPlanFromRejectedPreview(run, preview, reason, actionSuffix, feedback = {}) {
+    const sourcePlan = preview.content?.source_artifact_id
+      ? repo.getArtifact(db, preview.content.source_artifact_id)
+      : latestArtifact(db, run.id, 'director_plan', 'shot', preview.scope_id);
+    if (!sourcePlan || sourcePlan.stage !== 'director_plan') {
+      const error = new Error('无法找到被该预演使用的导演台方案，不能在不改变方案的情况下重复录制');
+      error.code = 'DIRECTOR_PLAN_SOURCE_MISSING';
+      throw error;
+    }
+    const currentPlan = latestArtifact(db, run.id, 'director_plan', 'shot', preview.scope_id);
+    if (Number(currentPlan?.content?.revision_source_preview_id) === Number(preview.id)) {
+      repo.updateRun(db, run.id, {
+        current_stage: 'director_plan', current_scope_type: 'shot', current_scope_id: preview.scope_id,
+        status: 'running', waiting_reason: null, error_code: null, error_message: null,
+      });
+      return { state: 'progressed', reason: 'director_plan_revision_reused', artifact: currentPlan, artifacts: [currentPlan] };
+    }
+    const briefHash = crypto.createHash('sha256').update(JSON.stringify({
+      preview_id: preview.id,
+      reason,
+      blocking_issues: feedback.blocking_issues || [],
+      improvement_notes: feedback.improvement_notes || [],
+    })).digest('hex');
+    const suggestion = await suggestArtifact(sourcePlan.id, {
+      instruction: [
+        '这次打回的是由该 JSON 录制出的 3D 预演视频。必须先修改导演台 JSON，再重新录制；禁止原样返回旧方案。',
+        `必须修复：${reason}`,
+        `阻断项：${JSON.stringify(feedback.blocking_issues || [])}`,
+        `可选改进：${JSON.stringify(feedback.improvement_notes || [])}`,
+        '保持未被批评的镜头时长、画幅、资产身份和已有效构图，只调整导致预演打回的摄像机、走位、姿势、物体运动或关键帧。',
+      ].join('\n'),
+      reason,
+      action_key: `preview-${preview.id}-${briefHash.slice(0, 16)}-${actionSuffix}`,
+      context: { rejected_preview_artifact_id: preview.id, review_feedback: feedback },
+    });
+    const sourceShot = sourcePlan.content?.source_artifact_id
+      ? repo.getArtifact(db, sourcePlan.content.source_artifact_id)
+      : null;
+    const candidate = {
+      ...sourcePlan.content,
+      ...(suggestion.candidate || {}),
+      source_artifact_id: sourcePlan.content?.source_artifact_id || sourceShot?.id || null,
+      source_revision: sourcePlan.content?.source_revision || sourceShot?.revision || null,
+      revision_source_preview_id: preview.id,
+      revision_brief_hash: briefHash,
+      revision_reason: autonomy.sanitizeFailureText(reason, 1200),
+      included: sourcePlan.content?.included !== false,
+    };
+    candidate.document = director.normalizeDirectorDocument(
+      candidate.document,
+      sourceShot ? shotExecutionDuration(sourceShot.content, run.policy || {}) : candidate.document?.timeline?.duration,
+      run.policy?.aspect_ratio
+    );
+    const replacement = repo.editArtifact(db, sourcePlan.id, {
+      title: sourcePlan.title,
+      content: candidate,
+      depends_on: repo.listUpstreamArtifactIds(db, sourcePlan.id),
+    });
+    repo.consumeRejectedArtifactForRevision(db, preview.id, {
+      target_stage: 'director_plan', target_scope_id: preview.scope_id, reason,
+    });
+    repo.updateRun(db, run.id, {
+      current_stage: 'director_plan', current_scope_type: 'shot', current_scope_id: preview.scope_id,
+      status: 'running', waiting_reason: null, error_code: null, error_message: null,
+    });
+    repo.appendEvent(db, run.id, 'director_plan.revised_from_preview_review', {
+      stage: 'director_plan', scope_type: 'shot', scope_id: preview.scope_id,
+      payload: {
+        source_plan_artifact_id: sourcePlan.id,
+        rejected_preview_artifact_id: preview.id,
+        replacement_artifact_id: replacement.id,
+        revision_brief_hash: briefHash,
+      },
+    });
+    return { state: 'progressed', reason: 'director_plan_revised_from_preview', artifact: replacement, artifacts: [replacement] };
+  }
+
+  function chineseShotNumber(value) {
+    const digits = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 };
+    const source = String(value || '').trim();
+    if (digits[source]) return digits[source];
+    if (/^十[一二三四五六七八九]$/.test(source)) return 10 + digits[source[1]];
+    if (/^[一二三四五六七八九]十$/.test(source)) return digits[source[0]] * 10;
+    return null;
+  }
+
+  function revisionBriefText(reason, feedback = {}) {
+    const blocking = (Array.isArray(feedback.blocking_issues) ? feedback.blocking_issues : [])
+      .map((item) => autonomy.sanitizeFailureText(item, 1600)).filter(Boolean);
+    const improvements = (Array.isArray(feedback.improvement_notes) ? feedback.improvement_notes : [])
+      .map((item) => autonomy.sanitizeFailureText(item, 1200)).filter(Boolean);
+    return [
+      '本次返工必须以审批意见为高优先级修改依据，同时保留所有未被批评的已确认事实、身份、空间、道具、剧情和有效构图。',
+      `合并打回理由：${autonomy.sanitizeFailureText(reason, 2400) || '修复当前审批阻断项'}`,
+      blocking.length ? `必须修复的阻断项：\n${blocking.map((item, index) => `${index + 1}. ${item}`).join('\n')}` : '',
+      improvements.length ? `兼容时可采纳的改进建议（不得升级成新门槛）：\n${improvements.map((item, index) => `${index + 1}. ${item}`).join('\n')}` : '',
+      '输出前自检：逐项确认阻断项已经在新内容中得到可见、可执行的修复；不要只复述意见，也不要擅自改动无关内容。',
+    ].filter(Boolean).join('\n');
+  }
+
+  function finalRevisionText(reason, feedback = {}) {
+    return [reason, ...(feedback.blocking_issues || []), ...(feedback.improvement_notes || [])]
+      .map((item) => String(item || '').trim()).filter(Boolean).join('；');
+  }
+
+  function shotIdFromFinalFeedback(run, feedbackText) {
+    const shots = approvedArtifacts(db, run.id, 'storyboard_plan')
+      .filter((item) => item.content?.included !== false);
+    const numeric = [...String(feedbackText || '').matchAll(/(?:第\s*|镜头\s*#?\s*)(\d{1,3})\s*(?:镜|个镜头)?/g)]
+      .map((match) => Number(match[1]));
+    const chinese = [...String(feedbackText || '').matchAll(/第\s*([一二三四五六七八九十]{1,3})\s*镜/g)]
+      .map((match) => chineseShotNumber(match[1])).filter(Boolean);
+    for (const number of [...numeric, ...chinese]) {
+      const shot = shots.find((item) => Number(item.content?.number) === number || Number(item.scope_id) === number);
+      if (shot) return String(shot.scope_id);
+    }
+    const named = shots.find((item) => {
+      const title = String(item.title || item.content?.title || '').trim();
+      return title.length >= 2 && String(feedbackText || '').includes(title);
+    });
+    return named ? String(named.scope_id) : null;
+  }
+
+  async function planFinalEditRevision(run, artifact, reason, feedback = {}) {
+    const feedbackText = finalRevisionText(reason, feedback);
+    const shotId = shotIdFromFinalFeedback(run, feedbackText);
+    if (/(旁白|配音|字幕|声音|音轨|音量|语速|台词|章节|声画|口播|朗读|voice|subtitle|audio|narration)/i.test(feedbackText)) {
+      return { action: 'revise_narration_plan', shot_id: shotId || '', reason: '审核明确指向声画或字幕计划', instruction: feedbackText, requires_human_authority: false };
+    }
+    if (shotId && /(画面|人物|角色|动作|场景|道具|武器|服装|构图|镜头|闪烁|畸形|连续|一致|visual|character|action|scene|prop)/i.test(feedbackText)) {
+      return { action: 'revise_shot_video', shot_id: shotId, reason: '审核明确定位到具体镜头画面', instruction: feedbackText, requires_human_authority: false };
+    }
+    if (/(文件损坏|无法播放|黑帧|编码错误|封装错误|合成失败|导出损坏|corrupt|decode|codec|mux)/i.test(feedbackText)) {
+      return { action: 'retry_merge', shot_id: '', reason: '输入内容无需变化的本地合成技术问题', instruction: feedbackText, requires_human_authority: false };
+    }
+
+    const shots = approvedArtifacts(db, run.id, 'storyboard_plan')
+      .filter((item) => item.content?.included !== false)
+      .map((item) => ({
+        shot_id: String(item.scope_id), number: item.content?.number, title: item.title,
+        duration: item.content?.duration, narration: item.content?.narration,
+        action: item.content?.action, visual: item.content?.visual,
+      }));
+    const prompts = {
+      system: '你是影视后期返工导演。定位成片打回的最小可修复源头，只输出 JSON。',
+      user: [
+        `成片审核：${feedbackText}`,
+        `结构化审批：${JSON.stringify(feedback).slice(0, 6000)}`,
+        `成片来源：${JSON.stringify(artifact.content || {}).slice(0, 5000)}`,
+        `可返工镜头：${JSON.stringify(shots).slice(0, 12000)}`,
+        '请选择修改旁白剪辑计划、重做一个明确镜头、仅重建技术损坏的合成，或确实需要人提供不可推断事实。',
+      ].join('\n'),
+    };
+    const planned = await runTextAction(run, {
+      stage: 'final_edit', scope_type: 'run', scope_id: `revision-${artifact.id}`,
+      kind: 'revision_plan', scene_key: 'production_final_edit_revision',
+      prompts, prompt_id: 'production.final_edit_revision.system',
+      max_tokens: 2400, temperature: 0.15, repair_on_normalize_error: true,
+      normalize: (raw) => {
+        const value = require('../utils/safeJson').safeParseAIJSON(raw, log);
+        const action = String(value.action || '');
+        if (!['revise_narration_plan', 'revise_shot_video', 'retry_merge', 'needs_human'].includes(action)) {
+          throw new Error('成片返工规划 action 无效');
+        }
+        const plannedShotId = value.shot_id == null ? '' : String(value.shot_id);
+        if (action === 'revise_shot_video' && !shots.some((item) => item.shot_id === plannedShotId)) {
+          throw new Error('成片返工规划没有给出有效镜头编号');
+        }
+        if (action === 'needs_human' && value.requires_human_authority !== true) {
+          throw new Error('needs_human 必须说明真实人工权限需求');
+        }
+        return {
+          action,
+          shot_id: plannedShotId,
+          reason: autonomy.sanitizeFailureText(value.reason || feedbackText, 1000),
+          instruction: autonomy.sanitizeFailureText(value.instruction || feedbackText, 1600),
+          requires_human_authority: value.requires_human_authority === true,
+        };
+      },
+    });
+    return planned.waiting ? { action: 'waiting', action_id: planned.action_id } : planned;
+  }
+
+  async function reviseRejectedFinalEdit(run, artifact, reason, actionSuffix, feedback = {}) {
+    const plan = await planFinalEditRevision(run, artifact, reason, feedback);
+    if (plan.action === 'waiting') return { state: 'waiting_task', reason: 'final_revision_plan_in_progress', action_id: plan.action_id };
+    if (plan.action === 'needs_human') {
+      return {
+        state: 'needs_human', reason: 'final_revision_requires_human', revision_plan: plan,
+        requires_human_authority: plan.requires_human_authority === true,
+      };
+    }
+    if (plan.action === 'revise_narration_plan') {
+      const narration = latestArtifact(db, run.id, 'final_edit', 'narration', 'settings');
+      if (!narration) {
+        const error = new Error('成片需要修改旁白/剪辑计划，但当前任务没有旁白设置产物');
+        error.code = 'FINAL_NARRATION_PLAN_MISSING';
+        throw error;
+      }
+      const suggestion = await suggestArtifact(narration.id, {
+        instruction: [
+          '根据成片审核修订旁白、字幕、音量、语速或逐镜节奏。必须保留未被批评的设置与镜头顺序。',
+          revisionBriefText(plan.instruction || reason, feedback),
+        ].join('\n'),
+        reason,
+        action_key: `final-${artifact.id}-narration-${actionSuffix}`,
+        context: { final_artifact_id: artifact.id, revision_plan: plan, review_feedback: feedback },
+      });
+      const normalized = finalEdit.normalizeNarrationPlanEdit(narration, { content: suggestion.candidate });
+      const replacement = repo.editArtifact(db, narration.id, normalized);
+      repo.consumeRejectedArtifactForRevision(db, artifact.id, {
+        target_stage: 'final_edit', target_scope_id: 'settings', reason,
+      });
+      repo.updateRun(db, run.id, {
+        current_stage: 'final_edit', current_scope_type: null, current_scope_id: null,
+        status: 'running', waiting_reason: null, error_code: null, error_message: null,
+      });
+      repo.appendEvent(db, run.id, 'final_edit.revision_planned', {
+        stage: 'final_edit', scope_type: 'narration', scope_id: 'settings',
+        payload: { source_final_artifact_id: artifact.id, replacement_artifact_id: replacement.id, action: plan.action, reason: plan.reason },
+      });
+      return { state: 'progressed', reason: 'final_narration_plan_revised', artifact: replacement, artifacts: [replacement], revision_plan: plan };
+    }
+    if (plan.action === 'revise_shot_video') {
+      const shotVideo = latestArtifact(db, run.id, 'shot_video', 'shot', plan.shot_id);
+      if (!shotVideo) {
+        const error = new Error(`成片返工规划指向镜头 ${plan.shot_id}，但没有找到其视频产物`);
+        error.code = 'FINAL_SOURCE_SHOT_VIDEO_MISSING';
+        throw error;
+      }
+      if (shotVideo.status === 'approved') {
+        repo.reviewArtifact(db, shotVideo.id, {
+          reviewer_type: 'ai_revision_transfer', decision: 'rejected',
+          reason: plan.instruction || reason,
+          criteria_version: run.review_profile?.version || 'default-v1',
+          evidence: { source_final_artifact_id: artifact.id, final_review_feedback: feedback, revision_plan: plan },
+        });
+      }
+      repo.consumeRejectedArtifactForRevision(db, artifact.id, {
+        target_stage: 'shot_video', target_scope_id: plan.shot_id, reason,
+      });
+      const liveRun = repo.updateRun(db, run.id, {
+        current_stage: 'shot_video', current_scope_type: 'shot', current_scope_id: plan.shot_id,
+        status: 'running', waiting_reason: null, error_code: null, error_message: null,
+      });
+      repo.appendEvent(db, run.id, 'final_edit.revision_planned', {
+        stage: 'shot_video', scope_type: 'shot', scope_id: plan.shot_id,
+        payload: { source_final_artifact_id: artifact.id, source_shot_video_artifact_id: shotVideo.id, action: plan.action, reason: plan.reason },
+      });
+      const regenerated = await media.ensureShotVideos(liveRun);
+      return { ...regenerated, reason: regenerated.reason || 'final_source_shot_revision', revision_plan: plan };
+    }
+
+    repo.consumeRejectedArtifactForRevision(db, artifact.id, {
+      target_stage: 'final_edit', target_scope_id: '', reason,
+    });
+    const liveRun = repo.updateRun(db, run.id, {
+      status: 'running', waiting_reason: null, error_code: null, error_message: null,
+    });
+    const rebuilt = await finalEdit.ensureFinalEdit(liveRun, {
+      force_rebuild: true, revision_reason: plan.instruction || reason,
+    });
+    return { ...rebuilt, reason: rebuilt.reason || 'final_merge_rebuilt', revision_plan: plan };
+  }
+
+  async function reviseArtifactAutomatically(run, artifact, reason, sourceDecision, actionSuffix = '', options = {}) {
+    const textRewriteStages = new Set(['script', 'asset_text', 'storyboard_plan', 'director_plan']);
     const isNarrationPlan = artifact.stage === 'final_edit' && artifact.content?.kind === 'narration_plan';
     if (textRewriteStages.has(artifact.stage) || isNarrationPlan) {
+      const feedback = options.feedback || {};
+      const revisionBrief = revisionBriefText(reason, feedback);
       const suggestion = await suggestArtifact(artifact.id, {
-        instruction: `根据自动审批或校验意见重写并修复，保持原 JSON 字段结构。修改意见：${reason}`,
+        instruction: `${revisionBrief}\n保持当前阶段所要求的完整字段结构与输出格式。`,
         reason,
         model: run.review_profile?.model || undefined,
         action_key: `automatic-${artifact.id}-${actionSuffix || artifact.revision}`,
+        context: {
+          source_artifact_id: artifact.id,
+          review_feedback: feedback,
+          revision_brief: revisionBrief,
+        },
       });
       const replacement = repo.editArtifact(db, artifact.id, { content: suggestion.candidate });
       repo.appendEvent(db, run.id, 'automation.artifact_revised', {
@@ -1270,14 +1574,69 @@ function createProductionService(db, cfg, log, injected = {}) {
       repo.updateRun(db, run.id, { status: 'running', waiting_reason: null, error_code: null, error_message: null });
       return { state: 'progressed', reason: 'ai_revised', artifacts: [replacement], artifact: replacement };
     }
-    const queued = repo.queueArtifactRevision(db, artifact.id, { reason, source_decision: sourceDecision });
+    if (artifact.stage === 'director_preview') {
+      return reviseDirectorPlanFromRejectedPreview(
+        run, artifact, reason, actionSuffix, options.feedback || {}
+      );
+    }
+    if (artifact.stage === 'final_edit' && artifact.content?.kind === 'final_video') {
+      return reviseRejectedFinalEdit(run, artifact, reason, actionSuffix, options.feedback || {});
+    }
+    const queued = options.queue_event === false
+      ? repo.getArtifact(db, artifact.id)
+      : repo.queueArtifactRevision(db, artifact.id, { reason, source_decision: sourceDecision });
     repo.updateRun(db, run.id, { status: 'running', waiting_reason: null, error_code: null, error_message: null });
+    let regenerated = null;
+    const liveRun = repo.getRun(db, run.id);
+    if (['asset_images', 'storyboard_images'].includes(artifact.stage)) {
+      regenerated = await media.ensureImageStage(liveRun, artifact.stage);
+    } else if (artifact.stage === 'reference_bundle') {
+      regenerated = await media.ensureReferenceBundles(liveRun);
+    } else if (artifact.stage === 'shot_video') {
+      regenerated = await media.ensureShotVideos(liveRun);
+    }
+    if (regenerated) {
+      return {
+        ...regenerated,
+        reason: regenerated.reason || 'ai_regenerate',
+        revision_source_artifact: queued,
+      };
+    }
     return { state: 'progressed', reason: 'ai_regenerate', artifacts: [queued], artifact: queued };
   }
 
   async function tryAutomaticVideoModelSwitch(run, recorded, failedAction, diagnosis, failure = {}) {
     if (recorded.scope.stage !== 'shot_video'
       || run.policy?.allow_auto_model_switch === false) return null;
+    // Seedance 2.5 production shots have a dedicated parent/child fallback
+    // state machine in productionMediaService.ensureShotVideos().  The
+    // legacy generic switcher must never create a competing direct retry for
+    // the same logical shot (which previously caused the old model to be
+    // selected again after a settings change).  Leave the failed action in
+    // place; ensureShotVideos() will persist and advance its fallback plan.
+    const failedModel = String(failedAction?.request?.model
+      || failedAction?.request?.routing_receipt?.model || '').trim();
+    if (isSeedance25Model(failedModel) && isFallbackEligibleFailure(failure)) {
+      // A failed run can enter this method before the normal media stage is
+      // reached (for example after a process restart).  Re-enter the owner
+      // immediately so the fallback plan/segment is created on this tick,
+      // while preserving the same idempotent parent action key.
+      const resumed = repo.updateRun(db, run.id, {
+        status: 'running', waiting_reason: null, error_code: null, error_message: null,
+      });
+      const advanced = await media.ensureShotVideos(resumed || repo.getRun(db, run.id));
+      return {
+        ...(advanced || { state: 'progressed' }),
+        reason: advanced?.reason || 'seedance_fallback_owned_by_media_service',
+        effects: { ...(advanced?.effects || {}), paid_submission: false, direct_model_switch: false },
+        handoff: {
+          owner: 'productionMediaService.ensureShotVideos',
+          parent_action_id: failedAction?.id || null,
+          model: failedModel,
+          trigger_category: failure.category || null,
+        },
+      };
+    }
     const preferences = automationPreferences.get(db);
     const moderationFallbackAuthorized = failure.category === 'content_moderation_failure'
       && preferences.moderation_fallback_enabled === true
@@ -1288,7 +1647,6 @@ function createProductionService(db, cfg, log, injected = {}) {
     const attemptedModels = new Set(
       (recorded.object?.attempts || []).map((item) => String(item.model || '').trim()).filter(Boolean)
     );
-    const failedModel = String(failedAction?.request?.model || failedAction?.request?.routing_receipt?.model || '').trim();
     if (failedModel) attemptedModels.add(failedModel);
     const selectable = (options.options || []).filter((option) => (
       // Manual selection is intentionally permissive.  Unattended switching
@@ -1743,6 +2101,7 @@ function createProductionService(db, cfg, log, injected = {}) {
       }
 
       const priorReviews = repo.listReviews(db, run.id, {
+        stage: artifact.stage,
         scope_type: artifact.scope_type,
         scope_id: artifact.scope_id,
         page_size: 20,
@@ -1800,7 +2159,16 @@ function createProductionService(db, cfg, log, injected = {}) {
         scores: verdict.scores,
         criteria_version: run.review_profile?.version || 'default-v1',
         prompt_snapshot: prompts.system,
-        evidence: reviewResult.evidence || {},
+        evidence: {
+          ...(reviewResult.evidence || {}),
+          review_verdict: {
+            reason: verdict.reason,
+            severity: verdict.severity,
+            blocking_issues: verdict.blocking_issues,
+            improvement_notes: verdict.improvement_notes,
+            requires_human_authority: verdict.requires_human_authority,
+          },
+        },
       });
       reviewed.push(outcome.artifact);
       if (verdict.decision === 'approved') {
@@ -1827,64 +2195,109 @@ function createProductionService(db, cfg, log, injected = {}) {
       followups.push({ type: 'revise', artifact: outcome.artifact, verdict, recorded });
     }
 
-    const followup = followups[0];
-    if (followup?.type === 'error') {
-      const { artifact, reviewResult } = followup;
-      return recoverAutomationFailure(repo.getRun(db, run.id), {
-        artifact: null,
-        stage: artifact.stage,
-        scope_type: artifact.scope_type,
-        scope_id: artifact.scope_id,
-        kind: 'review',
-        error: reviewResult.error,
-        action: reviewResult.action,
-        action_name: 'retry_ai_review',
-      });
-    }
-    if (followup?.type === 'waiting') {
-      repo.updateRun(db, run.id, { status: 'running', waiting_reason: null });
-      return {
-        state: 'waiting_task', reason: 'ai_review_in_progress',
-        action: followup.reviewResult.action, artifacts: reviewed,
-      };
-    }
-    if (followup?.type === 'human_authority') {
-      return escalateAutonomy(followup.recorded, {
-        reason: 'human_authority_required',
-        waiting_reason: 'human_authority_required',
-        error_code: 'HUMAN_AUTHORITY_REQUIRED',
-        error_message: followup.verdict.reason,
-      });
-    }
-    if (followup?.type === 'exhausted') {
-      return escalateAutonomy(followup.recorded, {
-        reason: 'automation_limit_reached',
-        waiting_reason: 'automation_limit_reached',
-        error_code: 'AUTOMATION_LIMIT_REACHED',
-        error_message: followup.verdict.reason,
-      });
-    }
-    if (followup?.type === 'revise') {
-      try {
-        const revision = await reviseArtifactAutomatically(
-          repo.getRun(db, run.id), followup.artifact, followup.verdict.reason,
-          followup.verdict.decision, `review-${followup.recorded.count}`
-        );
-        return { ...revision, artifacts: [...reviewed, ...(revision.artifacts || [])], verdict: followup.verdict };
-      } catch (error) {
-        return recoverAutomationFailure(repo.getRun(db, run.id), {
-          stage: followup.artifact.stage,
-          scope_type: followup.artifact.scope_type,
-          scope_id: followup.artifact.scope_id,
-          error,
-          action: latestFailureAction(repo.getRun(db, run.id), {
+    const automaticResults = [];
+    const plannedHumanAuthority = [];
+    const orderedFollowups = [
+      ...followups.filter((item) => item.type === 'revise'),
+      ...followups.filter((item) => item.type === 'error'),
+      ...followups.filter((item) => item.type === 'waiting'),
+    ];
+    for (const followup of orderedFollowups) {
+      if (followup.type === 'revise') {
+        try {
+          const revisionResult = await reviseArtifactAutomatically(
+            repo.getRun(db, run.id), followup.artifact, followup.verdict.reason,
+            followup.verdict.decision, `review-${followup.recorded.count}`,
+            { feedback: followup.verdict }
+          );
+          automaticResults.push(revisionResult);
+          if (revisionResult?.state === 'needs_human'
+            && revisionResult.requires_human_authority === true) {
+            plannedHumanAuthority.push({ followup, revisionResult });
+          }
+        } catch (error) {
+          automaticResults.push(await recoverAutomationFailure(repo.getRun(db, run.id), {
             stage: followup.artifact.stage,
             scope_type: followup.artifact.scope_type,
             scope_id: followup.artifact.scope_id,
-          }),
-          action_name: 'retry_artifact_revision',
+            error,
+            action: latestFailureAction(repo.getRun(db, run.id), {
+              stage: followup.artifact.stage,
+              scope_type: followup.artifact.scope_type,
+              scope_id: followup.artifact.scope_id,
+            }),
+            action_name: 'retry_artifact_revision',
+          }));
+        }
+      } else if (followup.type === 'error') {
+        automaticResults.push(await recoverAutomationFailure(repo.getRun(db, run.id), {
+          artifact: null,
+          stage: followup.artifact.stage,
+          scope_type: followup.artifact.scope_type,
+          scope_id: followup.artifact.scope_id,
+          kind: 'review',
+          error: followup.reviewResult.error,
+          action: followup.reviewResult.action,
+          action_name: 'retry_ai_review',
+        }));
+      } else {
+        automaticResults.push({
+          state: 'waiting_task', reason: 'ai_review_in_progress',
+          action: followup.reviewResult.action,
         });
       }
+    }
+    const interventionFollowup = followups.find((item) => item.type === 'human_authority')
+      || followups.find((item) => item.type === 'exhausted');
+    const automaticIntervention = automaticResults.find((item) => item?.intervention || item?.run?.runtime?.autonomy?.intervention);
+    const plannedHumanFollowup = plannedHumanAuthority[0] || null;
+    if (plannedHumanFollowup) {
+      const liveRun = repo.getRun(db, run.id);
+      const recorded = plannedHumanFollowup.followup.recorded;
+      const refreshedRecorded = {
+        ...recorded,
+        run: liveRun,
+        object: autonomy.objectState(liveRun, recorded.scope),
+      };
+      return escalateAutonomy(refreshedRecorded, {
+        reason: 'human_authority_required',
+        waiting_reason: 'human_authority_required',
+        error_code: 'HUMAN_AUTHORITY_REQUIRED',
+        error_message: plannedHumanFollowup.revisionResult.revision_plan?.reason
+          || plannedHumanFollowup.followup.verdict.reason,
+      });
+    }
+    if (interventionFollowup) {
+      const liveRun = repo.getRun(db, run.id);
+      const refreshedRecorded = {
+        ...interventionFollowup.recorded,
+        run: liveRun,
+        object: autonomy.objectState(liveRun, interventionFollowup.recorded.scope),
+      };
+      const humanAuthority = interventionFollowup.type === 'human_authority';
+      return escalateAutonomy(refreshedRecorded, {
+        reason: humanAuthority ? 'human_authority_required' : 'automation_limit_reached',
+        waiting_reason: humanAuthority ? 'human_authority_required' : 'automation_limit_reached',
+        error_code: humanAuthority ? 'HUMAN_AUTHORITY_REQUIRED' : 'AUTOMATION_LIMIT_REACHED',
+        error_message: interventionFollowup.verdict.reason,
+      });
+    }
+    if (automaticIntervention) return automaticIntervention;
+    if (automaticResults.length) {
+      const waiting = automaticResults.find((item) => ['client_action', 'waiting_provider', 'waiting_task'].includes(item?.state));
+      return {
+        state: waiting?.state || 'progressed',
+        reason: waiting?.reason || (automaticResults.length === 1
+          ? automaticResults[0]?.reason || 'automatic_followup'
+          : 'automatic_batch_followup'),
+        action: waiting?.action || null,
+        client_action: waiting?.client_action || null,
+        artifacts: [
+          ...reviewed,
+          ...automaticResults.flatMap((item) => item?.artifacts || (item?.artifact ? [item.artifact] : [])),
+        ],
+        followups: automaticResults,
+      };
     }
     repo.updateRun(db, run.id, { status: 'running', waiting_reason: null });
     return { state: 'approved', artifacts: reviewed };
@@ -1911,7 +2324,8 @@ function createProductionService(db, cfg, log, injected = {}) {
     const reason = review?.reason || run.error_message || '恢复上次未完成的自动修订';
     try {
       return await reviseArtifactAutomatically(
-        run, artifact, reason, review?.decision || 'recovery', `resume-${artifact.revision}`
+        run, artifact, reason, review?.decision || 'recovery', `resume-${artifact.revision}`,
+        { queue_event: false, feedback: review?.evidence?.review_verdict || {} }
       );
     } catch (error) {
       return recoverAutomationFailure(repo.getRun(db, run.id), {
@@ -2009,7 +2423,8 @@ function createProductionService(db, cfg, log, injected = {}) {
   async function generateScript(run) {
     const source = approvedArtifacts(db, run.id, 'story_input')[0];
     if (!source) throw new Error('找不到已确认的故事输入');
-    const prompts = textStages.scriptPrompts(source.content.story, run.policy);
+    const seriesContext = seriesGroupService.buildGenerationContext(db, run);
+    const prompts = textStages.scriptPrompts(source.content.story, { ...run.policy, series_context: seriesContext });
     const result = await runTextAction(run, {
       stage: 'script', scope_type: 'run', scope_id: '', prompts,
       prompt_id: 'production.script.system',
@@ -2027,7 +2442,8 @@ function createProductionService(db, cfg, log, injected = {}) {
   async function generateAssetText(run) {
     const script = approvedArtifacts(db, run.id, 'script')[0];
     if (!script) throw new Error('请先确认剧本');
-    const prompts = textStages.resourcePrompts(script.content.text, run.policy);
+    const seriesContext = seriesGroupService.buildGenerationContext(db, run);
+    const prompts = textStages.resourcePrompts(script.content.text, { ...run.policy, series_context: seriesContext });
     const result = await runTextAction(run, {
       stage: 'asset_text', scope_type: 'collection', scope_id: '', prompts,
       prompt_id: 'production.assets.system',
@@ -2055,13 +2471,25 @@ function createProductionService(db, cfg, log, injected = {}) {
     const script = approvedArtifacts(db, run.id, 'script')[0];
     const assets = approvedArtifacts(db, run.id, 'asset_text').filter((item) => item.content.included !== false);
     if (!script || !assets.length) throw new Error('请先确认剧本和资源');
+    const seriesContext = seriesGroupService.buildGenerationContext(db, run);
     const resourceDigest = assets.map((item) => ({ type: item.scope_type, ...item.content }));
     const videoCapability = getYinziVideoCapability(run.policy?.video_model);
-    const durationMin = Math.max(5, Number(run.policy?.video_duration_min || videoCapability?.duration_min) || 5);
+    const durationMin = Math.max(1, Number(run.policy?.video_duration_min) || 1);
+    const durationMax = Math.max(durationMin, Number(run.policy?.video_duration_max) || 60);
+    const providerDuration = videoCapability
+      ? (videoCapability.duration_mode === 'fixed'
+        ? Number(videoCapability.fixed_duration_seconds || videoCapability.duration_min)
+        : videoCapability.duration_mode === 'enumerated'
+          ? (Array.isArray(videoCapability.allowed_durations) ? videoCapability.allowed_durations.join('/') : '按能力枚举')
+          : `${videoCapability.duration_min}-${videoCapability.duration_max}`)
+      : '由上游校验';
     const prompts = textStages.storyboardPrompts(script.content.text, resourceDigest, {
       ...run.policy,
+      series_context: seriesContext,
       max_total_seconds: run.budget.max_video_seconds,
       video_duration_min: durationMin,
+      video_duration_max: durationMax,
+      duration_plan: `创作目标 ${durationMin}-${durationMax} 秒；供应商执行时长：${providerDuration}；最终剪辑可在本地裁剪。`,
       strict_first_frame_supported: capabilitySupportsRole(videoCapability, 'image', 'first_frame'),
     });
     const result = await runTextAction(run, {
@@ -2069,12 +2497,16 @@ function createProductionService(db, cfg, log, injected = {}) {
       prompt_id: 'production.storyboard.system',
       prompt_variables: {
         min_shot_seconds: durationMin,
+        max_shot_seconds: durationMax,
+        provider_duration: providerDuration,
         transition_rule: capabilitySupportsRole(videoCapability, 'image', 'first_frame')
           ? '默认硬切；仅在确有必要且提供严格首帧时使用 strict_continuation。'
           : '默认硬切；连续画面只能把上一镜尾帧作为普通参考图。',
       },
       normalize: (raw) => textStages.normalizeShots(raw, log, run.budget.max_shots, {
         duration_min: durationMin,
+        duration_max: durationMax,
+        provider_capability: videoCapability,
         strict_first_frame_supported: capabilitySupportsRole(videoCapability, 'image', 'first_frame'),
       }),
       max_tokens: 14000, temperature: 0.45,
@@ -2137,8 +2569,9 @@ function createProductionService(db, cfg, log, injected = {}) {
       strict_first_frame_supported: capabilitySupportsRole(
         getYinziVideoCapability(run.policy?.video_model), 'image', 'first_frame'
       ),
-      duration_min: Math.max(5, Number(run.policy?.video_duration_min
-        || getYinziVideoCapability(run.policy?.video_model)?.duration_min) || 5),
+      duration_min: Math.max(1, Number(run.policy?.video_duration_min) || 1),
+      duration_max: Math.max(1, Number(run.policy?.video_duration_max) || 60),
+      provider_capability: getYinziVideoCapability(run.policy?.video_model),
     });
     const result = await runTextAction(run, {
       stage: 'storyboard_plan',
@@ -2159,8 +2592,9 @@ function createProductionService(db, cfg, log, injected = {}) {
           strict_first_frame_supported: capabilitySupportsRole(
             getYinziVideoCapability(run.policy?.video_model), 'image', 'first_frame'
           ),
-          duration_min: Math.max(5, Number(run.policy?.video_duration_min
-            || getYinziVideoCapability(run.policy?.video_model)?.duration_min) || 5),
+          duration_min: Math.max(1, Number(run.policy?.video_duration_min) || 1),
+          duration_max: Math.max(1, Number(run.policy?.video_duration_max) || 60),
+          provider_capability: getYinziVideoCapability(run.policy?.video_model),
         }),
       }),
       max_tokens: 9000,
@@ -2262,7 +2696,9 @@ function createProductionService(db, cfg, log, injected = {}) {
       {
         expected_number: roughShot.content?.number || scopeId,
         strict_first_frame_supported: capabilitySupportsRole(capability, 'image', 'first_frame'),
-        duration_min: Math.max(5, Number(run.policy?.video_duration_min || capability?.duration_min) || 5),
+        duration_min: Math.max(1, Number(run.policy?.video_duration_min) || 1),
+        duration_max: Math.max(1, Number(run.policy?.video_duration_max) || 60),
+        provider_capability: capability,
       }
     );
     const artifact = createGeneratedArtifact(run, {
@@ -2338,7 +2774,12 @@ function createProductionService(db, cfg, log, injected = {}) {
         prompt_id: 'production.director.system',
         prompt_variables: director.directorPromptVariables(run.policy?.aspect_ratio || '16:9'),
         normalize: (raw) => ({
-          document: director.parseDirectorDocument(raw, shot.content, log, run.policy?.aspect_ratio),
+           document: director.parseDirectorDocument(
+             raw,
+             { ...shot.content, provider_duration_seconds: shotExecutionDuration(shot.content, run.policy || {}) },
+             log,
+             run.policy?.aspect_ratio
+           ),
         }),
         max_tokens: 10000,
         temperature: 0.25,
@@ -2711,7 +3152,11 @@ function createProductionService(db, cfg, log, injected = {}) {
         : director.createFallbackDirectorDocument(source.content, run.policy?.aspect_ratio);
       content = {
         ...content,
-        document: director.normalizeDirectorDocument(document, source.content?.duration, run.policy?.aspect_ratio),
+        document: director.normalizeDirectorDocument(
+          document,
+          shotExecutionDuration(source.content, run.policy || {}),
+          run.policy?.aspect_ratio
+        ),
         scene_summary: content.scene_summary || `${source.content?.visual || ''}；${source.content?.action || ''}`,
       };
     }
@@ -2839,7 +3284,11 @@ function createProductionService(db, cfg, log, injected = {}) {
         stage: 'final_edit', scope_type: 'run', scope_id: '',
         payload: { reason: String(input.reason || '用户请求重新剪辑合成').slice(0, 500) },
       });
-      const result = await finalEdit.ensureFinalEdit(run, { force_rebuild: true });
+      const revisionReason = String(input.reason || '用户请求重新剪辑合成').slice(0, 4000);
+      const result = await finalEdit.ensureFinalEdit(run, {
+        force_rebuild: true,
+        revision_reason: revisionReason,
+      });
       return { ...result, run: repo.getRun(db, run.id) };
     } finally {
       repo.releaseLease(db, runId, owner);
@@ -3013,9 +3462,9 @@ function createProductionService(db, cfg, log, injected = {}) {
       blocking: false,
       advisory: !contractKnown,
       detail: automaticRouting
-        ? `自动按镜头路由：即梦统一按 5-15 秒提交；${isDirectorDisabled(run) ? '3D 导演台已关闭，只使用图片、音频与文本参考' : '连续长镜头可使用 3D 预演参考视频'}；付费前刷新实时目录`
+         ? `自动按镜头路由：供应商执行时长由当前模型能力决定（2.5 固定 30 秒，2.0 使用 5/10/15 秒）；${isDirectorDisabled(run) ? '3D 导演台已关闭，只使用图片、音频与文本参考' : '连续长镜头可使用 3D 预演参考视频'}；付费前刷新实时目录`
         : capability
-        ? `${capability.max_images} 图 / ${isDirectorDisabled(run) ? 0 : capability.max_videos} 视频 / ${capability.max_audios} 音频，${capability.duration_min}-${capability.duration_max} 秒；${capabilitySupportsRole(capability, 'image', 'first_frame') ? '支持严格首帧' : '不支持严格首帧，可选普通尾帧参考或真实切镜点硬切'}`
+         ? `${capability.max_images} 图 / ${isDirectorDisabled(run) ? 0 : capability.max_videos} 视频 / ${capability.max_audios} 音频，供应商执行 ${capability.duration_mode === 'fixed' ? `${capability.fixed_duration_seconds || capability.duration_min} 秒固定` : capability.duration_mode === 'enumerated' ? (capability.allowed_durations || []).join('/') : `${capability.duration_min}-${capability.duration_max}`}；创作时长可在本地规划并裁剪；${capabilitySupportsRole(capability, 'image', 'first_frame') ? '支持严格首帧' : '不支持严格首帧，可选普通尾帧参考或真实切镜点硬切'}`
         : '本地尚未登记该模型能力提示；仍可提交，若上游拒绝会显示原始原因并可调整参考包后重试',
     });
     if (input.browser) {
@@ -3126,6 +3575,73 @@ function createProductionService(db, cfg, log, injected = {}) {
     return repo.getRunSummary(db, run.id);
   }
 
+  async function detachRunView(runId, input = {}) {
+    const run = repo.getRun(db, runId);
+    if (!run) return null;
+    // Detaching is a view concern only: do not pause, cancel, mutate
+    // revisions, or release any provider reservation.
+    repo.appendEvent(db, run.id, 'run.view_detached', {
+      stage: run.current_stage,
+      scope_type: run.current_scope_type,
+      scope_id: run.current_scope_id,
+      payload: { reason: String(input.reason || '用户离开当前页面').slice(0, 240) },
+    });
+    return {
+      run_id: run.id,
+      status: 'detached_view',
+      background_continues: !['paused', 'cancelled', 'completed'].includes(run.status),
+      run: repo.getRun(db, run.id),
+    };
+  }
+
+  async function cancelRunAction(runId, input = {}) {
+    const result = await media.cancelRunAction(runId, input);
+    if (result && result.status !== 'not_found') {
+      const run = repo.getRun(db, runId);
+      if (run && result.status === 'cancelled_local') {
+        repo.updateRun(db, runId, {
+          status: run.status === 'waiting_provider' ? 'running' : run.status,
+          waiting_reason: run.waiting_reason === 'video_generation' ? null : run.waiting_reason,
+          error_code: null,
+          error_message: null,
+        });
+      } else if (run && result.status === 'local_observation_stopped') {
+        repo.updateRun(db, runId, {
+          status: 'waiting_review',
+          waiting_reason: 'local_observation_stopped',
+          error_code: null,
+          error_message: null,
+        });
+      } else if (run && result.status === 'cancelled_provider') {
+        repo.updateRun(db, runId, {
+          status: 'waiting_review',
+          waiting_reason: 'provider_cancelled_pending_refund',
+          error_code: null,
+          error_message: null,
+        });
+      } else if (run && result.status === 'cancel_requested_provider_unknown') {
+        repo.updateRun(db, runId, {
+          status: 'waiting_review',
+          waiting_reason: 'provider_cancel_requested_unknown',
+          error_code: null,
+          error_message: null,
+        });
+      }
+      repo.appendEvent(db, runId, 'run.action_cancel_requested', {
+        stage: result.action?.stage || run?.current_stage,
+        scope_type: result.action?.scope_type || run?.current_scope_type,
+        scope_id: result.action?.scope_id ?? run?.current_scope_id,
+        payload: {
+          action_id: result.action?.id || null,
+          status: result.status,
+          paid_submission: result.paid_submission === true,
+          billable_status: result.billable_status || null,
+        },
+      });
+    }
+    return { ...result, run: repo.getRun(db, runId) };
+  }
+
   return {
     advance,
     transition,
@@ -3146,6 +3662,8 @@ function createProductionService(db, cfg, log, injected = {}) {
     preflight,
     applyReviewPolicy,
     updateRunControl,
+    detachRunView,
+    cancelRunAction,
     skipShot: shotOperations.skipShot,
     restoreShot: shotOperations.restoreShot,
     reviseShot: shotOperations.reviseShot,

@@ -219,8 +219,11 @@ const limits = computed(() => ({
   audios: videoCapability.value?.max_audios ?? 1,
 }))
 const durationBounds = computed(() => ({
-  min: videoCapability.value?.duration_min ?? 1,
-  max: videoCapability.value?.duration_max ?? 15,
+  // Keep the direct-create form aligned with the provider's automatic
+  // submission boundary. Raw manual-contract fields may be wider than the
+  // 5-15s workflow range and must not expose a known-invalid 4s choice.
+  min: videoCapability.value?.auto_duration_min ?? videoCapability.value?.duration_min ?? 1,
+  max: videoCapability.value?.auto_duration_max ?? videoCapability.value?.duration_max ?? 15,
 }))
 const isUploading = computed(() => Boolean(uploadingType.value))
 

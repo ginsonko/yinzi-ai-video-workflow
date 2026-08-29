@@ -64,7 +64,8 @@ describe('production storyboard boundary contract', () => {
     const revision = shotContinuityRevisionPrompts({ strict_first_frame_supported: false });
     assert.match(rough.system, /同一次运镜、同一个尚未完成的物理动作不得拆到两个视频请求中/);
     assert.match(rough.system, /默认使用 hard_cut/);
-    assert.match(rough.system, /即梦片段只允许 5到15 秒/);
+    assert.match(rough.system, /2\.5 由供应商固定请求 30 秒/);
+    assert.match(rough.system, /2\.0.*5、10、15 秒/);
     assert.doesNotMatch(`${rough.system}\n${rough.user}`, /2到4秒/);
     assert.match(revision.system, /Never split one camera move or an unfinished physical action/);
     assert.match(revision.system, /ordinary image reference/);
@@ -88,7 +89,7 @@ describe('production storyboard boundary contract', () => {
       cut_out: '深潭中的取物动作已经完整结束。',
     }, { strict_first_frame_supported: false, duration_min: 2 });
     assert.equal(recovered.transition_mode, 'hard_cut');
-    assert.equal(recovered.duration, 5);
+    assert.equal(recovered.duration, 4);
     assert.match(recovered.continuity_in, /叙事状态承接/);
     assert.match(recovered.boundary_prompt, /不使用上一段视频尾帧/);
     assert.doesNotMatch(recovered.boundary_prompt, /逐像素承接/);
@@ -103,6 +104,22 @@ describe('production creative and review defaults', () => {
     assert.match(prompts.system, /主动做出/);
     assert.match(prompts.system, /不能回答“用户未指定”/);
     assert.match(prompts.user, /未指定的创作要素由你直接决定/);
+  });
+
+  it('passes series-group selected assets as authoritative context and keeps candidates advisory', () => {
+    const series_context = {
+      group: { id: 7, name: '星尘系列' },
+      selected: [{ asset_key: 'hero-lin', asset_type: 'character', title: '林夏', version: 2, content: { hair: 'silver' } }],
+      candidates: [{ asset_key: 'old-scene', asset_type: 'scene', title: '旧温室', version: 1, content: { location: 'greenhouse' }, selected: false }],
+    };
+    const script = scriptPrompts('续集故事', { target_shots: 2, series_context });
+    const resources = require('../src/services/productionTextStages').resourcePrompts('剧本', { series_context });
+    const board = storyboardPrompts('剧本', [], { target_shots: 2, series_context });
+    for (const prompts of [script, resources, board]) {
+      assert.match(`${prompts.system}\n${prompts.user}`, /hero-lin/);
+      assert.match(`${prompts.system}\n${prompts.user}`, /old-scene/);
+      assert.match(prompts.system, /不得(?:静默|把未确认候选)/);
+    }
   });
 
   it('approves low-confidence work when the reviewer found no blocking issue', () => {

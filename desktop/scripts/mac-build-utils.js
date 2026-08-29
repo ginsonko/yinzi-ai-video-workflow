@@ -22,6 +22,29 @@ const OPTIONAL_MAC_SIGNING_ENV = Object.freeze([
   'APPLE_API_ISSUER',
 ]);
 
+const MAC_VARIANTS = Object.freeze({
+  yinzi: Object.freeze({
+    id: 'yinzi',
+    config: 'electron-builder-mac-v012.json',
+    output: 'release-mac',
+    productName: '银子AI视频工作流',
+    appId: 'top.yinziapi.ai-video-workflow',
+  }),
+  universal: Object.freeze({
+    id: 'universal',
+    config: 'electron-builder-mac-universal.json',
+    output: 'release-mac-universal',
+    productName: '银子AI视频工作流-通用版-老李兼容',
+    appId: 'top.yinziapi.ai-video-workflow.universal',
+  }),
+});
+
+function resolveMacVariant(value = process.env.AI_VIDEO_MAC_VARIANT || 'yinzi') {
+  const variant = MAC_VARIANTS[value];
+  if (!variant) throw new Error(`不支持的 Mac 发行版：${value || '(empty)'}`);
+  return variant;
+}
+
 function assertArch(value) {
   if (!ARCHES.includes(value)) throw new Error(`不支持的 Mac 架构：${value || '(empty)'}`);
   return value;
@@ -113,6 +136,7 @@ function assertNoSecrets(targets, extensions = null) {
 
 module.exports = {
   ARCHES,
+  MAC_VARIANTS,
   SECRET_PATTERNS,
   assertArch,
   assertMachOArch,
@@ -123,6 +147,7 @@ module.exports = {
   normalizeMacSigningEnvironment,
   npmExecutable,
   readMachO,
+  resolveMacVariant,
   sha256,
   walkFiles,
 };

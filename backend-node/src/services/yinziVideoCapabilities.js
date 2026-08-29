@@ -1,5 +1,8 @@
 const COMMON_LIMITS = Object.freeze({
   provider_contract: 'aizzz-video-v1',
+  provider_create_path: '/videos',
+  provider_query_path: '/videos/{taskId}',
+  provider_content_path: '/videos/{taskId}/content',
   provider_prompt_hard_max_chars: 4096,
   max_prompt_chars: 4000,
   max_image_bytes: 30 * 1024 * 1024,
@@ -13,6 +16,9 @@ function freezeProfile(input) {
   return Object.freeze({
     ...COMMON_LIMITS,
     duration_step: 1,
+    allowed_durations: Array.isArray(input.allowed_durations)
+      ? Object.freeze([...new Set(input.allowed_durations.map(Number).filter(Number.isFinite))].sort((a, b) => a - b))
+      : null,
     automatic_eligible: false,
     expensive_bypass: false,
     requires_director_preview: false,
@@ -83,6 +89,8 @@ function multimodalSeedanceProfile({
   durationMax = 15,
   autoDurationMin = 5,
   autoDurationMax = 15,
+  allowedDurations = null,
+  fixedDurationSeconds = null,
   automaticEligible = true,
   exclusionReason = null,
 } = {}) {
@@ -93,6 +101,8 @@ function multimodalSeedanceProfile({
     duration_max: durationMax,
     auto_duration_min: autoDurationMin,
     auto_duration_max: autoDurationMax,
+    allowed_durations: allowedDurations,
+    fixed_duration_seconds: fixedDurationSeconds,
     max_images: maxImages,
     max_videos: maxVideos,
     max_audios: maxAudios,
@@ -112,7 +122,7 @@ function multimodalSeedanceProfile({
   });
 }
 
-function conservativeManualProfile(family, resolution = '720p') {
+function singleImageVideoProfile(family, resolution = '720p', options = {}) {
   return freezeProfile({
     provider_contract: 'yinzi-openai-video-v1',
     family,
@@ -125,9 +135,9 @@ function conservativeManualProfile(family, resolution = '720p') {
     max_total_references: 1,
     max_reference_video_seconds_total: 0,
     resolution,
-    quality_tier: 'manual',
-    automatic_eligible: false,
-    exclusion_reason: 'conservative_manual_contract',
+    quality_tier: options.quality || 'balanced',
+    automatic_eligible: options.automaticEligible !== false,
+    preference_rank: Number(options.preferenceRank ?? 200),
     route_profiles: ['short_image_guided', 'long_previs_guided'],
     roles: { image: ['reference'], video: [], audio: [] },
   });
@@ -207,19 +217,41 @@ const AIZZZ_PROFILES = Object.freeze({
   'seedance-2.5-480p': multimodalSeedanceProfile({
     family: 'seedance2.5-reference', resolution: '480p', quality: 'balanced', preferenceRank: 35,
     maxImages: 30, maxVideos: 10, maxAudios: 10, maxReferenceVideoSeconds: 29,
+    durationMode: 'fixed', durationMin: 30, durationMax: 30, autoDurationMin: 30, autoDurationMax: 30,
+    allowedDurations: [30],
+    fixedDurationSeconds: 30,
   }),
   'seedance-2.5-720p': multimodalSeedanceProfile({
     family: 'seedance2.5-reference', resolution: '720p', quality: 'quality', preferenceRank: 55,
-    maxImages: 30, maxVideos: 0, maxAudios: 10, maxReferenceVideoSeconds: 0,
-    durationMode: 'range', durationMin: 4, durationMax: 30, autoDurationMin: 5, autoDurationMax: 15,
+    maxImages: 30, maxVideos: 10, maxAudios: 10, maxReferenceVideoSeconds: 29,
+    durationMode: 'fixed', durationMin: 30, durationMax: 30, autoDurationMin: 30, autoDurationMax: 30,
+    allowedDurations: [30], fixedDurationSeconds: 30,
+  }),
+  // 老李 NewAPI 的站内别名：3.5=即梦 2.5（固定 30 秒），
+  // 3.0=即梦 2.0（5/10/15 秒）。作为兼容提示，不限制未知模型提交。
+  '3.5': multimodalSeedanceProfile({
+    family: 'laoli-seedance2.5-alias', resolution: '720p', quality: 'quality', preferenceRank: 56,
+    maxImages: 30, maxVideos: 10, maxAudios: 10, maxReferenceVideoSeconds: 29,
+    durationMode: 'fixed', durationMin: 30, durationMax: 30, autoDurationMin: 30, autoDurationMax: 30,
+    allowedDurations: [30], fixedDurationSeconds: 30,
+  }),
+  '3.0': multimodalSeedanceProfile({
+    family: 'laoli-seedance2.0-alias', resolution: '720p', quality: 'balanced', preferenceRank: 57,
+    maxImages: 30, maxVideos: 10, maxAudios: 10, maxReferenceVideoSeconds: 15,
+    durationMode: 'enumerated', durationMin: 5, durationMax: 15, autoDurationMin: 5, autoDurationMax: 15,
+    allowedDurations: [5, 10, 15],
   }),
   '特价seedance-2.5-480p': multimodalSeedanceProfile({
     family: 'seedance2.5-discount-reference', resolution: '480p', quality: 'economy', preferenceRank: 25,
     maxImages: 30, maxVideos: 10, maxAudios: 10, maxReferenceVideoSeconds: 29,
+    durationMode: 'fixed', durationMin: 30, durationMax: 30, autoDurationMin: 30, autoDurationMax: 30,
+    allowedDurations: [30], fixedDurationSeconds: 30,
   }),
   '特价seedance-2.5-720p': multimodalSeedanceProfile({
     family: 'seedance2.5-discount-reference', resolution: '720p', quality: 'balanced', preferenceRank: 45,
     maxImages: 30, maxVideos: 10, maxAudios: 10, maxReferenceVideoSeconds: 29,
+    durationMode: 'fixed', durationMin: 30, durationMax: 30, autoDurationMin: 30, autoDurationMax: 30,
+    allowedDurations: [30], fixedDurationSeconds: 30,
   }),
   'ca-seedance 2.0 720pro-15s': multimodalSeedanceProfile({
     family: 'ca-seedance2-reference', resolution: '720p', quality: 'quality', preferenceRank: 100,
@@ -287,28 +319,74 @@ const AIZZZ_PROFILES = Object.freeze({
     roles: { image: ['reference'], video: ['reference'], audio: ['reference'] },
   }),
 
-  'grok-imagine-video': conservativeManualProfile('grok-imagine-video', '720p'),
-  'minimax-h3-2k': conservativeManualProfile('minimax-h3-2k', '2k'),
-  'kling video 3.0 omni': conservativeManualProfile('kling-video-3-omni', '1080p'),
+  'grok-imagine-video': singleImageVideoProfile('grok-imagine-video', '720p', {
+    quality: 'balanced', preferenceRank: 210,
+  }),
+  'minimax-h3-2k': singleImageVideoProfile('minimax-h3-2k', '2k', {
+    quality: 'quality', preferenceRank: 220,
+  }),
+  'minimax-h3-4k': singleImageVideoProfile('minimax-h3-4k', '4k', {
+    quality: 'quality', preferenceRank: 225,
+  }),
+  'kling video 3.0 omni': singleImageVideoProfile('kling-video-3-omni', '720p', {
+    quality: 'balanced', preferenceRank: 230,
+  }),
+  'kling video 3.0 omni-1080p': singleImageVideoProfile('kling-video-3-omni', '1080p', {
+    quality: 'quality', preferenceRank: 240,
+  }),
+  'kling video 3.0 omni-4k': singleImageVideoProfile('kling-video-3-omni', '4k', {
+    quality: 'quality', preferenceRank: 250,
+  }),
+});
+
+// Operational availability is intentionally separate from the model's media
+// contract. These models remain visible and manually selectable, while the
+// automatic router avoids channels the operator has currently reported down.
+const CURRENT_AUTOMATIC_ROUTE_EXCLUSIONS = Object.freeze({
+  'cc-seedance2.0 480p-fast-nsp': 'channel_temporarily_unavailable',
+  'cc-seedance2.0 480p-nsp': 'channel_temporarily_unavailable',
+  'seedance2.0 720p-pro-nv-nsp': 'channel_temporarily_unavailable',
+  'seedance2.0特价pro-720p-gz-15s-nsp': 'channel_temporarily_unavailable',
+  'minimax-h3-2k': 'channel_temporarily_unavailable',
+  'minimax-h3-4k': 'channel_temporarily_unavailable',
+  'kling video 3.0 omni': 'channel_temporarily_unavailable',
+  'kling video 3.0 omni-1080p': 'channel_temporarily_unavailable',
+  'kling video 3.0 omni-4k': 'channel_temporarily_unavailable',
 });
 
 const CANONICAL_MODEL_NAMES = Object.freeze({
   'minimax-h3-2k': 'MiniMax-H3-2k',
+  'minimax-h3-4k': 'MiniMax-H3-4k',
   'kling video 3.0 omni': 'Kling VIDEO 3.0 Omni',
+  'kling video 3.0 omni-1080p': 'Kling VIDEO 3.0 Omni-1080p',
+  'kling video 3.0 omni-4k': 'Kling VIDEO 3.0 Omni-4k',
 });
 
 function normalizeModelName(model) {
   return String(model || '').trim().toLowerCase();
 }
 
+function applyAutomaticRouteAvailability(model, capability) {
+  if (!capability) return null;
+  const exclusionReason = CURRENT_AUTOMATIC_ROUTE_EXCLUSIONS[normalizeModelName(model)];
+  if (!exclusionReason) return capability;
+  return Object.freeze({
+    ...capability,
+    automatic_eligible: false,
+    manual_eligible: true,
+    automatic_availability: 'temporarily_unavailable',
+    exclusion_reason: exclusionReason,
+  });
+}
+
 function getYinziVideoCapability(model) {
-  return AIZZZ_PROFILES[normalizeModelName(model)] || null;
+  return applyAutomaticRouteAvailability(model, AIZZZ_PROFILES[normalizeModelName(model)] || null);
 }
 
 function listYinziVideoCapabilities() {
   return Object.entries(AIZZZ_PROFILES).map(([model, capability]) => ({
     model: CANONICAL_MODEL_NAMES[model] || model,
-    capability,
+    capability: applyAutomaticRouteAvailability(model, capability),
   }));
 }
 
@@ -318,8 +396,10 @@ function capabilitySupportsRole(capability, mediaType, role) {
 }
 
 function capabilitySupportsRoute(capability, routeProfile) {
-  return Array.isArray(capability?.route_profiles)
-    && capability.route_profiles.includes(routeProfile);
+  const routeProfiles = capability?.route_profiles;
+  // Provider contracts do not have to know the workflow's local route labels.
+  // Only an explicit list can exclude a profile; absence remains compatible.
+  return !Array.isArray(routeProfiles) || routeProfiles.includes(routeProfile);
 }
 
 function capabilityAcceptsDuration(capability, duration, options = {}) {
@@ -327,6 +407,12 @@ function capabilityAcceptsDuration(capability, duration, options = {}) {
   if (!capability || !Number.isFinite(seconds)) return false;
   if (capability.duration_mode === 'fixed') {
     return seconds === Number(capability.fixed_duration_seconds || capability.duration_min);
+  }
+  if (capability.duration_mode === 'enumerated') {
+    const allowed = Array.isArray(capability.allowed_durations)
+      ? capability.allowed_durations.map(Number).filter(Number.isFinite)
+      : [];
+    return allowed.includes(seconds);
   }
   const min = options.automatic
     ? Number(capability.auto_duration_min ?? capability.duration_min)
@@ -341,19 +427,44 @@ function supportsStrictFirstFrame(model) {
   return capabilitySupportsRole(getYinziVideoCapability(model), 'image', 'first_frame');
 }
 
-function clampYinziVideoDuration(model, duration) {
-  const capability = getYinziVideoCapability(model);
-  const fallback = capability?.duration_min || 5;
-  const rounded = Math.round(Number(duration) || fallback);
-  if (!capability) return Math.max(1, rounded);
+function clampYinziVideoDuration(model, duration, capabilityOverride = undefined) {
+  const capability = capabilityOverride === undefined
+    ? getYinziVideoCapability(model)
+    : capabilityOverride;
+  const rounded = Math.round(Number(duration));
+  if (!capability) return Math.max(1, Number.isFinite(rounded) ? rounded : 1);
   if (capability.duration_mode === 'fixed') {
     return Number(capability.fixed_duration_seconds || capability.duration_min);
   }
-  return Math.min(capability.duration_max, Math.max(capability.duration_min, rounded));
+  if (capability.duration_mode === 'enumerated') {
+    const allowed = (Array.isArray(capability.allowed_durations) ? capability.allowed_durations : [])
+      .map(Number).filter(Number.isFinite).sort((a, b) => a - b);
+    if (allowed.length) {
+      const target = Number.isFinite(rounded) ? rounded : allowed[0];
+      return allowed.reduce((best, value) => {
+        const bestDistance = Math.abs(best - target);
+        const distance = Math.abs(value - target);
+        return distance < bestDistance || (distance === bestDistance && value > best) ? value : best;
+      }, allowed[0]);
+    }
+  }
+  const minimum = capability?.auto_duration_min ?? capability?.duration_min;
+  const maximum = capability?.auto_duration_max ?? capability?.duration_max;
+  const fallback = Number.isFinite(Number(minimum)) ? Number(minimum) : (Number.isFinite(rounded) ? rounded : 1);
+  if (!Number.isFinite(Number(minimum)) && !Number.isFinite(Number(maximum))) return Math.max(1, rounded || fallback);
+  return Math.min(maximum, Math.max(minimum, rounded));
+}
+
+// The workflow keeps creative/planned duration separate from the provider's
+// execution unit. This helper is the single capability-driven source of truth
+// used by routing, dispatch and direct Yinzi requests.
+function providerDurationForCapability(capability, plannedDuration) {
+  return clampYinziVideoDuration('', plannedDuration, capability);
 }
 
 module.exports = {
   CURRENT_YINZI_JIMENG_MODELS,
+  CURRENT_AUTOMATIC_ROUTE_EXCLUSIONS,
   getYinziVideoCapability,
   listYinziVideoCapabilities,
   capabilitySupportsRole,
@@ -361,4 +472,5 @@ module.exports = {
   capabilityAcceptsDuration,
   supportsStrictFirstFrame,
   clampYinziVideoDuration,
+  providerDurationForCapability,
 };

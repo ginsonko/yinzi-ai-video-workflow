@@ -115,4 +115,68 @@ describe('production autonomy runner', () => {
     assert.equal(repo.getRun(db, ambiguous.id).waiting_reason, 'ambiguous_external_task');
     runner.stop();
   });
+
+  it('backs off when an outcome claims progress but persisted semantics did not change', async () => {
+    const run = createRun('ai', 'semantic-idle');
+    repo.updateRun(db, run.id, { status: 'running' });
+    let clock = 1000;
+    let calls = 0;
+    const runner = createProductionAutonomyRunner(db, {}, log, {
+      service: { async advance() { calls += 1; return { state: 'progressed' }; } },
+      now: () => clock,
+      max_runs_per_tick: 1,
+      semantic_idle_delay_ms: 3500,
+      semantic_idle_max_delay_ms: 30000,
+    });
+
+    const first = await runner.runOnce();
+    assert.equal(first.outcomes[0].outcome.semantic_progress, false);
+    assert.equal(calls, 1);
+    clock = 4499;
+    assert.equal((await runner.runOnce()).processed, 0);
+    clock = 4500;
+    assert.equal((await runner.runOnce()).processed, 1);
+    assert.equal(calls, 2);
+    clock = 11499;
+    assert.equal((await runner.runOnce()).processed, 0);
+    clock = 11500;
+    assert.equal((await runner.runOnce()).processed, 1);
+    assert.equal(calls, 3);
+    runner.stop();
+  });
+
+  it('resets semantic idle backoff after a real artifact change', async () => {
+    const run = createRun('ai', 'semantic-reset');
+    repo.updateRun(db, run.id, { status: 'running' });
+    let clock = 1000;
+    let calls = 0;
+    const runner = createProductionAutonomyRunner(db, {}, log, {
+      service: {
+        async advance(runId) {
+          calls += 1;
+          if (calls === 2) {
+            repo.createArtifact(db, {
+              run_id: runId, stage: 'script', scope_type: 'run', scope_id: '',
+              title: '语义进展', status: 'draft', content: { text: '新剧本' },
+            });
+          }
+          return { state: 'progressed' };
+        },
+      },
+      now: () => clock,
+      max_runs_per_tick: 1,
+      progress_delay_ms: 150,
+      semantic_idle_delay_ms: 3500,
+    });
+
+    await runner.runOnce();
+    clock = 4500;
+    const changed = await runner.runOnce();
+    assert.equal(changed.outcomes[0].outcome.semantic_progress, true);
+    clock = 4649;
+    assert.equal((await runner.runOnce()).processed, 0);
+    clock = 4650;
+    assert.equal((await runner.runOnce()).processed, 1);
+    runner.stop();
+  });
 });

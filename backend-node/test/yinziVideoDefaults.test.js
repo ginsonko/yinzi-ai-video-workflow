@@ -21,6 +21,12 @@ describe('Yinzi video defaults', () => {
       'seedance2.0 720p-pro-nv-nsp',
       'seedance2.0特价pro-720p-gz-15s',
       'seedance2.0特价pro-720p-gz-15s-nsp',
+      'grok-imagine-video',
+      'MiniMax-H3-2k',
+      'MiniMax-H3-4k',
+      'Kling VIDEO 3.0 Omni',
+      'Kling VIDEO 3.0 Omni-1080p',
+      'Kling VIDEO 3.0 Omni-4k',
     ].map((model) => model.toLowerCase());
     assert.equal(new Set(modelNames).size, prices.length);
     assert.equal(requiredModels.every((model) => modelNames.includes(model)), true);

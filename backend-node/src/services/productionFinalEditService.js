@@ -404,6 +404,7 @@ function createFinalEditService(db, cfg, log, injected = {}) {
     if (action?.status === 'cancelled') action = null;
     if (action?.status === 'completed' && !matchingFinal) action = null;
     if (!action) {
+      const revisionReason = String(options.revision_reason || '').trim().slice(0, 4000) || null;
       const attempt = repo.nextActionAttempt(db, run.id, 'final_edit', 'run', '', 'strict_merge');
       const actionKey = `final_edit:run:shots-${shots.map((item) => item.id).join('-')}:narration-${confirmedPlan.confirmation_fingerprint}:a${attempt}`;
       const segmentByShot = new Map(confirmedPlan.segments.map((item) => [String(item.shot_id), item]));
@@ -447,6 +448,8 @@ function createFinalEditService(db, cfg, log, injected = {}) {
           scene_ids: shots.map((item) => item.id),
           narration_plan_artifact_id: planArtifact.id,
           narration_confirmation_fingerprint: confirmedPlan.confirmation_fingerprint,
+          force_rebuild: options.force_rebuild === true,
+          revision_reason: revisionReason,
         },
       }).action;
       action = repo.updateAction(db, action.id, { status: 'waiting', merge_id: merge.merge_id, task_id: merge.task_id });
@@ -527,12 +530,24 @@ function createFinalEditService(db, cfg, log, injected = {}) {
           narration_audio_path: narrationAudioPath,
           subtitle_path: subtitlePath,
           validation: receipt,
+          revision_receipt: {
+            force_rebuild: action.request?.force_rebuild === true,
+            reason: action.request?.revision_reason || null,
+            strict_merge_action_id: action.id,
+          },
           included: true,
         },
         status: 'draft', media_path: receipt.relative_path, mime_type: 'video/mp4', content_hash: receipt.sha256,
         source_action_id: action.id, source_merge_id: action.merge_id, depends_on: [planArtifact.id, ...shots.map((item) => item.id)],
       });
-      repo.updateAction(db, action.id, { status: 'completed', result: { artifact_id: artifact.id, receipt } });
+      repo.updateAction(db, action.id, {
+        status: 'completed',
+        result: {
+          artifact_id: artifact.id,
+          receipt,
+          revision_reason: action.request?.revision_reason || null,
+        },
+      });
       repo.updateRun(db, run.id, { status: 'running', waiting_reason: null });
       return { state: 'progressed', artifact, receipt };
     }

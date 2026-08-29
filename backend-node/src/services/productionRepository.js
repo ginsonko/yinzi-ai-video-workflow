@@ -7,6 +7,7 @@ const {
 const { normalizeProductionAspectRatio } = require('./productionAspectRatio');
 const costLedger = require('./productionCostLedger');
 const settingsService = require('./settingsService');
+const automationPreferences = require('./productionAutomationPreferences');
 
 function nowIso() {
   return new Date().toISOString();
@@ -134,15 +135,21 @@ function createRun(db, input) {
   const id = input.id || crypto.randomUUID();
   const timestamp = nowIso();
   const defaultBudget = settingsService.getGlobalSetting(db, 'production_default_budget', {});
+  const automationDefaults = automationPreferences.get(db);
   const allowUnknownPrice = settingsService.getGlobalSetting(db, 'production_allow_unknown_price', false);
+  const defaultReviewLimit = automationDefaults.max_consecutive_review_rejections;
   const budget = {
     max_video_attempts: 10,
     max_video_seconds: 60,
     max_shots: 12,
-    max_text_revisions: 3,
-    max_image_revisions: 3,
-    max_director_revisions: 2,
-    max_video_attempts_per_shot: 2,
+    // The global automation preferences are templates for new runs. Once a
+    // run exists, its own visible budget is the sole authority and can be
+    // changed without being shadowed by later global-setting changes.
+    max_text_revisions: defaultReviewLimit,
+    max_image_revisions: defaultReviewLimit,
+    max_director_revisions: defaultReviewLimit,
+    max_video_attempts_per_shot: defaultReviewLimit,
+    max_auto_recoveries: automationDefaults.max_consecutive_recovery_failures,
     ...(defaultBudget && typeof defaultBudget === 'object' ? defaultBudget : {}),
     allow_unknown_price: Boolean(allowUnknownPrice),
     ...(input.budget || {}),
@@ -158,7 +165,11 @@ function createRun(db, input) {
     storyboard_image_config_id: defaultImageConfigId(db, 'storyboard_image'),
     video_config_id: defaultImageConfigId(db, 'video'),
     video_model: '',
-    video_duration_min: 5,
+    // This is the creative/editorial range, not the provider execution unit.
+    // Provider-specific minimums/fixed durations are resolved from the route
+    // capability at dispatch time.
+    video_duration_min: 1,
+    video_duration_max: 60,
     director_mode: 'auto',
     allow_auto_model_switch: true,
     keep_provider_audio: true,
@@ -173,6 +184,56 @@ function createRun(db, input) {
       ...(input.runtime?.shot_pipeline || {}),
     },
   };
+
+  // Series membership and asset references are explicit user choices. Do not
+  // silently drop a malformed group/version here: that would make the UI say
+  // an asset was selected while the generated run actually had no reference.
+  // An empty reference list remains valid, so a series can be used purely as
+  // advisory context.
+  const rawSeriesGroupId = policy.series_group_id ?? input.series_group_id;
+  const hasSeriesGroup = rawSeriesGroupId !== undefined && rawSeriesGroupId !== null && String(rawSeriesGroupId).trim() !== '';
+  let seriesGroup = null;
+  let seriesAssetRequests = [];
+  if (hasSeriesGroup) {
+    const seriesGroupId = Number(rawSeriesGroupId);
+    if (!Number.isInteger(seriesGroupId) || seriesGroupId <= 0) {
+      throw Object.assign(new Error('剧集组 ID 无效，请重新选择剧集组'), { code: 'SERIES_GROUP_INVALID' });
+    }
+    seriesGroup = db.prepare('SELECT id FROM series_groups WHERE id = ? AND archived_at IS NULL').get(seriesGroupId);
+    if (!seriesGroup) {
+      throw Object.assign(new Error('剧集组不存在或已归档，请重新选择剧集组'), { code: 'SERIES_GROUP_NOT_FOUND' });
+    }
+    seriesAssetRequests = policy.series_asset_refs == null ? [] : policy.series_asset_refs;
+    if (!Array.isArray(seriesAssetRequests)) {
+      throw Object.assign(new Error('剧集复用资产格式无效，请重新选择资产'), { code: 'SERIES_ASSET_REFS_INVALID' });
+    }
+    for (const requested of seriesAssetRequests) {
+      const assetId = Number(typeof requested === 'object' && requested !== null ? requested.series_asset_id : requested);
+      if (!Number.isInteger(assetId) || assetId <= 0) {
+        throw Object.assign(new Error('剧集复用资产 ID 无效，请重新选择资产'), { code: 'SERIES_ASSET_REF_INVALID' });
+      }
+      const asset = db.prepare('SELECT id,current_version_id FROM series_assets WHERE id = ? AND series_group_id = ?').get(assetId, seriesGroupId);
+      if (!asset) {
+        throw Object.assign(new Error(`复用资产 #${assetId} 不属于当前剧集组或已不存在`), { code: 'SERIES_ASSET_NOT_FOUND' });
+      }
+      if (!asset.current_version_id) {
+        throw Object.assign(new Error(`复用资产 #${assetId} 尚无可用版本，请先完善资产`), { code: 'SERIES_ASSET_VERSION_NOT_FOUND' });
+      }
+      const requestedVersion = typeof requested === 'object' && requested !== null
+        ? requested.series_asset_version_id
+        : null;
+      const versionId = requestedVersion == null || String(requestedVersion).trim() === ''
+        ? Number(asset.current_version_id)
+        : Number(requestedVersion);
+      if (!Number.isInteger(versionId) || versionId <= 0) {
+        throw Object.assign(new Error(`复用资产 #${assetId} 的版本无效，请重新选择版本`), { code: 'SERIES_ASSET_VERSION_INVALID' });
+      }
+      const version = db.prepare('SELECT id FROM series_asset_versions WHERE id = ? AND series_asset_id = ?').get(versionId, asset.id);
+      if (!version) {
+        throw Object.assign(new Error(`复用资产 #${assetId} 的版本不存在，请刷新后重新选择`), { code: 'SERIES_ASSET_VERSION_NOT_FOUND' });
+      }
+    }
+  }
 
   const tx = db.transaction(() => {
     db.prepare(
@@ -205,6 +266,22 @@ function createRun(db, input) {
       decision: 'approved',
       reason: '用户提交的创作源内容',
     });
+    if (seriesGroup) {
+      const seriesGroupId = Number(seriesGroup.id);
+      db.prepare('INSERT OR IGNORE INTO series_group_episodes (series_group_id,drama_id,episode_id,created_at) VALUES (?,?,?,?)')
+        .run(seriesGroupId, dramaId, episodeId, timestamp);
+      for (const requested of seriesAssetRequests) {
+        const assetId = Number(typeof requested === 'object' && requested !== null ? requested.series_asset_id : requested);
+        const asset = db.prepare('SELECT id,current_version_id FROM series_assets WHERE id = ? AND series_group_id = ?').get(assetId, seriesGroupId);
+        const requestedVersion = typeof requested === 'object' && requested !== null ? requested.series_asset_version_id : null;
+        const versionId = requestedVersion == null || String(requestedVersion).trim() === ''
+          ? Number(asset.current_version_id)
+          : Number(requestedVersion);
+        const version = db.prepare('SELECT id FROM series_asset_versions WHERE id = ? AND series_asset_id = ?').get(versionId, asset.id);
+        db.prepare('INSERT OR IGNORE INTO episode_asset_refs (series_asset_id,series_asset_version_id,drama_id,episode_id,mode,created_at) VALUES (?,?,?,?,?,?)')
+          .run(asset.id, version.id, dramaId, episodeId, 'reuse', timestamp);
+      }
+    }
     appendEvent(db, id, 'run.created', { stage: 'story_input', payload: { review_owner: reviewOwner } });
   });
   try {
@@ -788,6 +865,29 @@ function queueArtifactRevision(db, artifactId, input = {}) {
   return getArtifact(db, artifact.id);
 }
 
+function consumeRejectedArtifactForRevision(db, artifactId, input = {}) {
+  const artifact = getArtifact(db, artifactId);
+  if (!artifact) throw new Error('产物不存在');
+  if (!['rejected', 'failed', 'invalidated'].includes(artifact.status)) return artifact;
+  const timestamp = nowIso();
+  db.prepare(
+    `UPDATE production_artifacts SET status = 'invalidated', updated_at = ?
+     WHERE id = ? AND status IN ('rejected', 'failed')`
+  ).run(timestamp, artifact.id);
+  appendEvent(db, artifact.run_id, 'artifact.revision_source_consumed', {
+    stage: artifact.stage,
+    scope_type: artifact.scope_type,
+    scope_id: artifact.scope_id,
+    payload: {
+      artifact_id: artifact.id,
+      target_stage: input.target_stage || artifact.stage,
+      target_scope_id: input.target_scope_id == null ? artifact.scope_id : String(input.target_scope_id),
+      reason: String(input.reason || 'revision_scheduled').slice(0, 1200),
+    },
+  });
+  return getArtifact(db, artifact.id);
+}
+
 function excludeArtifact(db, artifactId, input = {}) {
   const artifact = getArtifact(db, artifactId);
   if (!artifact) throw new Error('产物不存在');
@@ -820,13 +920,18 @@ function restoreArtifact(db, artifactId, input = {}) {
 function listReviews(db, runId, query = {}) {
   const page = Math.max(1, Number(query.page) || 1);
   const pageSize = Math.min(100, Math.max(1, Number(query.page_size) || 50));
-  const clauses = ['run_id = ?'];
+  const clauses = ['r.run_id = ?'];
   const params = [runId];
-  if (query.artifact_id) { clauses.push('artifact_id = ?'); params.push(Number(query.artifact_id)); }
+  if (query.artifact_id) { clauses.push('r.artifact_id = ?'); params.push(Number(query.artifact_id)); }
+  if (query.decision) { clauses.push('r.decision = ?'); params.push(String(query.decision)); }
+  if (query.stage) { clauses.push('a.stage = ?'); params.push(String(query.stage)); }
+  if (query.scope_type) { clauses.push('a.scope_type = ?'); params.push(String(query.scope_type)); }
+  if (query.scope_id != null) { clauses.push('a.scope_id = ?'); params.push(String(query.scope_id)); }
   const where = clauses.join(' AND ');
-  const total = db.prepare(`SELECT COUNT(*) AS n FROM production_reviews WHERE ${where}`).get(...params).n;
+  const from = 'production_reviews r JOIN production_artifacts a ON a.id = r.artifact_id';
+  const total = db.prepare(`SELECT COUNT(*) AS n FROM ${from} WHERE ${where}`).get(...params).n;
   const items = db.prepare(
-    `SELECT * FROM production_reviews WHERE ${where} ORDER BY id DESC LIMIT ? OFFSET ?`
+    `SELECT r.* FROM ${from} WHERE ${where} ORDER BY r.id DESC LIMIT ? OFFSET ?`
   ).all(...params, pageSize, (page - 1) * pageSize).map(toReview);
   return { items, pagination: { page, page_size: pageSize, total, total_pages: Math.ceil(total / pageSize) } };
 }
@@ -1102,13 +1207,21 @@ function reserveAction(db, input) {
     const info = db.prepare(
       `INSERT INTO production_actions (
         run_id, action_key, stage, scope_type, scope_id, kind, status, attempt,
-        handler_version, request_json, request_hash, reserved_video_seconds, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, 'reserved', ?, ?, ?, ?, ?, ?, ?)`
+        handler_version, request_json, request_hash, reserved_video_seconds,
+        parent_action_id, parent_action_key, segment_index, cancel_mode, external_outcome,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 'reserved', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       input.run_id, input.action_key, input.stage, input.scope_type || null,
       input.scope_id == null ? null : String(input.scope_id), input.kind,
       Number(input.attempt) || 1, Number(input.handler_version) || graph.HANDLER_VERSION,
-      json(request), hashJson(request), seconds, timestamp, timestamp
+      json(request), hashJson(request), seconds,
+      input.parent_action_id == null ? null : Number(input.parent_action_id),
+      input.parent_action_key == null ? null : String(input.parent_action_key),
+      input.segment_index == null ? null : Number(input.segment_index),
+      input.cancel_mode == null ? null : String(input.cancel_mode),
+      input.external_outcome == null ? null : String(input.external_outcome),
+      timestamp, timestamp
     );
     const actionId = Number(info.lastInsertRowid);
     if (input.cost) {
@@ -1136,13 +1249,20 @@ function reserveAction(db, input) {
 function updateAction(db, actionId, patch) {
   const row = db.prepare('SELECT * FROM production_actions WHERE id = ?').get(Number(actionId));
   if (!row) return null;
-  const allowed = ['status', 'task_id', 'generation_id', 'merge_id', 'provider_id', 'error_code', 'error_message'];
+  const allowed = [
+    'status', 'task_id', 'generation_id', 'merge_id', 'provider_id', 'error_code', 'error_message',
+    'cancel_mode', 'external_outcome', 'parent_action_id', 'parent_action_key', 'segment_index',
+  ];
   const sets = [];
   const values = [];
   for (const key of allowed) {
     if (!Object.prototype.hasOwnProperty.call(patch, key)) continue;
     if (key === 'status') graph.assertEnum(patch[key], graph.ACTION_STATUSES, 'action.status');
-    sets.push(`${key} = ?`); values.push(patch[key]);
+    if (key === 'parent_action_id' || key === 'segment_index') {
+      sets.push(`${key} = ?`); values.push(patch[key] == null ? null : Number(patch[key]));
+    } else {
+      sets.push(`${key} = ?`); values.push(patch[key] == null ? null : patch[key]);
+    }
   }
   if (Object.prototype.hasOwnProperty.call(patch, 'result')) { sets.push('result_json = ?'); values.push(json(patch.result)); }
   if (!sets.length) return toAction(row);
@@ -1172,6 +1292,117 @@ function updateAction(db, actionId, patch) {
   return toAction(db.prepare('SELECT * FROM production_actions WHERE id = ?').get(Number(actionId)));
 }
 
+/**
+ * Reserve the worst-case budget for a bounded 2.5 -> 2.0 fallback chain.
+ * The reservation lives in the run usage snapshot rather than as a fake
+ * provider charge, so it cannot be mistaken for a submitted request.  A
+ * child segment consumes its share immediately before its own action ledger
+ * reservation; unused capacity is released when the chain converges.
+ */
+function reserveFallbackBudget(db, runId, input = {}) {
+  const key = String(input.reservation_key || '').trim();
+  const amount = Math.max(0, Math.floor(Number(input.amount_microusd) || 0));
+  if (!key || amount <= 0) return { reserved: false, reused: false, reason: 'no_budget_amount' };
+  const tx = db.transaction(() => {
+    const run = getRun(db, runId);
+    if (!run) throw new Error('制作任务不存在');
+    const runtime = { ...(run.runtime || {}) };
+    const reservations = runtime.fallback_budget_reservations
+      && typeof runtime.fallback_budget_reservations === 'object'
+      ? { ...runtime.fallback_budget_reservations }
+      : {};
+    if (reservations[key]) return { reserved: true, reused: true, reservation: reservations[key], run };
+    const limit = costLedger.budgetMicrousd(run);
+    const costs = costLedger.sumRun(db, runId);
+    const existing = Math.max(0, Number(runtime.fallback_reserved_microusd) || 0);
+    const committed = costs.reserved_microusd + costs.settled_microusd + costs.uncertain_microusd + existing;
+    if (limit != null && committed + amount > limit) {
+      const error = new Error('视频降级最坏成本预留将超过任务金额上限');
+      error.code = 'COST_FALLBACK_BUDGET_EXHAUSTED';
+      error.details = { limit_microusd: limit, committed_microusd: committed, requested_microusd: amount };
+      throw error;
+    }
+    const reservation = {
+      key,
+      amount_microusd: amount,
+      remaining_microusd: amount,
+      reason: String(input.reason || 'seedance_fallback_worst_case').slice(0, 240),
+      created_at: nowIso(),
+    };
+    reservations[key] = reservation;
+    runtime.fallback_budget_reservations = reservations;
+    runtime.fallback_reserved_microusd = existing + amount;
+    const updated = updateRun(db, runId, { runtime });
+    appendEvent(db, runId, 'fallback.budget_reserved', {
+      stage: input.stage || 'shot_video', scope_type: input.scope_type || 'shot', scope_id: input.scope_id,
+      payload: { reservation_key: key, amount_microusd: amount, remaining_microusd: amount },
+    });
+    return { reserved: true, reused: false, reservation, run: updated };
+  });
+  return tx.immediate();
+}
+
+function consumeFallbackBudget(db, runId, reservationKey, amountMicrousd) {
+  const key = String(reservationKey || '').trim();
+  const amount = Math.max(0, Math.floor(Number(amountMicrousd) || 0));
+  if (!key || amount <= 0) return { consumed: 0, remaining_microusd: 0, missing: true };
+  const tx = db.transaction(() => {
+    const run = getRun(db, runId);
+    if (!run) throw new Error('制作任务不存在');
+    const runtime = { ...(run.runtime || {}) };
+    const reservations = runtime.fallback_budget_reservations && typeof runtime.fallback_budget_reservations === 'object'
+      ? { ...runtime.fallback_budget_reservations }
+      : {};
+    const reservation = reservations[key];
+    if (!reservation) return { consumed: 0, remaining_microusd: 0, missing: true };
+    const remaining = Math.max(0, Number(reservation.remaining_microusd) || 0);
+    if (amount > remaining) {
+      const error = new Error('视频降级子任务超出父镜头预算预留');
+      error.code = 'COST_FALLBACK_SEGMENT_BUDGET_EXHAUSTED';
+      throw error;
+    }
+    const next = remaining - amount;
+    reservations[key] = { ...reservation, remaining_microusd: next, last_consumed_microusd: amount, updated_at: nowIso() };
+    runtime.fallback_budget_reservations = reservations;
+    runtime.fallback_reserved_microusd = Math.max(0,
+      (Number(runtime.fallback_reserved_microusd) || 0) - amount);
+    updateRun(db, runId, { runtime });
+    appendEvent(db, runId, 'fallback.budget_consumed', {
+      stage: 'shot_video', scope_type: 'shot', scope_id: null,
+      payload: { reservation_key: key, consumed_microusd: amount, remaining_microusd: next },
+    });
+    return { consumed: amount, remaining_microusd: next, missing: false };
+  });
+  return tx.immediate();
+}
+
+function releaseFallbackBudget(db, runId, reservationKey, reason = 'fallback_converged') {
+  const key = String(reservationKey || '').trim();
+  if (!key) return { released_microusd: 0, missing: true };
+  const tx = db.transaction(() => {
+    const run = getRun(db, runId);
+    if (!run) return { released_microusd: 0, missing: true };
+    const runtime = { ...(run.runtime || {}) };
+    const reservations = runtime.fallback_budget_reservations && typeof runtime.fallback_budget_reservations === 'object'
+      ? { ...runtime.fallback_budget_reservations }
+      : {};
+    const reservation = reservations[key];
+    if (!reservation || reservation.released_at) return { released_microusd: 0, missing: !reservation };
+    const remaining = Math.max(0, Number(reservation.remaining_microusd) || 0);
+    reservations[key] = { ...reservation, remaining_microusd: 0, released_microusd: remaining, released_at: nowIso(), release_reason: String(reason).slice(0, 240) };
+    runtime.fallback_budget_reservations = reservations;
+    runtime.fallback_reserved_microusd = Math.max(0,
+      (Number(runtime.fallback_reserved_microusd) || 0) - remaining);
+    const updated = updateRun(db, runId, { runtime });
+    appendEvent(db, runId, 'fallback.budget_released', {
+      stage: 'shot_video', scope_type: 'shot', scope_id: null,
+      payload: { reservation_key: key, released_microusd: remaining, reason: String(reason).slice(0, 240) },
+    });
+    return { released_microusd: remaining, missing: false, run: updated };
+  });
+  return tx.immediate();
+}
+
 function cancelReservedAction(db, actionId, result = {}) {
   const tx = db.transaction(() => {
     const action = getAction(db, actionId);
@@ -1179,6 +1410,8 @@ function cancelReservedAction(db, actionId, result = {}) {
     if (action.status !== 'reserved') return action;
     const updated = updateAction(db, action.id, {
       status: 'cancelled',
+      cancel_mode: result.cancel_mode || 'cancel_local_request',
+      external_outcome: result.external_outcome || 'not_submitted',
       result: { ...(action.result || {}), ...result },
     });
     if (action.kind === 'video_generate' || Number(action.reserved_video_seconds || 0) > 0) {
@@ -1205,6 +1438,78 @@ function cancelReservedAction(db, actionId, result = {}) {
         action_id: action.id,
         reserved_video_seconds: Number(action.reserved_video_seconds || 0),
         reason: result.cancelled_reason || null,
+      },
+    });
+    return updated;
+  });
+  return tx.immediate();
+}
+
+/**
+ * Mark an accepted provider task as a cancellation request without claiming
+ * that the provider stopped or refunded it.  This is intentionally separate
+ * from cancelReservedAction(): once a provider/task id exists the local
+ * reservation is no longer safe to release.
+ */
+function markProviderCancelRequested(db, actionId, result = {}) {
+  const tx = db.transaction(() => {
+    const action = getAction(db, actionId);
+    if (!action) return null;
+    if (action.result?.cancel_requested_provider_unknown === true
+      || action.result?.provider_cancel_confirmed === true) return action;
+    const updated = updateAction(db, action.id, {
+      cancel_mode: 'cancel_provider_task',
+      external_outcome: result.provider_cancel_confirmed === true ? 'cancelled' : 'cancel_requested_provider_unknown',
+      result: {
+        ...(action.result || {}),
+        ...result,
+      },
+    });
+    appendEvent(db, action.run_id, 'action.provider_cancel_requested', {
+      stage: action.stage,
+      scope_type: action.scope_type,
+      scope_id: action.scope_id,
+      payload: {
+        action_id: action.id,
+        provider_task_id: action.provider_id || null,
+        confirmed: result.provider_cancel_confirmed === true,
+      },
+    });
+    return updated;
+  });
+  return tx.immediate();
+}
+
+/**
+ * Stop local observation of an already accepted provider action without
+ * sending a provider cancellation request.  The provider task identity and
+ * cost ledger are deliberately untouched: a local stop is not evidence that
+ * the remote task stopped or that a charge was refunded.
+ */
+function markLocalObservationStopped(db, actionId, result = {}) {
+  const tx = db.transaction(() => {
+    const action = getAction(db, actionId);
+    if (!action) return null;
+    if (action.result?.local_observation_stopped === true
+      || action.result?.provider_cancel_confirmed === true
+      || action.result?.cancel_requested_provider_unknown === true) return action;
+    const updated = updateAction(db, action.id, {
+      cancel_mode: 'cancel_local_request',
+      external_outcome: 'local_observation_stopped',
+      result: {
+        ...(action.result || {}),
+        ...result,
+        local_observation_stopped: true,
+        local_observation_stopped_at: result.local_observation_stopped_at || nowIso(),
+      },
+    });
+    appendEvent(db, action.run_id, 'action.local_observation_stopped', {
+      stage: action.stage,
+      scope_type: action.scope_type,
+      scope_id: action.scope_id,
+      payload: {
+        action_id: action.id,
+        provider_task_id: action.provider_id || null,
       },
     });
     return updated;
@@ -1395,6 +1700,7 @@ module.exports = {
   reviewArtifact,
   editArtifact,
   queueArtifactRevision,
+  consumeRejectedArtifactForRevision,
   excludeArtifact,
   restoreArtifact,
   listReviews,
@@ -1407,8 +1713,13 @@ module.exports = {
   claimLease,
   releaseLease,
   reserveAction,
+  reserveFallbackBudget,
+  consumeFallbackBudget,
+  releaseFallbackBudget,
   updateAction,
   cancelReservedAction,
+  markProviderCancelRequested,
+  markLocalObservationStopped,
   releaseUnacceptedVideoAction,
   getActionByKey,
   getAction,

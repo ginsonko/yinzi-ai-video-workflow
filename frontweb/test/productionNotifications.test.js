@@ -44,12 +44,16 @@ test('notifies only terminal unattended states and uses stable dedupe keys', () 
 test('honors the notification switch and normalizes user preferences', () => {
   const preferences = normalizeProductionNotificationPreferences({
     review_concurrency: 99,
+    max_consecutive_review_rejections: 99,
+    max_consecutive_recovery_failures: 0,
     notifications_enabled: false,
     notification_sound_enabled: false,
     moderation_fallback_enabled: true,
     moderation_fallback_model: ' 破甲seedance 720p-fast ',
   })
   assert.equal(preferences.review_concurrency, 8)
+  assert.equal(preferences.max_consecutive_review_rejections, 20)
+  assert.equal(preferences.max_consecutive_recovery_failures, 1)
   assert.equal(preferences.moderation_fallback_model, '破甲seedance 720p-fast')
   assert.equal(productionNotificationEvent({
     id: 'run-1', review_owner: 'auto_accept', status: 'completed', completed_at: 'now',

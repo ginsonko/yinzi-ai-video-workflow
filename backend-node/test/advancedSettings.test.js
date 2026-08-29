@@ -48,12 +48,16 @@ describe('advanced settings contracts', () => {
     assert.deepEqual(automationPreferences.get(db), automationPreferences.DEFAULTS);
     const saved = automationPreferences.set(db, {
       review_concurrency: 99,
+      max_consecutive_review_rejections: 99,
+      max_consecutive_recovery_failures: 0,
       notifications_enabled: false,
       notification_sound_enabled: true,
       moderation_fallback_enabled: true,
       moderation_fallback_model: '破甲seedance 720p-fast',
     });
     assert.equal(saved.review_concurrency, 8);
+    assert.equal(saved.max_consecutive_review_rejections, 20);
+    assert.equal(saved.max_consecutive_recovery_failures, 1);
     assert.equal(saved.notifications_enabled, false);
     assert.equal(saved.moderation_fallback_enabled, true);
     const bundle = bundles.exportBundle(db);
@@ -86,21 +90,27 @@ describe('advanced settings contracts', () => {
     );
   });
 
-  it('keeps shipped prompts byte-identical until an override exists and fully resets legacy keys', () => {
+  it('uses the versioned registry default at runtime, preserves overrides, and fully resets legacy keys', () => {
     const shipped = '  shipped system prompt\nwith its existing contract  ';
     const untouched = promptRegistry.resolveRuntime(db, 'production.script.system', { default_content: shipped });
-    assert.equal(untouched.content, shipped);
+    assert.notEqual(untouched.content, shipped);
+    assert.match(untouched.content, /创作决策权/);
+    assert.match(untouched.content, /不要输出 JSON/);
     assert.equal(untouched.customized, false);
 
     db.prepare('INSERT INTO prompt_overrides (key, content, updated_at) VALUES (?, ?, ?)')
       .run('story_expansion_system', '用户自定义剧本规则', new Date().toISOString());
     const customized = promptRegistry.resolveRuntime(db, 'production.script.system', { default_content: shipped });
-    assert.equal(customized.content, '用户自定义剧本规则');
+    assert.match(customized.content, /^用户自定义剧本规则/);
+    assert.match(customized.content, /不要输出 JSON/);
     assert.equal(customized.customized, true);
     promptRegistry.reset(db, 'production.script.system');
     assert.equal(db.prepare('SELECT COUNT(*) AS n FROM prompt_overrides WHERE key IN (?, ?)')
       .get('production.script.system', 'story_expansion_system').n, 0);
-    assert.equal(promptRegistry.resolveRuntime(db, 'production.script.system', { default_content: shipped }).content, shipped);
+    assert.equal(
+      promptRegistry.resolveRuntime(db, 'production.script.system', { default_content: shipped }).content,
+      untouched.content
+    );
   });
 
   it('reserves money atomically, reuses idempotency keys, and keeps uncertain money committed', () => {

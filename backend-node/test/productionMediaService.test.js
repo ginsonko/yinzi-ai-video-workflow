@@ -11,14 +11,91 @@ const {
   buildProviderPromptPackage,
   normalizeAutoLinkName,
   PROVIDER_PROMPT_MAX_CHARS,
+  canReuseModelCatalogSnapshot,
+  discoveryFromStoredSnapshot,
+  discoverVideoCatalogForConfig,
 } = require('../src/services/productionMediaService');
 const { routingMaterialSignature } = require('../src/services/productionVideoRouter');
+const { getYinziVideoCapability } = require('../src/services/yinziVideoCapabilities');
 const { createFallbackDirectorDocument } = require('../src/services/productionDirector');
 const { normalizeVideoRetryPlan } = require('../src/services/productionTextStages');
+const aiConfigService = require('../src/services/aiConfigService');
+const promptRegistry = require('../src/services/productionPromptRegistry');
 
 let db;
 const cfg = { storage: { local_path: './data/storage', base_url: 'http://localhost/static' } };
 const log = { info() {}, warn() {}, error() {} };
+
+describe('production model catalog snapshot fallback', () => {
+  it('reuses only a saved credential snapshot after a transient models failure', () => {
+    const config = {
+      model_catalog_snapshot: {
+        version: 1,
+        source_url: 'https://api.yinziapi.top/v1/models',
+        availability_scope: 'credential',
+        scope_verified: true,
+        fetched_at: '2026-08-19T00:00:00.000Z',
+        models: [{ model: 'seedance-2.5-720p', endpoint_types: ['openai-video'] }],
+      },
+    };
+    assert.equal(canReuseModelCatalogSnapshot({ code: 'MODEL_DISCOVERY_HTTP_ERROR', status: 503 }), true);
+    assert.equal(canReuseModelCatalogSnapshot({ code: 'MODEL_DISCOVERY_HTTP_ERROR', status: 400 }), false);
+    assert.equal(canReuseModelCatalogSnapshot({ code: 'MODEL_DISCOVERY_ENDPOINT_NOT_FOUND', status: 404 }), false);
+    assert.equal(canReuseModelCatalogSnapshot({ code: 'MODEL_DISCOVERY_AUTH_FAILED' }), false);
+    const result = discoveryFromStoredSnapshot(config, Object.assign(new Error('模型目录返回 HTTP 503'), {
+      code: 'MODEL_DISCOVERY_HTTP_ERROR',
+    }));
+    assert.equal(result.discovery_outcome, 'snapshot_reused');
+    assert.equal(result.stale_snapshot, true);
+    assert.deepEqual(result.models.map((item) => item.model), ['seedance-2.5-720p']);
+    assert.match(result.warnings[0], /保存的目录快照/);
+  });
+
+  it('does not fabricate a catalog when no snapshot exists', () => {
+    assert.throws(
+      () => discoveryFromStoredSnapshot({}, Object.assign(new Error('unauthorized'), {
+        code: 'MODEL_DISCOVERY_AUTH_FAILED',
+      })),
+      /unauthorized/
+    );
+  });
+
+  it('keeps the production picker usable when live models is temporarily unavailable', async () => {
+    const config = {
+      provider: 'yinzi',
+      service_type: 'video',
+      base_url: 'https://snapshot-route.example/v1',
+      api_key: 'snapshot-key',
+      settings: { routing_mode: 'smart' },
+      model_catalog_snapshot: {
+        version: 1,
+        source_url: 'https://snapshot-route.example/v1/models',
+        availability_scope: 'credential',
+        scope_verified: true,
+        fetched_at: '2026-08-19T00:00:00.000Z',
+        models: [{ model: 'seedance-2.5-720p', endpoint_types: ['openai-video'] }],
+      },
+    };
+    const fetchImpl = async (url) => {
+      if (url.endsWith('/models')) return { ok: false, status: 503 };
+      if (url.endsWith('/model-capabilities')) return { ok: false, status: 500 };
+      if (url === 'https://yinziapi.top/api/pricing') return {
+        ok: true, status: 200, async json() { return { success: true, pricing_version: 'snapshot-price-v1', data: [{
+          model_name: 'seedance-2.5-720p', supported_endpoint_types: ['openai-video'], enable_groups: ['video'],
+          group_pricing: { video: { group: 'video', billing_unit: 'per_second', effective_model_price: 0.672 } },
+        }] }; },
+      };
+      throw new Error(`unexpected URL ${url}`);
+    };
+    const catalog = await discoverVideoCatalogForConfig(null, config, null, fetchImpl);
+    assert.equal(catalog.discovery_outcome, 'snapshot_reused');
+    assert.equal(catalog.stale_snapshot, true);
+    assert.equal(catalog.video[0].model, 'seedance-2.5-720p');
+    assert.equal(catalog.video[0].credential_verified, true);
+    assert.match(catalog.warnings.join('\n'), /保存的目录快照/);
+  });
+
+});
 
 function migrateQuietly() {
   const originalLog = console.log;
@@ -791,6 +868,220 @@ describe('production media executor', () => {
     assert.equal(requests.find((item) => item.frame_type === 'production_storyboard').reference_autolink_receipt.items[0].status, 'missing_approved_image');
   });
 
+  it('rebuilds a failed image action from the live model and config revision', async () => {
+    const imageConfig = aiConfigService.createConfig(db, log, {
+      service_type: 'image', provider: 'yinzi', name: 'Live image config',
+      base_url: 'https://old-image.example/v1', api_key: 'old-image-key',
+      model: ['image-model-a'], default_model: 'image-model-a', is_default: true,
+    });
+    let run = makeRun('live-image-config-switch', {
+      asset_image_config_id: imageConfig.id,
+      asset_image_model: 'image-model-a',
+      image_concurrency: 1,
+    });
+    addApproved(run, 'asset_text', 'character', 'character-1', 'Hero', {
+      name: 'Hero', description: 'stable identity', visual_prompt: 'identity sheet',
+    });
+
+    const statuses = new Map();
+    const requests = [];
+    let nextGenerationId = 5000;
+    const service = createProductionMediaService(db, cfg, log, {
+      createImage: async (request) => {
+        requests.push(request);
+        nextGenerationId += 1;
+        statuses.set(nextGenerationId, 'processing');
+        return { id: nextGenerationId, task_id: `image-live-${nextGenerationId}` };
+      },
+      getImage: async (id) => ({
+        id, task_id: `image-live-${id}`, status: statuses.get(id) || 'processing',
+      }),
+    });
+
+    const started = await service.ensureImageStage(run, 'asset_images');
+    assert.equal(started.state, 'waiting_task');
+    assert.equal(requests[0].model, 'image-model-a');
+    assert.equal(requests[0].image_config_id, imageConfig.id);
+    const oldAction = repo.getLatestAction(db, run.id, {
+      stage: 'asset_images', scope_type: 'character', scope_id: 'character-1', kind: 'image_generate',
+    });
+    statuses.set(oldAction.generation_id, 'failed');
+    const failed = await service.ensureImageStage(repo.getRun(db, run.id), 'asset_images');
+    assert.equal(failed.state, 'waiting_review');
+
+    const updatedConfig = aiConfigService.updateConfig(db, log, imageConfig.id, {
+      base_url: 'https://new-image.example/v1',
+      api_key: 'new-image-key',
+      model: ['image-model-b'],
+      default_model: 'image-model-b',
+    });
+    run = repo.updateRun(db, run.id, {
+      policy: { ...repo.getRun(db, run.id).policy, asset_image_model: 'image-model-b' },
+    });
+    assert.equal(updatedConfig.default_model, 'image-model-b');
+
+    const retried = await service.ensureImageStage(repo.getRun(db, run.id), 'asset_images');
+    assert.equal(retried.state, 'waiting_task');
+    assert.equal(requests.length, 2);
+    assert.equal(requests[1].model, 'image-model-b');
+    assert.equal(requests[1].image_config_id, imageConfig.id);
+    assert.notEqual(requests[0].image_config_fingerprint, requests[1].image_config_fingerprint);
+    const superseded = repo.getAction(db, oldAction.id);
+    assert.equal(superseded.status, 'cancelled');
+    assert.equal(superseded.result.superseded_by_config_change, true);
+    assert.equal(superseded.result.retry_authorized, true);
+  });
+
+  it('rebuilds a failed video action with the newly selected config instead of the old snapshot', async () => {
+    const oldConfig = aiConfigService.createConfig(db, log, {
+      service_type: 'video', provider: 'yinzi', name: 'Old live video config',
+      base_url: 'https://old-video.example/v1', api_key: 'old-video-key',
+      model: ['mg-seedance2.0 -480p mini'], default_model: 'mg-seedance2.0 -480p mini', is_default: true,
+    });
+    const newConfig = aiConfigService.createConfig(db, log, {
+      service_type: 'video', provider: 'yinzi', name: 'New live video config',
+      base_url: 'https://new-video.example/v1', api_key: 'new-video-key',
+      model: ['cc-seedance2.0 480p-fast-nsp'], default_model: 'cc-seedance2.0 480p-fast-nsp', is_default: false,
+    });
+    let run = makeRun('live-video-config-switch', {
+      video_routing_mode: 'fixed',
+      video_group: '特价视频分组(即梦)',
+      video_model: 'mg-seedance2.0 -480p mini',
+      video_config_id: oldConfig.id,
+      director_mode: 'off',
+    });
+    const shot = addApproved(run, 'storyboard_plan', 'shot', '1', 'Config switch shot', {
+      number: 1, duration: 5, visual: 'Stable medium shot', action: 'Hold one pose',
+      video_prompt: 'Hold the pose for the entire shot', previs_mode: 'skip', transition_mode: 'opening',
+    });
+    const storyboard = addApproved(run, 'storyboard_images', 'shot', '1', 'Config switch frame', {
+      source_artifact_id: shot.id,
+    }, [shot.id]);
+    db.prepare('UPDATE production_artifacts SET media_path = ? WHERE id = ?')
+      .run('images/config-switch.png', storyboard.id);
+
+    const requests = [];
+    const service = createProductionMediaService(db, cfg, log, {
+      fetchVideoCatalog: async () => routedCatalog(),
+      createVideo: async (request) => {
+        requests.push(request);
+        if (requests.length === 1) {
+          const error = new Error('old video route unavailable');
+          error.code = 'UPSTREAM_UNAVAILABLE';
+          throw error;
+        }
+        return { id: 6100, task_id: 'new-video-task', model: request.model };
+      },
+    });
+
+    const firstBundle = await service.ensureReferenceBundles(run);
+    assert.equal(firstBundle.state, 'progressed');
+    repo.reviewArtifact(db, firstBundle.artifact.id, {
+      reviewer_type: 'human', decision: 'approved', reason: 'old route bundle approved',
+    });
+    await assert.rejects(
+      () => service.ensureShotVideos(repo.getRun(db, run.id)),
+      (error) => error.code === 'UPSTREAM_UNAVAILABLE'
+    );
+    const oldAction = repo.getLatestAction(db, run.id, {
+      stage: 'shot_video', scope_type: 'shot', scope_id: '1', kind: 'video_generate',
+    });
+    assert.equal(oldAction.status, 'failed');
+    assert.equal(oldAction.request.model, 'mg-seedance2.0 -480p mini');
+    assert.equal(oldAction.request.video_config_id, oldConfig.id);
+
+    run = repo.updateRun(db, run.id, {
+      policy: {
+        ...repo.getRun(db, run.id).policy,
+        video_model: 'cc-seedance2.0 480p-fast-nsp',
+        video_config_id: newConfig.id,
+      },
+    });
+    const refreshed = await service.ensureShotVideos(repo.getRun(db, run.id));
+    assert.equal(refreshed.state, 'waiting_review');
+    assert.equal(refreshed.reason, 'reference_bundle_stale');
+    assert.equal(refreshed.artifact.status, 'draft');
+    assert.equal(refreshed.artifact.content.routing_receipt.model, 'cc-seedance2.0 480p-fast-nsp');
+    repo.reviewArtifact(db, refreshed.artifact.id, {
+      reviewer_type: 'human', decision: 'approved', reason: 'new route bundle approved',
+    });
+
+    const retried = await service.ensureShotVideos(repo.getRun(db, run.id));
+    assert.equal(retried.state, 'waiting_provider');
+    assert.equal(requests.length, 2);
+    assert.equal(requests[1].model, 'cc-seedance2.0 480p-fast-nsp');
+    assert.equal(requests[1].video_config_id, newConfig.id);
+    assert.notEqual(requests[0].video_config_fingerprint, requests[1].video_config_fingerprint);
+    const superseded = repo.getAction(db, oldAction.id);
+    assert.equal(superseded.status, 'cancelled');
+    assert.equal(superseded.result.retry_authorized, true);
+    assert.equal(superseded.result.superseded_by_route_change, true);
+    assert.equal(retried.action.request.video_config_id, newConfig.id);
+    assert.equal(retried.action.request.model, 'cc-seedance2.0 480p-fast-nsp');
+  });
+
+  it('keeps an already accepted provider task on its immutable config snapshot while polling', async () => {
+    const oldConfig = aiConfigService.createConfig(db, log, {
+      service_type: 'video', provider: 'yinzi', name: 'Polling old config',
+      base_url: 'https://poll-old.example/v1', api_key: 'poll-old-key',
+      model: ['mg-seedance2.0 -480p mini'], default_model: 'mg-seedance2.0 -480p mini', is_default: true,
+    });
+    const newConfig = aiConfigService.createConfig(db, log, {
+      service_type: 'video', provider: 'yinzi', name: 'Polling new config',
+      base_url: 'https://poll-new.example/v1', api_key: 'poll-new-key',
+      model: ['mg-seedance2.0 -480p mini'], default_model: 'mg-seedance2.0 -480p mini', is_default: false,
+    });
+    let run = makeRun('immutable-video-poll-snapshot', {
+      video_routing_mode: 'fixed',
+      video_group: '特价视频分组(即梦)',
+      video_model: 'mg-seedance2.0 -480p mini',
+      video_config_id: oldConfig.id,
+      director_mode: 'off',
+    });
+    const shot = addApproved(run, 'storyboard_plan', 'shot', '1', 'Polling snapshot shot', {
+      number: 1, duration: 5, visual: 'Stable medium shot', action: 'Hold one pose',
+      video_prompt: 'Hold the pose for the entire shot', previs_mode: 'skip', transition_mode: 'opening',
+    });
+    const storyboard = addApproved(run, 'storyboard_images', 'shot', '1', 'Polling snapshot frame', {
+      source_artifact_id: shot.id,
+    }, [shot.id]);
+    db.prepare('UPDATE production_artifacts SET media_path = ? WHERE id = ?')
+      .run('images/polling-snapshot.png', storyboard.id);
+
+    let createCalls = 0;
+    const pollIds = [];
+    const service = createProductionMediaService(db, cfg, log, {
+      fetchVideoCatalog: async () => routedCatalog(),
+      createVideo: async (request) => {
+        createCalls += 1;
+        return { id: 6200, task_id: 'immutable-poll-task', model: request.model };
+      },
+      getVideo: async (id) => {
+        pollIds.push(id);
+        return { id: 6200, task_id: 'immutable-poll-task', status: 'processing', model: 'mg-seedance2.0 -480p mini' };
+      },
+    });
+    const bundle = await service.ensureReferenceBundles(run);
+    repo.reviewArtifact(db, bundle.artifact.id, {
+      reviewer_type: 'human', decision: 'approved', reason: 'polling bundle approved',
+    });
+    const submitted = await service.ensureShotVideos(repo.getRun(db, run.id));
+    assert.equal(submitted.state, 'waiting_provider');
+    assert.equal(createCalls, 1);
+    assert.equal(submitted.action.request.video_config_id, oldConfig.id);
+
+    run = repo.updateRun(db, run.id, {
+      policy: { ...repo.getRun(db, run.id).policy, video_config_id: newConfig.id },
+    });
+    const polled = await service.ensureShotVideos(repo.getRun(db, run.id));
+    assert.equal(polled.state, 'waiting_provider');
+    assert.equal(polled.reason, 'video_generation');
+    assert.deepEqual(pollIds, [6200]);
+    assert.equal(createCalls, 1);
+    assert.equal(polled.action.request.video_config_id, oldConfig.id);
+    assert.equal(polled.action.request.model, 'mg-seedance2.0 -480p mini');
+  });
+
   it('fills the configured asset-image concurrency and refills each completed slot', async () => {
     let run = makeRun('parallel-asset-images');
     run = repo.updateRun(db, run.id, {
@@ -1155,6 +1446,113 @@ describe('production media executor', () => {
     assert.doesNotMatch(requests[1].prompt, /同一空场的四视图|激活后未来藤蔓覆盖地面|第二镜未来藤蔓形成光桥/);
   });
 
+  it('sends exact four-view layouts and type-specific exclusions for every resource kind', async () => {
+    const run = makeRun('typed-four-view-resource-sheets', {
+      aspect_ratio: '9:16',
+      image_concurrency: 3,
+    });
+    addApproved(run, 'asset_text', 'character', 'character-1', '银发少女', {
+      name: '银发少女',
+      description: '冷漠神情，银色长发，青白短袍，固定桃木剑鞘',
+      identity_anchors: ['银色长发', '青白短袍', '右腰桃木剑鞘'],
+      visual_prompt: '同一名少女的标准角色设定板',
+      negative_prompt: '短发，红衣，第二角色',
+    });
+    addApproved(run, 'asset_text', 'scene', 'scene-1', '赛博城屋顶', {
+      name: '赛博城屋顶',
+      location: '同一栋高楼的固定屋顶平台',
+      description: '雨夜，东侧霓虹塔，西侧水箱，中央停机坪',
+      spatial_anchors: ['东侧霓虹塔', '西侧水箱', '中央停机坪'],
+      reference_state: 'rainy_night_empty_rooftop',
+      visual_prompt: '同一屋顶平台的可还原空间设定板',
+      negative_prompt: '鲜花，白昼，人群',
+    });
+    addApproved(run, 'asset_text', 'prop', 'prop-1', '桃木剑', {
+      name: '桃木剑',
+      description: '同一柄深色桃木剑，铜制八卦护手，剑身一道朱砂符纹',
+      continuity_rules: ['始终只有一柄', '护手与符纹位置固定'],
+      visual_prompt: '同一柄桃木剑的产品设定板',
+      negative_prompt: '金属长剑，人物手持，双剑',
+    });
+
+    const requests = [];
+    const service = createProductionMediaService(db, cfg, log, {
+      createImage: async (request) => {
+        requests.push(request);
+        return { id: 900 + requests.length, task_id: `typed-sheet-${requests.length}` };
+      },
+    });
+
+    assert.equal((await service.ensureImageStage(run, 'asset_images')).state, 'waiting_task');
+    assert.equal(requests.length, 3);
+    const byType = Object.fromEntries(requests.map((request) => [request.frame_type, request]));
+    const character = byType.character_reference_sheet;
+    const scene = byType.scene_reference_sheet;
+    const prop = byType.prop_reference_sheet;
+
+    for (const request of [character, scene, prop]) {
+      assert.ok(request);
+      assert.equal(request.aspect_ratio, '9:16');
+      assert.match(request.prompt, /恰好四个等宽、互不重叠的清晰视图/);
+      assert.match(request.prompt, /目标画幅 9:16/);
+      assert.equal(request.prompt_snapshot.prompt_id, 'production.image_asset.template');
+      assert.equal(request.prompt_snapshot.customized, false);
+      assert.match(request.negative_prompt, /three panels/);
+      assert.match(request.negative_prompt, /five panels/);
+      assert.match(request.negative_prompt, /text/);
+      assert.match(request.negative_prompt, /watermark/);
+    }
+
+    assert.match(character.prompt, /正面、左侧面、背面、右侧面/);
+    assert.match(character.prompt, /头顶到脚底完整/);
+    assert.match(character.negative_prompt, /second character/);
+    assert.match(character.negative_prompt, /cropped feet/);
+    assert.match(character.negative_prompt, /短发，红衣，第二角色/);
+
+    assert.match(scene.prompt, /全景、主方向、反方向、关键区域/);
+    assert.match(scene.prompt, /rainy_night_empty_rooftop/);
+    assert.match(scene.negative_prompt, /four different places/);
+    assert.match(scene.negative_prompt, /changing landmarks/);
+    assert.match(scene.negative_prompt, /鲜花，白昼，人群/);
+
+    assert.match(prop.prompt, /正面、侧面、背面、关键结构角度/);
+    assert.match(prop.prompt, /无手持者、人物、战斗/);
+    assert.match(prop.negative_prompt, /person holding the object/);
+    assert.match(prop.negative_prompt, /four different objects/);
+    assert.match(prop.negative_prompt, /金属长剑，人物手持，双剑/);
+  });
+
+  it('keeps custom image templates authoritative while still filling live asset and aspect variables', async () => {
+    promptRegistry.set(
+      db,
+      'production.image_asset.template',
+      '用户模板标记\n动态资源：{{base_prompt}}\n动态画幅：{{aspect_prompt}}'
+    );
+    const run = makeRun('custom-resource-image-template', {
+      aspect_ratio: '9:16',
+      image_concurrency: 1,
+    });
+    addApproved(run, 'asset_text', 'prop', 'prop-1', '罗盘', {
+      name: '罗盘',
+      description: '同一枚黑铜罗盘，十二刻度与中心指针固定',
+      visual_prompt: '同一件罗盘的四角度设定板',
+      negative_prompt: '人物，剧情动作',
+    });
+    let request;
+    const service = createProductionMediaService(db, cfg, log, {
+      createImage: async (value) => {
+        request = value;
+        return { id: 920, task_id: 'custom-sheet-1' };
+      },
+    });
+
+    assert.equal((await service.ensureImageStage(run, 'asset_images')).state, 'waiting_task');
+    assert.match(request.prompt, /^用户模板标记/);
+    assert.match(request.prompt, /同一件关键道具恰好四格产品设定板/);
+    assert.match(request.prompt, /目标画幅 9:16/);
+    assert.equal(request.prompt_snapshot.customized, true);
+  });
+
   it('persists every selected asset image as a storyboard dependency', async () => {
     const run = makeRun();
     const character = addApproved(run, 'asset_text', 'character', 'character-1', '林夏', {
@@ -1317,6 +1715,9 @@ describe('production media executor', () => {
     assert.equal(requests[0].model, 'mg-seedance2.0 -480p mini');
     assert.equal(requests[0].duration, 5);
     assert.deepEqual(requests[0].reference_video_urls, []);
+    assert.equal(requests[0].routing_receipt.capability_model, 'mg-seedance2.0 -480p mini');
+    assert.equal(requests[0].routing_receipt.capability_snapshot.max_images, 4);
+    assert.equal(requests[0].routing_receipt.capability_snapshot.max_videos, 3);
     assert.deepEqual(repo.getRun(db, run.id).usage, {
       video_attempts_reserved: 1,
       video_seconds_reserved: 5,
@@ -2089,5 +2490,202 @@ describe('production media executor', () => {
     assert.equal(completed.state, 'progressed');
     assert.equal(compared, 1);
     assert.equal(completed.artifact.content.boundary_validation.passed, true);
+  });
+
+  it('executes the bounded Seedance 2.5 to 2.0 parent/child fallback chain exactly once', async () => {
+    const run = makeRun('seedance-parent-child-fallback', {
+      video_routing_mode: 'auto', video_model: 'seedance-2.5-720p',
+      video_fallback_model: 'seedance2.0 -720p-fast-15s',
+      video_group: '特价视频分组(即梦)', allow_auto_model_switch: true, director_mode: 'off',
+    });
+    const shot = addApproved(run, 'storyboard_plan', 'shot', '1', 'Fallback shot', {
+      number: 1, duration: 20, action: '保持连续动作', visual: '稳定中景',
+      video_prompt: 'One continuous action beat.', previs_mode: 'skip', transition_mode: 'opening',
+    });
+    const frame = addApproved(run, 'storyboard_images', 'shot', '1', 'Fallback frame', {
+      source_artifact_id: shot.id,
+    }, [shot.id]);
+    db.prepare('UPDATE production_artifacts SET media_path = ? WHERE id = ?').run('images/fallback.png', frame.id);
+    const requests = [];
+    const states = new Map();
+    let nextId = 2000;
+    let mergeCalls = 0;
+    const model25 = 'seedance-2.5-720p';
+    const model20 = 'seedance2.0 -720p-fast-15s';
+    const catalogItem = (model, capability, price) => ({
+      model, endpoint_types: ['openai-video'], groups: ['特价视频分组(即梦)'], capabilities: capability,
+      prices: [{ group: '特价视频分组(即梦)', billing_unit: 'per_request', effective_price: price }],
+    });
+    const service = createProductionMediaService(db, cfg, log, {
+      fetchVideoCatalog: async () => ({ pricing_version: 'fallback-test-v1', fetched_at: new Date().toISOString(), video: [
+        catalogItem(model25, getYinziVideoCapability(model25), 3.5),
+      ] }),
+      createVideo: async (request) => {
+        requests.push(structuredClone(request));
+        nextId += 1;
+        states.set(nextId, {
+          status: request.model === model25 ? 'failed' : 'completed',
+          model: request.model,
+        });
+        return { id: nextId, task_id: `fallback-task-${nextId}`, model: request.model };
+      },
+      getVideo: async (id) => ({
+        id, task_id: `fallback-task-${id}`, ...states.get(id),
+        local_path: `videos/fallback-${id}.mp4`, video_url: `videos/fallback-${id}.mp4`,
+        submission_status: states.get(id)?.status === 'failed' ? 'rejected' : 'accepted',
+        error_msg: states.get(id)?.status === 'failed' ? 'model unavailable' : null,
+      }),
+      validateVideo: async (mediaPath) => videoReceipt(mediaPath),
+      extractContinuityFrame: async () => ({ relative_path: 'production/fallback-tail.png', sha256: 'c'.repeat(64) }),
+      mergeVideoSegments: async (paths) => {
+        mergeCalls += 1;
+        assert.equal(paths.length, 2);
+        return { relative_path: 'videos/fallback-merged.mp4', absolute_path: 'C:/storage/videos/fallback-merged.mp4' };
+      },
+    });
+    const bundle = await service.ensureReferenceBundles(run);
+    repo.reviewArtifact(db, bundle.artifact.id, { reviewer_type: 'human', decision: 'approved', reason: 'fallback fixture' });
+    assert.equal((await service.ensureShotVideos(repo.getRun(db, run.id))).state, 'waiting_provider');
+    const afterFailure = await service.ensureShotVideos(repo.getRun(db, run.id));
+    assert.equal(afterFailure.state, 'waiting_provider');
+    assert.deepEqual(requests.map((item) => [item.model, item.duration]), [[model25, 30], [model20, 15]]);
+    const afterA = await service.ensureShotVideos(repo.getRun(db, run.id));
+    assert.equal(afterA.state, 'waiting_provider');
+    assert.deepEqual(requests.map((item) => [item.model, item.duration]), [[model25, 30], [model20, 15], [model20, 15]]);
+    const done = await service.ensureShotVideos(repo.getRun(db, run.id));
+    assert.equal(done.state, 'progressed');
+    assert.equal(done.reason, 'video_fallback_converged');
+    assert.equal(mergeCalls, 1);
+    assert.equal(requests.length, 3);
+    const actions = repo.listActions(db, run.id, { page_size: 200 }).items;
+    const children = actions.filter((item) => item.parent_action_id);
+    assert.equal(children.length, 2);
+    assert.deepEqual(children.map((item) => item.segment_index).sort(), [1, 2]);
+    assert.equal(repo.getRun(db, run.id).runtime.fallback_reserved_microusd, 0);
+    assert.equal(repo.listArtifacts(db, run.id, { stage: 'shot_video', current: true, page_size: 20 }).items.length, 1);
+  });
+
+  it('keeps explicit local cancellation local and releases only an unsubmitted reservation', async () => {
+    const run = makeRun('cancel-local-reserved');
+    const reserved = repo.reserveAction(db, {
+      run_id: run.id, action_key: 'local-cancel-a1', stage: 'shot_video',
+      scope_type: 'shot', scope_id: '1', kind: 'video_generate', attempt: 1,
+      request: { model: 'manual-video' }, reserved_video_seconds: 5,
+    }).action;
+    let cancelCalls = 0;
+    const service = createProductionMediaService(db, cfg, log, {
+      cancelProviderTask: async () => { cancelCalls += 1; return { cancelled: true }; },
+    });
+    const result = await service.cancelRunAction(run.id, {
+      action_id: reserved.id, cancel_mode: 'cancel_local_request', reason: '先看历史记录',
+    });
+    assert.equal(result.status, 'cancelled_local');
+    assert.equal(cancelCalls, 0);
+    assert.equal(repo.getAction(db, reserved.id).status, 'cancelled');
+    assert.equal(db.prepare('SELECT status FROM cost_ledger WHERE action_id = ?').get(reserved.id), undefined);
+    const repeated = await service.cancelRunAction(run.id, {
+      action_id: reserved.id, cancel_mode: 'cancel_local_request',
+    });
+    assert.equal(repeated.status, 'cancelled');
+    assert.equal(cancelCalls, 0);
+  });
+
+  it('stops local observation for an accepted task without polling or releasing its charge', async () => {
+    const run = makeRun('cancel-local-accepted');
+    const accepted = repo.reserveAction(db, {
+      run_id: run.id, action_key: 'local-cancel-accepted-a1', stage: 'shot_video',
+      scope_type: 'shot', scope_id: '1', kind: 'video_generate', attempt: 1,
+      request: { model: 'manual-video' }, reserved_video_seconds: 5,
+    }).action;
+    repo.updateAction(db, accepted.id, {
+      status: 'waiting', task_id: 'provider-task-1', generation_id: 91, provider_id: 'provider-task-1',
+    });
+    let pollCalls = 0;
+    const service = createProductionMediaService(db, cfg, log, {
+      getVideo: async () => { pollCalls += 1; return { id: 91, status: 'processing' }; },
+    });
+    const result = await service.cancelRunAction(run.id, {
+      action_id: accepted.id, cancel_mode: 'cancel_local_request', reason: '停止当前页面等待',
+    });
+    assert.equal(result.status, 'local_observation_stopped');
+    assert.equal(result.billable_status, 'uncertain');
+    assert.equal(repo.getAction(db, accepted.id).status, 'waiting');
+    assert.equal(repo.getAction(db, accepted.id).result.local_observation_stopped, true);
+    assert.equal(repo.getAction(db, accepted.id).provider_id, 'provider-task-1');
+    assert.equal(pollCalls, 0);
+    const repeated = await service.cancelRunAction(run.id, { action_id: accepted.id, cancel_mode: 'cancel_local_request' });
+    assert.equal(repeated.status, 'local_observation_stopped');
+    assert.equal(pollCalls, 0);
+  });
+
+  it('calls the provider adapter only through explicit provider cancellation and remains truthful on failure', async () => {
+    const run = makeRun('cancel-provider-explicit');
+    const accepted = repo.reserveAction(db, {
+      run_id: run.id, action_key: 'provider-cancel-a1', stage: 'shot_video',
+      scope_type: 'shot', scope_id: '1', kind: 'video_generate', attempt: 1,
+      request: { model: 'manual-video' }, reserved_video_seconds: 5,
+    }).action;
+    repo.updateAction(db, accepted.id, {
+      status: 'waiting', task_id: 'provider-task-2', generation_id: 92, provider_id: 'provider-task-2',
+    });
+    let calls = 0;
+    const service = createProductionMediaService(db, cfg, log, {
+      cancelProviderTask: async ({ provider_task_id }) => {
+        calls += 1;
+        assert.equal(provider_task_id, 'provider-task-2');
+        throw new Error('provider cancel endpoint unavailable');
+      },
+    });
+    const result = await service.cancelRunAction(run.id, {
+      action_id: accepted.id, cancel_mode: 'cancel_provider_task', reason: '供应商任务过久',
+    });
+    assert.equal(result.status, 'cancel_requested_provider_unknown');
+    assert.equal(result.billable_status, 'uncertain');
+    assert.equal(calls, 1);
+    assert.equal(repo.getAction(db, accepted.id).status, 'waiting');
+    assert.equal(repo.getAction(db, accepted.id).result.cancel_requested_provider_unknown, true);
+    const repeated = await service.cancelRunAction(db ? run.id : run.id, {
+      action_id: accepted.id, cancel_mode: 'cancel_provider_task',
+    });
+    assert.equal(repeated.status, 'cancel_requested_provider_unknown');
+    assert.equal(calls, 1);
+  });
+
+  it('does not poll a provider-cancelled action when the shot runner is re-entered', async () => {
+    const run = makeRun('cancel-provider-no-poll', {
+      video_routing_mode: 'fixed', video_model: 'manual-video', director_mode: 'off',
+    });
+    const shot = addApproved(run, 'storyboard_plan', 'shot', '1', 'Cancelled shot', {
+      number: 1, duration: 5, action: 'Hold', visual: 'Static', video_prompt: 'Hold still.',
+      previs_mode: 'skip', transition_mode: 'opening', character_names: [], prop_names: [],
+    });
+    const frame = addApproved(run, 'storyboard_images', 'shot', '1', 'Cancelled frame', {
+      source_artifact_id: shot.id,
+    }, [shot.id]);
+    db.prepare('UPDATE production_artifacts SET media_path = ? WHERE id = ?').run('images/cancelled.png', frame.id);
+    const bundle = await createProductionMediaService(db, cfg, log, {
+      fetchVideoCatalog: async () => customVideoCatalog('manual-video'),
+    }).ensureReferenceBundles(run);
+    repo.reviewArtifact(db, bundle.artifact.id, { reviewer_type: 'human', decision: 'approved', reason: 'cancel test' });
+    const action = repo.reserveAction(db, {
+      run_id: run.id, action_key: 'shot_video:1:generate:a1', stage: 'shot_video',
+      scope_type: 'shot', scope_id: '1', kind: 'video_generate', attempt: 1,
+      request: { model: 'manual-video', source_artifact_id: shot.id, bundle_artifact_id: bundle.artifact.id,
+        routing_receipt: { model: 'manual-video', duration: 5 } }, reserved_video_seconds: 5,
+    }).action;
+    repo.updateAction(db, action.id, {
+      status: 'waiting', task_id: 'provider-task-3', generation_id: 93, provider_id: 'provider-task-3',
+      result: { source_artifact_id: shot.id, bundle_artifact_id: bundle.artifact.id,
+        local_observation_stopped: true },
+    });
+    let polls = 0;
+    const service = createProductionMediaService(db, cfg, log, {
+      fetchVideoCatalog: async () => customVideoCatalog('manual-video'),
+      getVideo: async () => { polls += 1; return { id: 93, status: 'processing' }; },
+    });
+    const result = await service.ensureShotVideos(repo.getRun(db, run.id));
+    assert.equal(result.state, 'waiting_review');
+    assert.equal(result.reason, 'local_observation_stopped');
+    assert.equal(polls, 0);
   });
 });

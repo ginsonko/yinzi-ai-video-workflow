@@ -347,13 +347,146 @@ describe('production final edit and export', () => {
     assert.equal(creates, 1);
     assert.equal(repo.listActions(db, run.id, { page_size: 200 }).items
       .filter((item) => item.kind === 'strict_merge').length, 1);
+    const rebuildAction = repo.listActions(db, run.id, { page_size: 200 }).items
+      .find((item) => item.kind === 'strict_merge');
+    assert.equal(rebuildAction.request.force_rebuild, true);
+    assert.equal(rebuildAction.request.revision_reason, '旁白不变，重新执行本地剪辑');
 
     mergeStatus = 'completed';
     const reconciled = await workflow.advance(run.id, { lease_owner: 'poll-final-edit' });
     assert.equal(reconciled.state, 'progressed');
     assert.equal(reconciled.artifact.status, 'draft');
     assert.equal(reconciled.artifact.content.narration_plan_artifact_id, plan.id);
+    assert.deepEqual(reconciled.artifact.content.revision_receipt, {
+      force_rebuild: true,
+      reason: '旁白不变，重新执行本地剪辑',
+      strict_merge_action_id: rebuildAction.id,
+    });
+    assert.equal(repo.getAction(db, rebuildAction.id).result.revision_reason, '旁白不变，重新执行本地剪辑');
     assert.equal(creates, 1);
+  });
+
+  it('turns final voice-sync rejection into a revised narration plan with the full review brief', async () => {
+    let run = makeRun('ai');
+    const shotPlan = approved(run, 'storyboard_plan', 'shot', '1', '镜头一', {
+      number: 1, duration: 5, narration: '她抬头看见晨光。', video_prompt: '稳定中景。',
+    });
+    const shotVideo = approved(run, 'shot_video', 'shot', '1', '镜头一', {
+      source_artifact_id: shotPlan.id, validation: { duration: 5 },
+    }, 'videos/shot-1.mp4', [shotPlan.id]);
+    const planContent = narrationPlan.normalizeNarrationPlan({}, [shotPlan], [shotVideo]);
+    const plan = approved(run, 'final_edit', 'narration', 'settings', '旁白设置', planContent);
+    const final = repo.createArtifact(db, {
+      run_id: run.id, stage: 'final_edit', scope_type: 'run', scope_id: '', title: '待审成片',
+      content: {
+        kind: 'final_video', included: true, source_shot_artifact_ids: [shotVideo.id],
+        narration_plan_artifact_id: plan.id,
+        narration_confirmation_fingerprint: planContent.confirmation_fingerprint,
+        validation: { duration: 5 },
+      },
+      status: 'draft', media_path: 'videos/final-voice-sync.mp4', mime_type: 'video/mp4',
+      depends_on: [plan.id, shotVideo.id],
+    });
+    run = repo.updateRun(db, run.id, {
+      current_stage: 'final_edit', status: 'running',
+      review_profile: { model: 'vision-review-model', version: 'final-review-v1' },
+    });
+    const rewriteCalls = [];
+    const workflow = createProductionService(db, cfg, log, {
+      validateVideo: async () => ({ duration: 5, video_codec: 'h264', audio_codec: 'aac', nonblank: true }),
+      prepareReviewEvidence: async () => ({
+        imageSource: { localAbsPath: 'C:\\review\\final-sheet.jpg' },
+        receipt: { kind: 'video_first_middle_last_sheet', sampled_at_seconds: [0.4, 2.5, 4.6] },
+        cleanup() {},
+      }),
+      generateTextWithVision: async () => JSON.stringify({
+        decision: 'rejected', reason: '旁白比画面慢一整拍，字幕进入下一章节后才出现',
+        confidence: 0.97, severity: 'major',
+        blocking_issues: ['把本镜旁白压缩到镜头结束前完成，并将字幕锁定到本镜时间窗'],
+        improvement_notes: ['背景原声可再降低少量音量'], requires_human_authority: false,
+        scores: { continuity: 35, production_ready: 30 },
+      }),
+      generateText: async (user, system, options) => {
+        rewriteCalls.push({ user, system, options });
+        return JSON.stringify({ ...planContent, speed: 1.12, provider_audio_volume: 0.55 });
+      },
+    });
+
+    const result = await workflow.applyReviewPolicy(run, [final]);
+    assert.equal(result.state, 'progressed');
+    assert.equal(result.reason, 'final_narration_plan_revised');
+    const revisedPlan = repo.listArtifacts(db, run.id, {
+      stage: 'final_edit', scope_type: 'narration', scope_id: 'settings', current: true,
+    }).items[0];
+    assert.equal(revisedPlan.revision, 2);
+    assert.equal(revisedPlan.status, 'draft');
+    assert.equal(revisedPlan.content.speed, 1.12);
+    assert.equal(repo.getArtifact(db, final.id).status, 'invalidated');
+    assert.equal(rewriteCalls.length, 1);
+    assert.match(rewriteCalls[0].user, /旁白比画面慢一整拍/);
+    assert.match(rewriteCalls[0].user, /把本镜旁白压缩到镜头结束前完成/);
+    assert.match(rewriteCalls[0].user, /背景原声可再降低少量音量/);
+    const rewriteAction = repo.listActions(db, run.id, { page_size: 100 }).items
+      .find((item) => item.kind === 'ai_rewrite');
+    assert.match(rewriteAction.request.instruction, /不得升级成新门槛/);
+  });
+
+  it('escalates an ambiguous final rejection only when the revision planner proves human authority is required', async () => {
+    let run = makeRun('ai');
+    const shotPlan = approved(run, 'storyboard_plan', 'shot', '1', '镜头一', {
+      number: 1, duration: 5, narration: '', video_prompt: '稳定中景。',
+    });
+    const shotVideo = approved(run, 'shot_video', 'shot', '1', '镜头一', {
+      source_artifact_id: shotPlan.id, validation: { duration: 5 },
+    }, 'videos/shot-1.mp4', [shotPlan.id]);
+    const planContent = narrationPlan.normalizeNarrationPlan({ narration_enabled: false }, [shotPlan], [shotVideo]);
+    const plan = approved(run, 'final_edit', 'narration', 'settings', '原声设置', planContent);
+    const final = repo.createArtifact(db, {
+      run_id: run.id, stage: 'final_edit', scope_type: 'run', scope_id: '', title: '待核权成片',
+      content: {
+        kind: 'final_video', included: true, source_shot_artifact_ids: [shotVideo.id],
+        narration_plan_artifact_id: plan.id,
+        narration_confirmation_fingerprint: planContent.confirmation_fingerprint,
+      },
+      status: 'draft', media_path: 'videos/final-rights.mp4', mime_type: 'video/mp4',
+      depends_on: [plan.id, shotVideo.id],
+    });
+    run = repo.updateRun(db, run.id, {
+      current_stage: 'final_edit', status: 'running',
+      review_profile: { model: 'vision-review-model', version: 'final-review-v1' },
+    });
+    const workflow = createProductionService(db, cfg, log, {
+      validateVideo: async () => ({ duration: 5, video_codec: 'h264', audio_codec: 'aac', nonblank: true }),
+      prepareReviewEvidence: async () => ({
+        imageSource: { localAbsPath: 'C:\\review\\rights-sheet.jpg' },
+        receipt: { kind: 'video_first_middle_last_sheet', sampled_at_seconds: [0.4, 2.5, 4.6] },
+        cleanup() {},
+      }),
+      generateTextWithVision: async () => JSON.stringify({
+        decision: 'rejected', reason: '成片出现真实品牌授权标识，项目没有提供授权状态',
+        confidence: 0.95, severity: 'critical',
+        blocking_issues: ['必须确认该真实品牌标识是否获得发布授权'],
+        improvement_notes: [], requires_human_authority: false,
+        scores: { production_ready: 20 },
+      }),
+      generateText: async (_user, _system, options) => {
+        assert.equal(options.scene_key, 'production_final_edit_revision');
+        return JSON.stringify({
+          action: 'needs_human', shot_id: '', reason: '授权状态是不可从素材推断的外部事实',
+          instruction: '请确认品牌授权，或明确允许移除该标识', requires_human_authority: true,
+        });
+      },
+    });
+
+    const result = await workflow.applyReviewPolicy(run, [final]);
+    assert.equal(result.state, 'waiting_review');
+    assert.equal(result.reason, 'human_authority_required');
+    assert.equal(result.run.error_code, 'HUMAN_AUTHORITY_REQUIRED');
+    assert.equal(result.run.runtime.autonomy.intervention.reason, 'human_authority_required');
+    const object = Object.values(result.run.runtime.autonomy.objects)[0];
+    assert.equal(object.consecutive_review_failures, 1);
+    assert.equal(repo.listActions(db, run.id, { page_size: 100 }).items
+      .filter((item) => item.kind === 'ai_rewrite').length, 0);
   });
 
   it('keeps an outdated final as history but blocks edits, AI rewrite, review, and export', async () => {

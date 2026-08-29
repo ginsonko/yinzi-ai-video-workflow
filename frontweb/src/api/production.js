@@ -70,6 +70,18 @@ export const productionAPI = {
   cancel(id, body = {}) {
     return request.post(`/production-runs/${id}/cancel`, body)
   },
+  detach(id, body = {}) {
+    return request.post(`/production-runs/${id}/detach`, body)
+  },
+  cancelAction(id, body = {}) {
+    return request.post(`/production-runs/${id}/cancel-action`, body)
+  },
+  cancelLocal(id, body = {}) {
+    return request.post(`/production-runs/${id}/cancel-local`, body)
+  },
+  cancelProvider(id, body = {}) {
+    return request.post(`/production-runs/${id}/cancel-provider`, body)
+  },
   transition(id, body) {
     return request.post(`/production-runs/${id}/transition`, body)
   },

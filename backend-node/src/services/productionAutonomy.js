@@ -112,7 +112,10 @@ function recordAttempt(run, input = {}) {
   const kind = input.kind === 'review' ? 'review' : 'generation';
   const countKey = kind === 'review' ? 'consecutive_review_failures' : 'consecutive_generation_failures';
   const count = Math.max(0, Number(previous[countKey]) || 0) + 1;
-  const limit = limitFor(run, input.stage, kind);
+  const configuredLimit = Number(input.limit);
+  const limit = Number.isFinite(configuredLimit)
+    ? Math.min(20, Math.max(1, Math.floor(configuredLimit)))
+    : limitFor(run, input.stage, kind);
   const attempt = {
     at: input.at || new Date().toISOString(),
     kind,

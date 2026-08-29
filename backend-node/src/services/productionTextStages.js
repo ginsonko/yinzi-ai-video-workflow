@@ -1,7 +1,20 @@
 const { safeParseAIJSON } = require('../utils/safeJson');
+const { providerDurationForCapability } = require('./yinziVideoCapabilities');
 
 function cleanText(value, max = 20000) {
   return String(value == null ? '' : value).trim().slice(0, max);
+}
+
+function seriesContextText(context = {}) {
+  const group = context?.group;
+  const selected = Array.isArray(context?.selected) ? context.selected : [];
+  const candidates = Array.isArray(context?.candidates) ? context.candidates : [];
+  if (!group && !selected.length && !candidates.length) return '';
+  return cleanText(JSON.stringify({
+    group,
+    selected: selected.map((item) => ({ asset_key: item.asset_key, asset_type: item.asset_type, title: item.title, version: item.version, content: item.content })),
+    candidates: candidates.filter((item) => !item.selected).map((item) => ({ asset_key: item.asset_key, asset_type: item.asset_type, title: item.title, version: item.version, content: item.content })),
+  }), 20000);
 }
 
 function unwrapArray(parsed, keys) {
@@ -94,9 +107,27 @@ function normalizeShot(item, index, options = {}) {
   const visual = cleanText(item?.visual || item?.composition || item?.layout_description || '', 4000);
   const videoPrompt = cleanText(item?.video_prompt || [visual, action].filter(Boolean).join('。'), 6000);
   if (!action || !visual || !videoPrompt) return null;
-  const durationMin = Math.max(5, Number(options.duration_min) || 5);
-  const durationMax = Math.max(durationMin, Number(options.duration_max) || 15);
-  const duration = Math.max(durationMin, Math.min(durationMax, Math.round(Number(item?.duration) || 5)));
+  const durationMin = Number.isFinite(Number(options.duration_min))
+    ? Math.max(1, Number(options.duration_min)) : 1;
+  const durationMax = Number.isFinite(Number(options.duration_max))
+    ? Math.max(durationMin, Number(options.duration_max)) : 60;
+  const requestedDuration = Math.round(Number(item?.duration));
+  const duration = Math.min(durationMax, Math.max(durationMin,
+    Number.isFinite(requestedDuration) && requestedDuration > 0 ? requestedDuration : durationMin));
+  // Keep the editorial/creative duration separate from the provider execution
+  // unit.  When a concrete capability is available, it is the source of truth
+  // (for example Seedance 2.5 always executes a 30-second request); an unknown
+  // model remains unknown instead of being silently forced to five seconds.
+  const providerDuration = options.provider_capability
+    ? providerDurationForCapability(options.provider_capability, duration)
+    : Number.isFinite(Number(item?.provider_duration_seconds))
+      ? Number(item.provider_duration_seconds)
+      : null;
+  const finalEditDuration = Number.isFinite(Number(item?.final_edit_duration_seconds))
+    ? Number(item.final_edit_duration_seconds)
+    : duration;
+  const incomingPlan = item?.duration_plan && typeof item.duration_plan === 'object'
+    ? item.duration_plan : {};
   const requestedProfile = ['short_image_guided', 'long_previs_guided'].includes(item?.route_profile)
     ? item.route_profile
     : null;
@@ -157,6 +188,15 @@ function normalizeShot(item, index, options = {}) {
       : [],
     image_prompt: cleanText(item?.image_prompt || [visual, action].filter(Boolean).join('。'), 5000),
     video_prompt: videoPrompt,
+    creative_duration_seconds: duration,
+    provider_duration_seconds: providerDuration,
+    final_edit_duration_seconds: finalEditDuration,
+    duration_plan: {
+      ...incomingPlan,
+      creative_seconds: duration,
+      provider_seconds: providerDuration,
+      final_edit_seconds: finalEditDuration,
+    },
     included: item?.included !== false,
     required_fields: requiredFields,
   };
@@ -176,31 +216,37 @@ function normalizeShots(raw, log, maxShots = 12, options = {}) {
 function scriptPrompts(source, policy = {}) {
   const targetShots = Math.max(1, Number(policy.target_shots) || 3);
   const style = cleanText(policy.style || policy.visual_style || '电影感科幻写实', 300);
+  const seriesContext = seriesContextText(policy.series_context);
   return {
-    system: `你是拥有创作决策权的专业短片编剧。把用户输入视为创作简报，而不是等待用户补完的问卷。用户明确给出的角色、世界观、情节、风格、时长和禁区是必须遵守的硬约束；对于用户没有指定的姓名、关系、场景细节、冲突、动作、对白、转折和结局，你必须主动做出一致、合理、可拍摄的创作选择，不能回答“用户未指定”、不能把普通创作决定退回给用户，也不要要求补充非必要信息。输入很简略或只要求你自行创作时，应直接构思一个完整短片。\n必须包含：片名、人物表、场景表，以及按场次书写的环境、动作、对白和必要旁白。重点保证因果清晰、角色动机明确、视觉动作可拍摄、前后连续，并控制在目标镜头规模内。不要输出 JSON，不要解释创作过程。`,
-    user: `请根据以下创作简报完成约 ${targetShots} 个镜头规模的短片剧本。视觉风格：${style}。明确要求必须保留；未指定的创作要素由你直接决定并写完整。\n\n创作简报：\n${cleanText(source, 45000)}`,
+    system: `你是拥有创作决策权的专业短片编剧。把用户输入视为创作简报，而不是等待用户补完的问卷。用户明确给出的角色、世界观、情节、风格、时长和禁区是必须遵守的硬约束；对于用户没有指定的姓名、关系、场景细节、冲突、动作、对白、转折和结局，你必须主动做出一致、合理、可拍摄的创作选择，不能回答“用户未指定”、不能把普通创作决定退回给用户，也不要要求补充非必要信息。输入很简略或只要求你自行创作时，应直接构思一个完整短片。\n必须包含：片名、人物表、场景表，以及按场次书写的环境、动作、对白和必要旁白。重点保证因果清晰、角色动机明确、视觉动作可拍摄、前后连续，并控制在目标镜头规模内。若提供剧集组资产，selected 是用户已明确选择复用的版本，必须保持其身份和设定；candidates 只是可复用候选，你可以建议但不得静默当作已选。不要输出 JSON，不要解释创作过程。`,
+    user: `请根据以下创作简报完成约 ${targetShots} 个镜头规模的短片剧本。视觉风格：${style}。明确要求必须保留；未指定的创作要素由你直接决定并写完整。${seriesContext ? `\n\n剧集组资产上下文：\n${seriesContext}` : ''}\n\n创作简报：\n${cleanText(source, 45000)}`,
   };
 }
 
 function resourcePrompts(scriptText, policy = {}) {
   const style = cleanText(policy.style || policy.visual_style || '电影感科幻写实', 300);
+  const seriesContext = seriesContextText(policy.series_context);
   return {
-    system: `你是影视前期资产总监。阅读剧本并抽取真正需要保持一致性的角色、场景、关键道具。只返回 JSON 对象，不要 Markdown。\n结构：{"characters":[...],"scenes":[...],"props":[...]}。\n每个角色必须有 name, role, description, appearance, identity_anchors(数组), continuity_rules, visual_prompt, negative_prompt。\n每个场景必须有 name, location, time, description, spatial_anchors(数组), visual_prompt, negative_prompt。\n每个道具必须有 name, category, description, continuity_rules, visual_prompt, negative_prompt。\n描述必须具体、可见、可用于一致性生图，不要用空泛形容词。`,
-    user: `视觉风格：${style}\n请抽取并设计以下剧本所需资产：\n\n${cleanText(scriptText, 45000)}`,
+    system: `你是影视前期资产总监。阅读剧本并抽取真正需要保持一致性的角色、场景、关键道具。只返回 JSON 对象，不要 Markdown。\n结构：{"characters":[...],"scenes":[...],"props":[...]}。\n每个角色必须有 name, role, description, appearance, identity_anchors(数组), continuity_rules, visual_prompt, negative_prompt。\n每个场景必须有 name, location, time, description, spatial_anchors(数组), visual_prompt, negative_prompt。\n每个道具必须有 name, category, description, continuity_rules, visual_prompt, negative_prompt。\n描述必须具体、可见、可用于一致性生图，不要用空泛形容词。若剧集组 selected 中已有对应资产，优先原样保留并在对象中写 reuse_asset_key；candidates 仅用于提出 reuse_suggestion，不得把未确认候选伪装成已复用。`,
+    user: `视觉风格：${style}${seriesContext ? `\n剧集组资产上下文：${seriesContext}` : ''}\n请抽取并设计以下剧本所需资产：\n\n${cleanText(scriptText, 45000)}`,
   };
 }
 
 function storyboardPrompts(scriptText, resources, policy = {}) {
   const targetShots = Math.max(1, Number(policy.target_shots) || 3);
-  const maxSeconds = Math.max(5, Number(policy.max_total_seconds || policy.total_seconds || 60));
-  const minShotSeconds = Math.max(5, Number(policy.video_duration_min) || 5);
+  const maxSeconds = Math.max(1, Number(policy.max_total_seconds || policy.total_seconds || 60));
+  const minShotSeconds = Math.max(1, Number(policy.video_duration_min) || 1);
+  const maxShotSeconds = Math.max(minShotSeconds, Number(policy.video_duration_max) || 60);
+  const durationPlan = cleanText(policy.duration_plan || '创作时长可自由规划；供应商执行时长由当前模型能力决定。', 1600);
+  const providerModel = cleanText(policy.video_model || '自动路由模型', 200);
+  const seriesContext = seriesContextText(policy.series_context);
   const strictSupported = policy.strict_first_frame_supported === true;
   const transitionRule = strictSupported
     ? '默认使用 hard_cut。只有同一画面状态确实需要连续时才使用 reference_continuation；只有必须像素级承接且会提供严格首帧时才使用 strict_continuation。'
     : '默认使用 hard_cut。需要连续画面时可使用 reference_continuation，把上一镜尾帧作为普通参考图；当前模型不支持 strict_continuation。';
   return {
-    system: `你是电影导演和分镜师。只返回 JSON 对象，不要 Markdown。结构：{"shots":[...]}。\n每个生成视频必须对应一个完整摄影镜头；同一次运镜、同一个尚未完成的物理动作不得拆到两个视频请求中。需要拆分时，必须把边界安排在真实镜头切换处。\n每个镜头必须包含 number,title,duration(${minShotSeconds}到15秒),route_profile,previs_mode,action,visual,dialogue,narration,shot_type,camera_angle,camera_movement,lighting,continuity_in,continuity_out,transition_mode,cut_motivation,cut_in,cut_out,continuous_take_id,boundary_prompt,character_names,scene_name,prop_names,image_prompt,video_prompt。\n第一镜 transition_mode 必须是 opening。${transitionRule}\n即梦片段只允许 5到15 秒；紧凑五秒镜头只承载一个完整视觉节拍，连续长镜头才承载同一机位内的完整连续动作，不得为了凑时长填充无意义动作。\nhard_cut 只需要记录剪辑依据，不要制造任何遮挡、闪光、烟雾、甩镜或其它转场效果来掩盖切换。切镜依据应是信息变化、反应、视线关系、动作节拍完成或有意义的景别/角度变化；前镜动作在 cut_out 前完整结束，后镜从独立新机位和 cut_in 状态开始。\nvideo_prompt 要按时间顺序写清主体动作、镜头运动、场景不变量和结尾状态；boundary_prompt 要明确这是开场、自然硬切后的新镜头、携带上一镜尾帧作普通参考图的续接，还是严格首帧续拍。route_profile 只能依据镜头是紧凑五秒节拍还是需要更长的连续动作填写 short_image_guided 或 long_previs_guided，不能填写模型名。`,
-    user: `请把剧本拆成约 ${targetShots} 个完整摄影镜头，总时长不要超过 ${maxSeconds} 秒。必须复用资产表中的名称。每个镜头时长为 5到15 秒，并在自身时长内完成一个有意义的摄影节拍。每个镜头都要在自身时长内完成动作并形成可剪辑的结尾，不要把一个动作或一次运镜悬在两个视频之间。正常镜头之间直接硬切，不要为了衔接添加金光、主体遮挡、爪子遮挡等刻意效果；只有画面状态确实需要尽量连续时才选择尾帧参考续接。\n\n剧本：\n${cleanText(scriptText, 40000)}\n\n已审批资产：\n${JSON.stringify(resources).slice(0, 30000)}`,
+    system: `你是电影导演和分镜师。只返回 JSON 对象，不要 Markdown。结构：{"shots":[...]}。\n每个生成视频必须对应一个完整摄影镜头；同一次运镜、同一个尚未完成的物理动作不得拆到两个视频请求中。需要拆分时，必须把边界安排在真实镜头切换处。\n当前模型：${providerModel}。时长规划上下文：${durationPlan}\n每个镜头必须包含 number,title,duration(${minShotSeconds}到${maxShotSeconds}秒的创作目标),creative_duration_seconds,provider_duration_seconds,final_edit_duration_seconds,duration_plan,route_profile,previs_mode,action,visual,dialogue,narration,shot_type,camera_angle,camera_movement,lighting,continuity_in,continuity_out,transition_mode,cut_motivation,cut_in,cut_out,continuous_take_id,boundary_prompt,character_names,scene_name,prop_names,image_prompt,video_prompt。\n第一镜 transition_mode 必须是 opening。${transitionRule}\n创作时长、供应商请求时长、最终剪辑保留时长是三个不同字段：不要把固定 30 秒执行单元误写成 30 秒成片，也不要把短成片时长直接当成 2.5 的供应商请求时长。2.5 由供应商固定请求 30 秒并在本地裁剪；2.0 只能选择 5、10、15 秒请求；未知模型不猜测能力。\nhard_cut 只需要记录剪辑依据，不要制造任何遮挡、闪光、烟雾、甩镜或其它转场效果来掩盖切换。切镜依据应是信息变化、反应、视线关系、动作节拍完成或有意义的景别/角度变化；前镜动作在 cut_out 前完整结束，后镜从独立新机位和 cut_in 状态开始。\nvideo_prompt 要按时间顺序写清主体动作、镜头运动、场景不变量和结尾状态；boundary_prompt 要明确这是开场、自然硬切后的新镜头、携带上一镜尾帧作普通参考图的续接，还是严格首帧续拍。route_profile 只能依据镜头节奏填写 short_image_guided 或 long_previs_guided，不能填写模型名。若收到剧集组候选资产，不得静默把未确认候选写成已复用。`,
+    user: `请把剧本拆成约 ${targetShots} 个完整摄影镜头，总时长不要超过 ${maxSeconds} 秒。必须复用资产表中的名称。每个镜头的 duration 是创作目标（${minShotSeconds}到${maxShotSeconds}秒），并同时填写 creative_duration_seconds、provider_duration_seconds、final_edit_duration_seconds 和 duration_plan。供应商请求时长必须严格遵循上面的模型能力：2.5 为 30 秒固定执行单元，2.0 只从 5/10/15 秒选择；如果模型未知，provider_duration_seconds 填 null 并说明由上游校验。每个镜头都要在创作目标内完成一个有意义的摄影节拍，并形成可剪辑的结尾；不要把一个动作或一次运镜悬在两个视频之间。正常镜头之间直接硬切，不要为了衔接添加金光、主体遮挡、爪子遮挡等刻意效果；只有画面状态确实需要尽量连续时才选择尾帧参考续接。${seriesContext ? `\n\n剧集组资产上下文（selected 已确认；candidates 仅建议）：\n${seriesContext}` : ''}\n\n剧本：\n${cleanText(scriptText, 40000)}\n\n已审批资产：\n${JSON.stringify(resources).slice(0, 30000)}`,
   };
 }
 
@@ -223,7 +269,7 @@ Current rough next-shot plan:\n${JSON.stringify(input.rough_shot || {}).slice(0,
 
 Immutable approved assets:\n${JSON.stringify(input.assets || []).slice(0, 20000)}
 
-Revise exactly this next shot. Keep its shot number and duration within 5 to 15 seconds. Use a compact five-second image-guided shot for a reaction or angle change, and a longer shot only for one complete continuous action. Make continuity_in an explicit story-state handoff, complete all action inside this clip, and keep image_prompt/video_prompt directly production-ready. Do not add a visual transition effect merely to hide the cut.`,
+Revise exactly this next shot. Keep its creative duration within the supplied duration range and preserve any explicit provider duration plan. Use a compact image-guided shot for a reaction or angle change, and a longer shot only for one complete continuous action. Make continuity_in an explicit story-state handoff, complete all action inside this clip, and keep image_prompt/video_prompt directly production-ready. Do not add a visual transition effect merely to hide the cut.`,
   };
 }
 
@@ -256,7 +302,7 @@ Next planned shot:\n${JSON.stringify(input.next_shot || null).slice(0, 8000)}
 
 Approved assets:\n${JSON.stringify(input.assets || []).slice(0, 20000)}
 
-Rewrite exactly one complete camera shot. Keep the same shot number, finish the action inside this clip, and keep duration within ${Number(input.duration_min) || 5} to ${Number(input.duration_max) || 15} seconds. Do not add a transition effect merely to hide a cut.`,
+Rewrite exactly one complete camera shot. Keep the same shot number, finish the action inside this clip, and keep creative duration within ${Number(input.duration_min) || 1} to ${Number(input.duration_max) || 60} seconds. Preserve any provider duration fields and do not add a transition effect merely to hide a cut.`,
   };
 }
 
@@ -273,7 +319,7 @@ Following planned shot:\n${JSON.stringify(input.next_shot || null).slice(0, 8000
 
 Approved assets:\n${JSON.stringify(input.assets || []).slice(0, 20000)}
 
-Return two complete camera shots. The first keeps number ${input.current_number}; the inserted second uses number ${input.next_number}. Each must last ${Number(input.duration_min) || 5} to ${Number(input.duration_max) || 15} seconds and end in a stable editable state. Put the split at action completion, reaction, information change, eyeline, or a meaningful shot-size/angle change. Use a normal hard cut unless continuity genuinely requires an ordinary tail-frame reference.`,
+Return two complete camera shots. The first keeps number ${input.current_number}; the inserted second uses number ${input.next_number}. Each must last ${Number(input.duration_min) || 1} to ${Number(input.duration_max) || 60} seconds as a creative target and end in a stable editable state. Put the split at action completion, reaction, information change, eyeline, or a meaningful shot-size/angle change. Use a normal hard cut unless continuity genuinely requires an ordinary tail-frame reference.`,
   };
 }
 
@@ -290,7 +336,7 @@ Screenplay context:\n${cleanText(input.script, 20000)}
 
 Approved assets:\n${JSON.stringify(input.assets || []).slice(0, 20000)}
 
-Create one new complete camera shot numbered ${input.number}. It must add clear narrative value rather than duplicate adjacent coverage, last ${Number(input.duration_min) || 5} to ${Number(input.duration_max) || 15} seconds, and form a normal editable cut boundary.`,
+Create one new complete camera shot numbered ${input.number}. It must add clear narrative value rather than duplicate adjacent coverage, last ${Number(input.duration_min) || 1} to ${Number(input.duration_max) || 60} seconds as a creative target, and form a normal editable cut boundary.`,
   };
 }
 
@@ -408,9 +454,15 @@ function fieldAssistPrompts(input) {
 function reviewPrompts(artifact, profile = {}) {
   const skills = Array.isArray(profile.skills) ? profile.skills.join('\n') : cleanText(profile.skills || '', 4000);
   const priorReviews = Array.isArray(profile.previous_reviews)
-    ? profile.previous_reviews.slice(0, 6).map((item) => ({
+    ? profile.previous_reviews.slice(0, 4).map((item) => ({
       decision: cleanText(item?.decision || '', 40),
       reason: cleanText(item?.reason || '', 1200),
+      blocking_issues: Array.isArray(item?.evidence?.review_verdict?.blocking_issues)
+        ? item.evidence.review_verdict.blocking_issues.map((value) => cleanText(value, 800)).filter(Boolean).slice(0, 8)
+        : [],
+      improvement_notes: Array.isArray(item?.evidence?.review_verdict?.improvement_notes)
+        ? item.evidence.review_verdict.improvement_notes.map((value) => cleanText(value, 600)).filter(Boolean).slice(0, 6)
+        : [],
       scores: item?.scores && typeof item.scores === 'object' ? item.scores : {},
     }))
     : [];

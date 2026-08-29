@@ -214,7 +214,11 @@ function normalizeDirectorDocument(value, expectedDuration = null, expectedAspec
     if (ids.has(object.id)) throw new Error(`导演台对象 ID 重复：${object.id}`);
     ids.add(object.id);
   }
-  const duration = finite(expectedDuration ?? input.timeline?.duration, 5, 5, 15);
+  // Director timelines follow the provider execution unit when one is known
+  // (e.g. Seedance 2.5 executes a fixed 30-second request).  The timeline is
+  // still bounded for safety, but it no longer carries the old global 5–15s
+  // assumption.
+  const duration = finite(expectedDuration ?? input.timeline?.duration, 5, 1, 60);
   const attachedIds = new Set(objects.filter((object) => object.props?.attach_to).map((object) => object.id));
   const keyframes = (Array.isArray(input.timeline?.keyframes) ? input.timeline.keyframes : [])
     .slice(0, 1000)
@@ -249,7 +253,10 @@ function colorFor(index, kind) {
 }
 
 function createFallbackDirectorDocument(shot, aspectRatio = '16:9') {
-  const duration = finite(shot?.duration, 5, 5, 15);
+  const requestedDuration = shot?.provider_duration_seconds
+    ?? shot?.duration_plan?.provider_seconds
+    ?? shot?.duration;
+  const duration = finite(requestedDuration, 5, 1, 60);
   const aspect = productionAspectSpec(aspectRatio);
   const characters = Array.isArray(shot?.character_names) && shot.character_names.length
     ? shot.character_names.slice(0, 4)
@@ -296,7 +303,10 @@ function parseDirectorDocument(raw, shot, log, aspectRatio = '16:9') {
     error.code = 'DIRECTOR_JSON_INVALID';
     throw error;
   }
-  return normalizeDirectorDocument(parsed, shot?.duration, aspectRatio);
+  const expectedDuration = shot?.provider_duration_seconds
+    ?? shot?.duration_plan?.provider_seconds
+    ?? shot?.duration;
+  return normalizeDirectorDocument(parsed, expectedDuration, aspectRatio);
 }
 
 function directorPrompts(shot, assets = [], aspectRatio = '16:9') {
@@ -304,9 +314,16 @@ function directorPrompts(shot, assets = [], aspectRatio = '16:9') {
   const poseIds = DIRECTOR_POSES.map((item) => item.id).join('|');
   const motionIds = DIRECTOR_MOTIONS.map((item) => item.id).join('|');
   const attachmentContract = 'HIGHEST-PRIORITY ATTACHMENT CONTRACT: props.attach_to references a non-camera parent; props.attach_anchor is root, head, left_hand, right_hand, left_forearm, or right_forearm. An attached object such as peachwood-sword must use only local_offset/local_rotation/local_scale keyframes, for example {"object_id":"peachwood-sword","time":1.5,"local_rotation":[0,0.4,0]}. Never emit position, rotation, or scale on a keyframe for an attached object. If static attachment is sufficient, omit that object from timeline.keyframes. World position/rotation/scale keyframes are allowed only for unattached objects. Missing parents, cycles, camera/light parents, unresolved hand anchors, and world keyframes on attached objects are hard errors. Each provider request is one complete camera shot. Do not split a continuous action or camera move across requests. Use a motivated hard_cut at flash or occlusion when strict first_frame is unavailable; use a predecessor tail frame only when first_frame is explicitly supported.';
+  const providerDuration = shot?.provider_duration_seconds
+    ?? shot?.duration_plan?.provider_seconds
+    ?? null;
+  const creativeDuration = shot?.creative_duration_seconds ?? shot?.duration ?? null;
+  const durationHint = providerDuration != null
+    ? `Provider execution duration: ${providerDuration}s; creative/edit target: ${creativeDuration ?? providerDuration}s.`
+    : `Creative/edit target duration: ${creativeDuration ?? 'provider-defined'}s; do not invent provider limits.`;
   const prompts = {
     system: `You are a 3D previs director. Return one JSON object and no Markdown. Schema:\n{"version":2,"aspect_ratio":"${aspect.aspect_ratio}","active_camera_id":"camera-1","objects":[{"id":"...","kind":"asset|procedural|box|sphere|plane|light|camera","name":"...","position":[x,y,z],"rotation":[rx,ry,rz],"scale":[sx,sy,sz],"props":{"asset_id":"registered.id","pose":"${poseIds}","motion":"${motionIds}","motion_speed":1,"motion_phase":0,"motion_intensity":1,"recipe":{"label":"simple missing prop","nodes":[{"shape":"${RECIPE_SHAPES.join('|')}","position":[0,0,0],"rotation":[0,0,0],"scale":[1,1,1],"material":{"color":"#RRGGBB"}}]},"color":"#RRGGBB","opacity":1,"wireframe":false,"emissive":"#000000","emissive_intensity":0,"fov":42,"aspect":${aspect.value},"aim_mode":"target","target_id":"character-1","target_offset":[0,1.1,0]}}],"timeline":{"duration":5,"keyframes":[{"object_id":"...","time":0,"position":[x,y,z],"rotation":[rx,ry,rz],"scale":[sx,sy,sz]}]}}. Every camera props.aspect must equal ${aspect.value}. Registered asset IDs: ${compactAssetCatalogForPrompt()}. Prefer registered assets. Use kind=asset with props.asset_id for catalog objects. Use kind=procedural with a bounded recipe only for a simple missing object; never emit code, URLs, or unsupported geometry. Keep coordinates between -20 and 20 and use radians for rotation. Include one active camera, a ground/environment, lights, and every principal character and prop. The active camera must use aim_mode=target and target_id must reference the principal animated subject; camera position keyframes then define dolly, orbit, follow, or crane movement while target tracking keeps the action framed. Give first and last keyframes to the camera and every moving subject. Large glass or enclosing geometry must use low opacity and/or wireframe so it cannot hide the action.`,
-    user: `${productionAspectPrompt(aspect.aspect_ratio)}\nShot: ${JSON.stringify(shot).slice(0, 12000)}\nAssets: ${JSON.stringify(assets).slice(0, 12000)}\nCreate a readable previs of composition, blocking, prop motion, lighting changes, and camera movement.`,
+    user: `${productionAspectPrompt(aspect.aspect_ratio)}\n${durationHint}\nShot: ${JSON.stringify(shot).slice(0, 12000)}\nAssets: ${JSON.stringify(assets).slice(0, 12000)}\nCreate a readable previs of composition, blocking, prop motion, lighting changes, and camera movement.`,
   };
   prompts.system = `${attachmentContract}\n${prompts.system}`;
   return prompts;

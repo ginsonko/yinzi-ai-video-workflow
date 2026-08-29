@@ -41,17 +41,138 @@ const policy = {
 };
 
 describe('production video router', () => {
-  it('keeps a legacy two-second plan but raises the provider duration to five seconds', () => {
+  it('uses a key-discovered unknown model as an advisory automatic fallback', () => {
+    const route = selectShotVideoRoute({
+      shot: { content: { duration: 5, previs_mode: 'skip', route_profile: 'short_image_guided' } },
+      catalog: {
+        pricing_version: 'smart-route-v1',
+        fetched_at: '2026-08-19T00:00:00.000Z',
+        video: [{
+          model: 'new-smart-route-video',
+          endpoint_types: ['openai-video'],
+          groups: ['智能路由'],
+          prices: [{ group: '智能路由', billing_unit: 'per_second', effective_price: 0.1, currency: 'CNY' }],
+          capabilities: null,
+          contract_status: 'missing',
+          availability_scope: 'credential',
+          scope_verified: true,
+        }],
+      },
+      policy: { video_routing_mode: 'auto', video_quality: 'balanced', director_mode: 'off' },
+    });
+    assert.equal(route.model, 'new-smart-route-video');
+    assert.equal(route.automatic, true);
+    assert.equal(route.catalog_verified, true);
+    assert.equal(route.availability_scope, 'credential');
+    assert.equal(route.scope_verified, true);
+    assert.equal(route.contract_status, 'missing');
+    assert.equal(route.estimated_price, 0.5);
+    assert.ok(route.reason_codes.includes('automatic_discovered_model_fallback'));
+    assert.ok(route.contract_warnings.includes('unknown_contract'));
+  });
+
+  it('does not treat an unverified static unknown model as an automatic candidate', () => {
+    assert.throws(
+      () => selectShotVideoRoute({
+        shot: { content: { duration: 5, previs_mode: 'skip', route_profile: 'short_image_guided' } },
+        catalog: {
+          pricing_version: 'static-list-v1',
+          video: [{
+            ...price('static-unknown-video', 0.01),
+            capabilities: null,
+            contract_status: 'missing',
+            availability_scope: 'public',
+            scope_verified: false,
+          }],
+        },
+        policy: { video_routing_mode: 'auto', video_quality: 'balanced', director_mode: 'off' },
+      }),
+      (error) => error?.code === 'VIDEO_ROUTE_NO_ELIGIBLE_MODEL',
+    );
+  });
+
+  it('prefers an available Seedance model over a cheaper Grok model', () => {
+    const route = selectShotVideoRoute({
+      shot: { content: { duration: 5, previs_mode: 'skip', route_profile: 'short_image_guided' } },
+      catalog: {
+        pricing_version: 'smart-route-v2',
+        video: [
+          { ...price('grok-imagine-video', 0.01, 'per_request'), credential_verified: true, availability_scope: 'credential', scope_verified: true },
+          { ...price('mg-seedance2.0 -480p mini', 0.2), credential_verified: true, availability_scope: 'credential', scope_verified: true },
+        ],
+      },
+      policy: { video_routing_mode: 'auto', video_quality: 'balanced', director_mode: 'off' },
+    });
+    assert.equal(route.model, 'mg-seedance2.0 -480p mini');
+  });
+
+  it('never auto-routes a public-only Seedance model over the current-key Grok model', () => {
+    const route = selectShotVideoRoute({
+      shot: { content: { duration: 5, previs_mode: 'skip', route_profile: 'short_image_guided' } },
+      catalog: {
+        pricing_version: 'smart-route-v3',
+        video: [
+          { ...price('grok-imagine-video', 0.1125, 'per_request'), credential_verified: true, availability_scope: 'credential', scope_verified: true },
+          { ...price('mg-seedance2.0 -480p mini', 0.01), credential_verified: false, public_catalog: true, manual_only: true, availability_scope: 'public', scope_verified: false },
+        ],
+      },
+      policy: { video_routing_mode: 'auto', video_quality: 'balanced', director_mode: 'off' },
+    });
+    assert.equal(route.model, 'grok-imagine-video');
+  });
+
+  it('ignores stale public smart-candidate flags and keeps the current-key model automatic', () => {
+    const route = selectShotVideoRoute({
+      shot: { content: { duration: 5, previs_mode: 'skip', route_profile: 'short_image_guided' } },
+      catalog: {
+        pricing_version: 'smart-route-v4',
+        video: [
+          { ...price('grok-imagine-video', 0.1125, 'per_request'), credential_verified: true, availability_scope: 'credential', scope_verified: true },
+          {
+            ...price('seedance2.0 720p-pro-nv-nsp', 0.44928, 'per_request'),
+            credential_verified: false,
+            smart_routing_candidate: true,
+            public_catalog: true,
+            availability_scope: 'public',
+            scope_verified: false,
+          },
+          {
+            ...price('seedance-2.5-720p', 0.672),
+            credential_verified: false,
+            smart_routing_candidate: true,
+            public_catalog: true,
+            availability_scope: 'public',
+            scope_verified: false,
+          },
+        ],
+      },
+      policy: { video_routing_mode: 'auto', video_quality: 'balanced', director_mode: 'off' },
+    });
+    assert.equal(route.model, 'grok-imagine-video');
+    assert.equal(route.smart_routing_candidate, false);
+    const options = listShotVideoRouteOptions({
+      shot: { content: { duration: 5, previs_mode: 'skip', route_profile: 'short_image_guided' } },
+      catalog: {
+        pricing_version: 'smart-route-v4',
+        video: [price('seedance2.0 720p-pro-nv-nsp', 0.44928, 'per_request')],
+      },
+      policy: { video_routing_mode: 'fixed', video_model: 'seedance2.0 720p-pro-nv-nsp' },
+    });
+    assert.equal(options[0].selectable, true);
+    assert.equal(options[0].automatic_eligible, false);
+    assert.ok(options[0].warnings.includes('channel_temporarily_unavailable'));
+  });
+  it('keeps a two-second creative plan when provider capability is unknown', () => {
     const route = classifyShotRoute({ content: { duration: 2, shot_type: '特写' } });
     assert.equal(route.profile, 'short_image_guided');
     assert.equal(route.planned_duration, 2);
-    assert.equal(route.duration, 5);
-    assert.equal(route.duration_adjusted, true);
+    assert.equal(route.duration, 2);
+    assert.equal(route.duration_adjusted, false);
     assert.equal(route.requires_director_preview, false);
     assert.equal(route.uses_reference_video, false);
   });
 
-  it('selects the lowest estimated total price and prices the effective five-second request', () => {
+  it('selects the lowest estimated total price using the concrete provider unit', () => {
     const route = selectShotVideoRoute({
       shot: { content: { duration: 2, shot_type: '特写' } }, catalog, policy,
     });
@@ -59,6 +180,7 @@ describe('production video router', () => {
     assert.equal(route.planned_duration, 2);
     assert.equal(route.duration, 5);
     assert.equal(route.duration_adjusted, true);
+    assert.equal(route.duration_adjustment_reason, 'provider_duration_boundary');
     assert.equal(route.limits.videos, 0);
     assert.equal(route.estimated_price, 1.002);
     assert.equal(route.catalog_verified, true);
@@ -134,16 +256,16 @@ describe('production video router', () => {
     assert.notEqual(route.model, '破甲seedance 720p-fast');
   });
 
-  it('uses the same visible five-second correction for a fixed compatible model', () => {
+  it('uses the provider capability boundary for a fixed compatible model', () => {
     const route = selectShotVideoRoute({
       shot: { content: { duration: 2 } }, catalog,
-      policy: { video_routing_mode: 'fixed', video_model: 'mg-seedance2.0 -480p mini' },
+      policy: { video_routing_mode: 'fixed', video_model: 'mg-seedance2.0 -480p-fast-gz-15s' },
     });
     assert.equal(route.planned_duration, 2);
-    assert.equal(route.duration, 5);
-    assert.equal(route.duration_adjustment_reason, 'jimeng_minimum_5_seconds');
+    assert.equal(route.duration, 15);
+    assert.equal(route.duration_adjustment_reason, 'provider_fixed_duration');
     assert.equal(route.catalog_verified, true);
-    assert.equal(route.estimated_price, 1.002);
+    assert.equal(route.estimated_price, 6.9888);
   });
 
   it('lets a shot override win over a project fixed model', () => {
@@ -195,9 +317,8 @@ describe('production video router', () => {
     const fixed15 = options.find((item) => item.model.includes('gz-15s'));
     const expensive = options.find((item) => item.model === '破甲seedance 720p-fast');
     assert.equal(fixed15.selectable, true);
-    assert.equal(fixed15.compatible, false);
-    assert.equal(fixed15.incompatibility_code, 'VIDEO_ROUTE_DURATION_UNSUPPORTED');
-    assert.ok(fixed15.warnings.includes('duration_mismatch'));
+    assert.equal(fixed15.compatible, true);
+    assert.equal(fixed15.incompatibility_code, null);
     assert.equal(expensive.selectable, true);
     assert.equal(expensive.requires_explicit_confirmation, true);
     assert.ok(expensive.warnings.includes('expensive_bypass'));
@@ -253,6 +374,34 @@ describe('production video router', () => {
     localCatalog.video[0].capabilities = { ...capability, automatic_eligible: true };
     const route = selectShotVideoRoute({ shot: { content: { duration: 8 } }, catalog: localCatalog, policy });
     assert.equal(route.model, 'new-local-video');
+  });
+
+  it('accepts a standard provider capability without local route profile labels', () => {
+    const standardCatalog = {
+      pricing_version: 'standard-contract-v1',
+      video: [{
+        ...price('standard-seedance-video', 0.2),
+        credential_verified: true,
+        availability_scope: 'credential',
+        scope_verified: true,
+        contract_status: 'active',
+        capability_source: 'key_scoped_contract',
+        capabilities: {
+          duration_mode: 'range', duration_min: 5, duration_max: 15,
+          max_images: 30, max_videos: 0, max_audios: 10,
+          resolution: '720p', quality_tier: 'balanced', automatic_eligible: true,
+          roles: { image: ['reference'], video: [], audio: ['reference'] },
+        },
+      }],
+    };
+    const route = selectShotVideoRoute({
+      shot: { content: { duration: 5, route_profile: 'short_image_guided', previs_mode: 'skip' } },
+      catalog: standardCatalog,
+      policy,
+    });
+    assert.equal(route.model, 'standard-seedance-video');
+    assert.equal(route.contract_status, 'active');
+    assert.equal(route.reason_codes.includes('profile_mismatch'), false);
   });
 
   it('lets the project-level director switch override a forced long-shot preview', () => {

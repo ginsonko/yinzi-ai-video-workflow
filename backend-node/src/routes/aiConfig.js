@@ -193,6 +193,17 @@ function yinziCatalog(log) {
   };
 }
 
+/**
+ * Read-only edition metadata used by onboarding. This is intentionally
+ * non-secret and advisory: it never filters models or blocks a request.
+ */
+function distributionProfile(cfg) {
+  return (req, res) => {
+    const profiles = require('../services/distributionProfiles');
+    response.success(res, profiles.getDistributionProfile(req.query?.profile || req.query?.distribution_profile, cfg));
+  };
+}
+
 function discoverModels(db, log) {
   return async (req, res) => {
     const body = req.body || {};
@@ -204,14 +215,28 @@ function discoverModels(db, log) {
         catalog_path: body.catalog_path,
       });
       let pricing = null;
+      let smartRouting = false;
       if (String(resolved.config.provider || '').toLowerCase() === 'yinzi') {
-        try { pricing = await require('../services/yinziService').fetchYinziCatalogForConfig(resolved.config); } catch (_) { pricing = null; }
+        const yinziService = require('../services/yinziService');
+        smartRouting = String(body.routing_mode || '').trim().toLowerCase() === 'smart'
+          || body.smart_routing === true
+          || yinziService.isYinziSmartRoutingConfig(resolved.config);
+        try {
+          pricing = await yinziService.fetchYinziCatalogForConfig(
+            resolved.config,
+            fetch,
+            { include_public_catalog: true }
+          );
+        } catch (_) { pricing = null; }
       }
       const catalog = aiConfigService.mergeDiscoveredCatalog(discovery, pricing, {
         provider: resolved.config.provider,
         service_type: body.service_type || resolved.config.service_type || 'video',
         group: body.group || '',
         capability_overrides: aiConfigService.getModelCapabilityOverrides(resolved.config),
+        include_public_catalog: String(resolved.config.provider || '').toLowerCase() === 'yinzi'
+          && String(body.service_type || resolved.config.service_type || 'video') === 'video',
+        smart_routing: smartRouting,
       });
       response.success(res, {
         ...discovery,
@@ -235,7 +260,11 @@ function setupYinzi(db, log, cfg) {
     const body = req.body || {};
     try {
       const { prepareYinziSetupInput, upsertYinziConfigs } = require('../services/yinziService');
-      const prepared = await prepareYinziSetupInput(body);
+      const { resolveDistributionProfile } = require('../services/distributionProfiles');
+      const prepared = await prepareYinziSetupInput({
+        ...body,
+        distribution_profile: resolveDistributionProfile(body, cfg),
+      });
       const result = require('../services/configMutationService').withAutomaticSnapshot(db, '一键配置 YinziAPI', () => (
         upsertYinziConfigs(db, log, prepared)
       )).result;
@@ -250,6 +279,91 @@ function setupYinzi(db, log, cfg) {
       ]);
       log.error('Setup Yinzi configs failed', { error: safeMessage });
       response.badRequest(res, safeMessage || 'YinziAPI 配置失败');
+    }
+  };
+}
+
+function setupImageYinzi(db, log, cfg) {
+  return async (req, res) => {
+    if (aiConfigService.getVendorLockStatus(cfg).enabled) {
+      return response.badRequest(res, '厂商锁定模式下不能创建银子媒体站配置');
+    }
+    const body = req.body || {};
+    try {
+      const service = require('../services/yinziImageSiteService');
+      const { resolveDistributionProfile } = require('../services/distributionProfiles');
+      const result = require('../services/configMutationService').withAutomaticSnapshot(db, '一键配置银子媒体站', () => (
+        service.setup(db, log, {
+          ...body,
+          distribution_profile: resolveDistributionProfile(body, cfg),
+        })
+      )).result;
+      response.success(res, result);
+    } catch (err) {
+      const safeMessage = aiConfigService.redactConnectionTestError(err, [body.text_api_key, body.image_api_key, body.video_api_key]);
+      log.error('Setup image.yinziapi configs failed', { error: safeMessage });
+      response.badRequest(res, safeMessage || '银子媒体站配置失败');
+    }
+  };
+}
+
+function setupLaoli(db, log, cfg) {
+  return async (req, res) => {
+    if (aiConfigService.getVendorLockStatus(cfg).enabled) {
+      return response.badRequest(res, '厂商锁定模式下不能创建老李站点配置');
+    }
+    const body = req.body || {};
+    try {
+      const service = require('../services/laoliSiteService');
+      const { resolveDistributionProfile } = require('../services/distributionProfiles');
+      const result = require('../services/configMutationService').withAutomaticSnapshot(db, '一键配置老李站点', () => (
+        service.setup(db, log, {
+          ...body,
+          distribution_profile: resolveDistributionProfile(body, cfg),
+        })
+      )).result;
+      response.success(res, result);
+    } catch (err) {
+      const safeMessage = aiConfigService.redactConnectionTestError(err, [body.text_api_key, body.image_api_key, body.video_api_key]);
+      log.error('Setup Laoli configs failed', { error: safeMessage });
+      response.badRequest(res, safeMessage || '老李站点配置失败');
+    }
+  };
+}
+
+function previewYinzi(log, cfg) {
+  return async (req, res) => {
+    if (aiConfigService.getVendorLockStatus(cfg).enabled) {
+      return response.badRequest(res, '厂商锁定模式下不能预览 YinziAPI 配置');
+    }
+    const body = req.body || {};
+    try {
+      const { resolveDistributionProfile } = require('../services/distributionProfiles');
+      const prepared = await require('../services/yinziService').prepareYinziSetupInput({
+        ...body,
+        distribution_profile: resolveDistributionProfile(body, cfg),
+      });
+      response.success(res, {
+        base_url: prepared.base_url,
+        distribution_profile: prepared.distribution_profile,
+        text_model: prepared.text_model,
+        image_model: prepared.image_model,
+        video_model: prepared.video_model,
+        text: prepared.text_models.map((model) => ({ model })),
+        image: prepared.image_models.map((model) => ({ model })),
+        video: prepared.setup_catalog?.models || prepared.video_models.map((model) => ({ model })),
+        catalog: prepared.setup_catalog || null,
+      });
+    } catch (err) {
+      const safeMessage = aiConfigService.redactConnectionTestError(err, [
+        body.api_key,
+        body.universal_api_key,
+        body.text_api_key,
+        body.image_api_key,
+        body.video_api_key,
+      ]);
+      log.error('Preview Yinzi configs failed', { error: safeMessage });
+      response.badRequest(res, safeMessage || 'YinziAPI 模型目录读取失败');
     }
   };
 }
@@ -320,7 +434,11 @@ module.exports = function aiConfigRoutes(db, log, cfg) {
     testConnection: testConnection(db, log),
     discoverModels: discoverModels(db, log),
     yinziCatalog: yinziCatalog(log),
+    distributionProfile: distributionProfile(cfg),
     setupYinzi: setupYinzi(db, log, cfg),
+    setupImageYinzi: setupImageYinzi(db, log, cfg),
+    setupLaoli: setupLaoli(db, log, cfg),
+    previewYinzi: previewYinzi(log, cfg),
     listJimeng2MaterialAssets: listJimeng2MaterialAssets(log),
     modelArkAsset: modelArkAsset(log),
     bulkUpdateKey: bulkUpdateKey(db, log, cfg),

@@ -109,6 +109,30 @@
 
               <article class="automation-setting-card">
                 <div class="setting-card-heading">
+                  <span class="setting-icon"><el-icon><Refresh /></el-icon></span>
+                  <div><strong>新任务自动返工上限</strong><p>AI 打回后会把理由作为下一版的必修项继续生成；达到上限才请你介入。这里只影响之后新建的任务。</p></div>
+                </div>
+                <div class="setting-control-line">
+                  <label for="review-rejection-limit">同一对象连续打回</label>
+                  <el-input-number id="review-rejection-limit" v-model="automationDraft.max_consecutive_review_rejections" :min="1" :max="20" controls-position="right" />
+                </div>
+                <small>默认 5 次。已有任务可在任务页“模型、Key 与制作设置”中单独调整每个阶段。</small>
+              </article>
+
+              <article class="automation-setting-card">
+                <div class="setting-card-heading">
+                  <span class="setting-icon"><el-icon><Operation /></el-icon></span>
+                  <div><strong>新任务故障恢复上限</strong><p>明确可安全重试的临时故障由系统自行分析和恢复；排队、等待和状态收敛不计入失败次数。</p></div>
+                </div>
+                <div class="setting-control-line">
+                  <label for="recovery-failure-limit">同一对象连续恢复</label>
+                  <el-input-number id="recovery-failure-limit" v-model="automationDraft.max_consecutive_recovery_failures" :min="1" :max="20" controls-position="right" />
+                </div>
+                <small>默认 5 次。不确定是否已扣费的外部任务仍会停止重复提交，避免重复扣费。</small>
+              </article>
+
+              <article class="automation-setting-card">
+                <div class="setting-card-heading">
                   <span class="setting-icon"><el-icon><Bell /></el-icon></span>
                   <div><strong>无人值守提醒</strong><p>只在成片完成或系统确认必须由人处理时提醒；排队、轮询和自动恢复不会打扰你。</p></div>
                 </div>

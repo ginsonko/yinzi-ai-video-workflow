@@ -15,6 +15,7 @@ const required = [
   'LICENSE.txt',
   'THIRD_PARTY_NOTICES.txt',
   'release-docs/小白使用说明.md',
+  'release-docs/通用版-老李兼容小白说明.md',
   'release-docs/发布说明.md',
   'frontweb-dist/demo/director-preview.mp4',
   'frontweb-dist/demo/test-shot-1.mp4',

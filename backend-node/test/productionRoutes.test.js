@@ -10,6 +10,7 @@ const { runMigrationsAndEnsure } = require('../src/db/migrate');
 const { setupRouter } = require('../src/routes');
 const repo = require('../src/services/productionRepository');
 const aiConfigService = require('../src/services/aiConfigService');
+const videoService = require('../src/services/videoService');
 const { createFallbackDirectorDocument } = require('../src/services/productionDirector');
 
 let db;
@@ -17,9 +18,22 @@ let server;
 let baseUrl;
 let originUrl;
 let storageDir;
+let observedCatalogConfigId;
 const historicalDirs = [];
 const log = { info() {}, warn() {}, error() {} };
 let cfg;
+// This fixture represents a healthy credential-scoped channel.  The real
+// nsp products are currently excluded from automatic routing, so the test
+// must declare its mocked channel availability explicitly.
+const healthyShortCapability = {
+  provider_contract: 'aizzz-video-v1',
+  duration_mode: 'free', duration_min: 5, duration_max: 15,
+  auto_duration_min: 5, auto_duration_max: 15,
+  max_images: 9, max_videos: 0, max_audios: 3, max_total_references: 12,
+  resolution: '480p', quality_tier: 'fast', automatic_eligible: true,
+  route_profiles: ['short_image_guided'],
+  roles: { image: ['reference'], video: [], audio: ['reference'] },
+};
 const videoCatalogFixture = {
   pricing_version: 'http-routing-fixture',
   fetched_at: '2026-08-09T00:00:00.000Z',
@@ -29,12 +43,16 @@ const videoCatalogFixture = {
       endpoint_types: ['openai-video'],
       groups: ['特价视频分组(即梦)'],
       prices: [{ group: '特价视频分组(即梦)', billing_unit: 'per_second', effective_price: 0.4656 }],
+      capabilities: healthyShortCapability,
+      credential_verified: true, availability_scope: 'credential', scope_verified: true,
     },
     {
       model: 'cc-seedance2.0 480p-nsp',
       endpoint_types: ['openai-video'],
       groups: ['特价视频分组(即梦)'],
       prices: [{ group: '特价视频分组(即梦)', billing_unit: 'per_second', effective_price: 0.5148 }],
+      capabilities: { ...healthyShortCapability, quality_tier: 'balanced' },
+      credential_verified: true, availability_scope: 'credential', scope_verified: true,
     },
   ],
 };
@@ -62,6 +80,7 @@ beforeEach(async () => {
   storageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'production-routes-storage-'));
   cfg = { storage: { local_path: storageDir, base_url: 'http://localhost/static' } };
   db = new Database(':memory:');
+  observedCatalogConfigId = null;
   migrateQuietly();
   const now = new Date().toISOString();
   db.prepare('INSERT INTO dramas (id, title, created_at, updated_at) VALUES (1, ?, ?, ?)').run('星尘花园', now, now);
@@ -70,7 +89,10 @@ beforeEach(async () => {
   app.use(express.json({ limit: '2mb' }));
   app.use('/static', express.static(storageDir));
   app.use('/api', setupRouter(cfg, db, log, {
-    production: { media: { fetchVideoCatalog: async () => videoCatalogFixture } },
+    production: { media: { fetchVideoCatalog: async (run) => {
+      observedCatalogConfigId = run?.policy?.video_config_id ?? null;
+      return videoCatalogFixture;
+    } } },
   }));
   server = await new Promise((resolve) => {
     const listener = app.listen(0, '127.0.0.1', () => resolve(listener));
@@ -87,6 +109,88 @@ afterEach(async () => {
 });
 
 describe('production HTTP routes', () => {
+  it('keeps Yinzi capability contracts advisory by default and freezes automatic-route intent', async () => {
+    const groupConfig = aiConfigService.createConfig(db, log, {
+      service_type: 'video', provider: 'yinzi', api_protocol: 'yinzi', name: 'Yinzi group route',
+      base_url: 'https://api.yinziapi.top/v1', api_key: 'group-test-key',
+      model: ['manual-unknown-video'], default_model: 'manual-unknown-video',
+      endpoint: '/videos', query_endpoint: '/videos/{taskId}', is_default: true,
+      settings: JSON.stringify({ routing_mode: 'group' }),
+    });
+    const smartConfig = aiConfigService.createConfig(db, log, {
+      service_type: 'video', provider: 'yinzi', api_protocol: 'yinzi', name: 'Yinzi smart route',
+      base_url: 'https://api.yinziapi.top/v1', api_key: 'smart-test-key',
+      model: ['seedance-2.5-720p'], default_model: 'seedance-2.5-720p',
+      endpoint: '/videos', query_endpoint: '/videos/{taskId}',
+      settings: JSON.stringify({ routing_mode: 'smart', smart_routing_enabled: true }),
+    });
+    const originalProcessor = videoService.processVideoGeneration;
+    videoService.processVideoGeneration = async () => {};
+    try {
+      const manual = await request('/videos', {
+        method: 'POST',
+        body: {
+          drama_id: 1, video_config_id: groupConfig.id,
+          model: 'manual-unknown-video', prompt: 'manual advisory request', duration: 5,
+          reference_image_urls: Array.from({ length: 12 }, (_, index) => `https://media.test/${index}.png`),
+        },
+      });
+      assert.equal(manual.status, 201);
+      const manualRow = db.prepare(
+        'SELECT contract_validation_mode, provider_config_snapshot_json FROM video_generations WHERE id = ?'
+      ).get(manual.body.data.id);
+      const manualSnapshot = JSON.parse(manualRow.provider_config_snapshot_json);
+      assert.equal(manualRow.contract_validation_mode, 'advisory');
+      assert.equal(manualSnapshot.requested_model_explicit, true);
+      assert.equal(manualSnapshot.automatic_route, false);
+
+      const automatic = await request('/videos', {
+        method: 'POST',
+        body: {
+          drama_id: 1, video_config_id: smartConfig.id,
+          model: 'seedance-2.5-720p', prompt: 'automatic smart-route request', duration: 5,
+          routing_receipt: { automatic: true, smart_routing_candidate: true },
+        },
+      });
+      assert.equal(automatic.status, 201);
+      const automaticRow = db.prepare(
+        'SELECT contract_validation_mode, provider_config_snapshot_json FROM video_generations WHERE id = ?'
+      ).get(automatic.body.data.id);
+      const automaticSnapshot = JSON.parse(automaticRow.provider_config_snapshot_json);
+      assert.equal(automaticRow.contract_validation_mode, 'advisory');
+      assert.equal(automaticSnapshot.smart_routing, true);
+      assert.equal(automaticSnapshot.automatic_route, true);
+      assert.equal(automaticSnapshot.smart_routing_candidate, true);
+      assert.equal(automaticSnapshot.capability_model, 'seedance-2.5-720p');
+      assert.equal(automaticSnapshot.capability_snapshot.max_images, 30);
+      // Seedance 2.5's current Yinzi capability contract supports up to
+      // ten reference videos.  This route remains advisory (it never gates
+      // a manual request), but the frozen snapshot must preserve the real
+      // capability instead of the historical zero-value fallback.
+      assert.equal(automaticSnapshot.capability_snapshot.max_videos, 10);
+
+      const strict = await request('/videos', {
+        method: 'POST',
+        body: {
+          drama_id: 1, video_config_id: smartConfig.id,
+          model: 'seedance-2.5-720p', prompt: 'explicit strict request', duration: 5,
+          contract_validation_mode: 'strict',
+        },
+      });
+      assert.equal(strict.status, 201);
+      const strictRow = db.prepare(
+        'SELECT contract_validation_mode, provider_config_snapshot_json FROM video_generations WHERE id = ?'
+      ).get(strict.body.data.id);
+      const strictSnapshot = JSON.parse(strictRow.provider_config_snapshot_json);
+      assert.equal(strictRow.contract_validation_mode, 'strict');
+      assert.equal(strictSnapshot.automatic_route, false);
+      assert.equal(strictSnapshot.requested_model_explicit, true);
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      videoService.processVideoGeneration = originalProcessor;
+    }
+  });
+
   it('exposes the graph and preserves idempotent run creation semantics', async () => {
     const graph = await request('/production-graph');
     assert.equal(graph.status, 200);
@@ -113,6 +217,48 @@ describe('production HTTP routes', () => {
     const missing = await request('/production-runs/missing');
     assert.equal(missing.status, 404);
     assert.equal(missing.body.error.code, 'NOT_FOUND');
+  });
+
+  it('keeps detach/local/provider cancellation endpoints semantically distinct', async () => {
+    const run = repo.createRun(db, {
+      drama_id: 1, episode_id: 1, idempotency_key: 'route-cancel-semantics',
+      review_owner: 'human', input: { story: '取消语义测试' },
+      budget: { max_video_seconds: 60, max_video_attempts: 10 },
+    }).run;
+    const reserved = repo.reserveAction(db, {
+      run_id: run.id, action_key: 'route-local-reserved', stage: 'shot_video',
+      scope_type: 'shot', scope_id: '1', kind: 'video_generate', attempt: 1,
+      request: { model: 'manual-video' }, reserved_video_seconds: 5,
+    }).action;
+    const detached = await request(`/production-runs/${run.id}/detach`, {
+      method: 'POST', body: { reason: '查看历史' },
+    });
+    assert.equal(detached.status, 200);
+    assert.equal(detached.body.data.status, 'detached_view');
+    assert.equal(repo.getAction(db, reserved.id).status, 'reserved');
+    const local = await request(`/production-runs/${run.id}/cancel-local`, {
+      method: 'POST', body: { action_id: reserved.id, reason: '取消尚未外发的请求' },
+    });
+    assert.equal(local.status, 200);
+    assert.equal(local.body.data.status, 'cancelled_local');
+    assert.equal(repo.getAction(db, reserved.id).status, 'cancelled');
+
+    const accepted = repo.reserveAction(db, {
+      run_id: run.id, action_key: 'route-provider-waiting', stage: 'shot_video',
+      scope_type: 'shot', scope_id: '2', kind: 'video_generate', attempt: 1,
+      request: { model: 'manual-video' }, reserved_video_seconds: 5,
+    }).action;
+    repo.updateAction(db, accepted.id, {
+      status: 'waiting', task_id: 'route-provider-task', generation_id: 77,
+      provider_id: 'route-provider-task',
+    });
+    const provider = await request(`/production-runs/${run.id}/cancel-provider`, {
+      method: 'POST', body: { action_id: accepted.id, reason: '供应商任务过久' },
+    });
+    assert.equal(provider.status, 200);
+    assert.equal(provider.body.data.status, 'cancel_requested_provider_unknown');
+    assert.equal(repo.getAction(db, accepted.id).status, 'waiting');
+    assert.equal(repo.getAction(db, accepted.id).result.cancel_requested_provider_unknown, true);
   });
 
   it('rejects changing a run aspect ratio after creation with an actionable conflict', async () => {
@@ -333,6 +479,7 @@ describe('production HTTP routes', () => {
     assert.equal(routing.status, 200);
     assert.equal(routing.body.data.project.config_id, videoConfig.id);
     assert.equal(repo.getRun(db, run.id).policy.video_config_id, null);
+    assert.equal(observedCatalogConfigId, videoConfig.id);
     assert.equal(routing.body.data.effective_route.model, 'cc-seedance2.0 480p-fast-nsp');
     assert.equal(routing.body.data.catalog.options.length, 2);
     assert.equal(routing.body.data.catalog.options.every((item) => item.selectable), true);

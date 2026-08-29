@@ -107,12 +107,18 @@ function videoReservation(db, run, request = {}, route = {}) {
   const routeUnit = ['per_request', 'per_second'].includes(String(route.billing_unit || ''))
     ? String(route.billing_unit)
     : 'unknown';
-  const billingUnit = storedPrice?.billing_unit || routeUnit;
+  // A bounded fallback chain carries an explicit price snapshot from the
+  // immutable plan.  It must win over an older catalog row (for example a
+  // stale per-second Seedance 2.0 price), otherwise the child action could
+  // reserve the wrong amount while the UI claims a per-request product.
+  const explicitPrice = route?.price_override && typeof route.price_override === 'object'
+    ? route.price_override : null;
+  const billingUnit = explicitPrice?.billing_unit || storedPrice?.billing_unit || routeUnit;
   const durationSeconds = Math.max(0, Number(request.duration) || 0);
   const units = billingUnit === 'per_request' ? 1
     : billingUnit === 'per_second' ? durationSeconds
       : 0;
-  const routePrice = !storedPrice && Number.isFinite(Number(route.unit_price)) && billingUnit !== 'unknown'
+  const routePrice = explicitPrice || (!storedPrice && Number.isFinite(Number(route.unit_price)) && billingUnit !== 'unknown'
     ? {
       provider,
       service_type: 'video',
@@ -123,8 +129,8 @@ function videoReservation(db, run, request = {}, route = {}) {
       source: 'frozen_video_route',
       source_version: route.catalog_version || '',
     }
-    : null;
-  const price = storedPrice || routePrice;
+    : null);
+  const price = explicitPrice || storedPrice || routePrice;
   const estimatedMicrousd = price
     ? costs.estimateMicrousd(price, { units })
     : Number.isFinite(Number(route.estimated_price))

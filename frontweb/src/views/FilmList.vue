@@ -31,7 +31,7 @@
         </nav>
 
         <div class="header-actions">
-          <a class="yinzi-link" href="https://www.yinziapi.top" target="_blank" rel="noopener noreferrer">
+          <a v-if="distributionProfile?.smart_routing_entry" class="yinzi-link" href="https://www.yinziapi.top" target="_blank" rel="noopener noreferrer">
             银子API<el-icon><TopRight /></el-icon>
           </a>
           <el-tooltip :content="isDark ? '切换到浅色模式' : '切换到暗色模式'">
@@ -115,7 +115,7 @@
           </div>
           <p class="readiness-note">“已配置”仅检查已保存的默认配置，不会自动测试 Key，也不会产生模型费用。</p>
           <div class="readiness-actions">
-            <el-button type="primary" plain @click="openConfigDialog('yinzi')">一键配置银子API</el-button>
+            <el-button type="primary" plain @click="openConfigDialog(distributionProfile?.smart_routing_entry ? 'yinzi' : 'laoli')">{{ distributionProfile?.smart_routing_entry ? '一键配置银子API' : '配置文本、图片和视频' }}</el-button>
             <el-button text @click="router.push('/help#configuration')">查看配置方法</el-button>
           </div>
         </aside>
@@ -244,7 +244,7 @@
         <div><strong>银子AI视频工作流</strong><span>作者：银子 · QQ：474764004</span></div>
         <div>
           <a href="https://github.com/ginsonko" target="_blank" rel="noopener noreferrer">GitHub · ginsonko</a>
-          <a href="https://www.yinziapi.top" target="_blank" rel="noopener noreferrer">银子API</a>
+          <a v-if="distributionProfile?.smart_routing_entry" href="https://www.yinziapi.top" target="_blank" rel="noopener noreferrer">银子API</a>
           <button type="button" @click="router.push('/help')">说明书</button>
         </div>
       </footer>
@@ -663,6 +663,7 @@ const configError = ref('')
 const aiConfigs = ref([])
 const configReadiness = computed(() => getConfigReadiness(aiConfigs.value))
 const configProgress = computed(() => Math.round((configReadiness.value.readyCount / configReadiness.value.total) * 100))
+const distributionProfile = ref(null)
 
 function positiveInt(value, fallback) {
   const parsed = Number.parseInt(value, 10)
@@ -689,8 +690,18 @@ async function loadConfigReadiness() {
   }
 }
 
+async function loadDistributionProfile() {
+  try {
+    distributionProfile.value = await aiAPI.getDistributionProfile()
+  } catch (_) {
+    // Fail closed for the edition-specific Yinzi entry: a profile that cannot
+    // be read must never expose a provider-specific shortcut.
+    distributionProfile.value = { id: 'universal', smart_routing_entry: false }
+  }
+}
+
 function openConfigDialog(action = '') {
-  configInitialAction.value = action === 'yinzi' ? 'yinzi' : (action ? `service:${action}` : '')
+  configInitialAction.value = action === 'yinzi' ? 'yinzi' : action === 'laoli' ? 'laoli' : (action ? `service:${action}` : '')
   showAiConfigDialog.value = true
 }
 
@@ -1214,9 +1225,10 @@ onMounted(async () => {
     loadConfigReadiness(),
     loadList(),
     loadFinalMedia(),
+    loadDistributionProfile(),
   ])
   if (route.query.config === 'yinzi') {
-    openConfigDialog('yinzi')
+    openConfigDialog(distributionProfile.value?.smart_routing_entry ? 'yinzi' : 'laoli')
     router.replace({ path: '/' })
   } else if (route.query.start === '1') {
     await goNewProject()

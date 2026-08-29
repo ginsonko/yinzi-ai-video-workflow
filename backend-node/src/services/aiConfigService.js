@@ -889,16 +889,19 @@ async function discoverModels(opts = {}, options = {}) {
   if (response.status === 401 || response.status === 403) {
     const error = new Error(`模型目录鉴权失败 (${response.status})`);
     error.code = 'MODEL_DISCOVERY_AUTH_FAILED';
+    error.status = response.status;
     throw error;
   }
   if (response.status === 404 || response.status === 405) {
     const error = new Error(`模型目录端点不存在：${catalogPath}`);
     error.code = 'MODEL_DISCOVERY_ENDPOINT_NOT_FOUND';
+    error.status = response.status;
     throw error;
   }
   if (!response.ok) {
     const error = new Error(`模型目录返回 HTTP ${response.status}`);
     error.code = 'MODEL_DISCOVERY_HTTP_ERROR';
+    error.status = response.status;
     throw error;
   }
   const payload = await response.json().catch(() => ({}));
@@ -919,45 +922,203 @@ async function discoverModels(opts = {}, options = {}) {
 }
 
 function mergeDiscoveredCatalog(discovery, pricingCatalog, options = {}) {
-  const discovered = Array.isArray(discovery?.models) ? discovery.models : [];
-  const priced = Array.isArray(pricingCatalog?.video) ? pricingCatalog.video : [];
+  const rawDiscovered = Array.isArray(discovery?.models) ? discovery.models : [];
   const group = String(options.group || '').trim();
   const serviceType = String(options.service_type || 'video').trim() || 'video';
   const provider = String(options.provider || '').trim().toLowerCase();
+  const smartRouting = provider === 'yinzi' && options.smart_routing === true;
+  const endpointTypes = (entry) => [...new Set((Array.isArray(entry?.endpoint_types)
+    ? entry.endpoint_types : Array.isArray(entry?.supported_endpoint_types)
+      ? entry.supported_endpoint_types : [])
+    .map((value) => String(value || '').trim().toLowerCase())
+    .filter(Boolean))];
+  const publicCatalog = pricingCatalog?.public_catalog && typeof pricingCatalog.public_catalog === 'object'
+    ? pricingCatalog.public_catalog : null;
+  const publicItems = Array.isArray(publicCatalog?.video)
+    ? publicCatalog.video : pricingCatalog?.catalog_verified === true ? []
+      : Array.isArray(pricingCatalog?.video) ? pricingCatalog.video : [];
+  const contractItems = pricingCatalog?.catalog_verified === true && Array.isArray(pricingCatalog?.video)
+    ? pricingCatalog.video : [];
+  const publicVideoModels = new Set([...publicItems, ...contractItems]
+    .filter((entry) => endpointTypes(entry).includes('openai-video'))
+    .map((entry) => String(entry?.model || '').trim().toLowerCase())
+    .filter(Boolean));
+  const hasTypedPricingVideo = [...publicItems, ...contractItems]
+    .some((entry) => endpointTypes(entry).includes('openai-video'));
   const capabilityOverrides = normalizeCapabilityOverrideMap(options.capability_overrides);
+  const hasExplicitLocalVideoHint = rawDiscovered.some((entry) => Boolean(
+    findModelCapabilityOverride(capabilityOverrides, entry?.model)
+  ));
+  // Older custom relays and historical fixtures exposed a dedicated `video`
+  // catalog but omitted endpoint metadata everywhere. Keep that narrow,
+  // explicitly untyped compatibility path; a mixed typed Yinzi catalog never
+  // falls through to guessing.
+  const legacyUnlabelledVideoCatalog = serviceType === 'video'
+    && !rawDiscovered.some((entry) => endpointTypes(entry).length > 0)
+    && !hasTypedPricingVideo
+    && (Array.isArray(pricingCatalog?.video) || hasExplicitLocalVideoHint);
+  const matchesService = (entry) => {
+    if (provider !== 'yinzi') return true;
+    const endpoints = endpointTypes(entry);
+    const knownVideo = Boolean(getYinziVideoCapability(entry?.model));
+    if (serviceType === 'video') {
+      // The live /models response may omit endpoint_types for every entry.
+      // In that case only exact public-video or builtin registry membership is
+      // evidence of a video model; never classify the whole mixed catalog.
+      return endpoints.includes('openai-video')
+        || (!endpoints.length && (knownVideo
+          || publicVideoModels.has(String(entry?.model || '').trim().toLowerCase())
+          || legacyUnlabelledVideoCatalog));
+    }
+    if (serviceType === 'image' || serviceType === 'storyboard_image') {
+      return endpoints.includes('image-generation');
+    }
+    if (serviceType === 'text') {
+      return endpoints.includes('openai')
+        && !endpoints.includes('openai-video')
+        && !endpoints.includes('image-generation');
+    }
+    return true;
+  };
+  const discovered = rawDiscovered.filter(matchesService);
+  const priced = publicItems.length ? publicItems : contractItems;
   const catalog = discovered.map((entry) => {
     const model = entry.model;
-    const publicItem = priced.find((item) => String(item.model || '').toLowerCase() === model.toLowerCase()) || null;
+    const modelKey = String(model || '').toLowerCase();
+    const publicItem = priced.find((item) => String(item.model || '').toLowerCase() === modelKey) || null;
+    const contractItem = contractItems.find((item) => String(item.model || '').toLowerCase() === modelKey) || null;
+    const enrichment = contractItem || publicItem;
     // A key-scoped capability catalog is authoritative even when one model's
     // contract is missing. Only the explicit legacy fallback may use the
     // bundled compatibility profiles; never invent capabilities for a model
     // that the live catalog returned as unknown.
     const capabilityCatalogVerified = pricingCatalog?.catalog_verified === true;
-    const builtinCapability = publicItem?.capabilities
+    const builtinCapability = contractItem?.capabilities || publicItem?.capabilities
       || (!capabilityCatalogVerified && serviceType === 'video' ? getYinziVideoCapability(model) : null);
     const localOverride = findModelCapabilityOverride(capabilityOverrides, model);
     const capability = mergeModelCapability(builtinCapability, localOverride);
-    const groups = group ? [group] : (publicItem?.groups || []);
+    const groups = group ? [group] : (enrichment?.groups || []);
+    const normalizedEndpoints = endpointTypes(entry);
+    const resolvedEndpoints = normalizedEndpoints.length
+      ? normalizedEndpoints
+      : serviceType === 'video' && getYinziVideoCapability(model) ? ['openai-video']
+        : endpointTypes(enrichment);
     return {
       ...(publicItem || {}),
+      ...(contractItem || {}),
       model,
-      name: entry.name || publicItem?.name || model,
-      endpoint_types: entry.endpoint_types?.length ? entry.endpoint_types : (publicItem?.endpoint_types || [serviceType === 'video' ? 'openai-video' : serviceType]),
+      name: entry.name || enrichment?.name || model,
+      endpoint_types: resolvedEndpoints,
       groups,
-      prices: publicItem?.prices || [],
+      prices: contractItem?.prices?.length ? contractItem.prices : (publicItem?.prices || []),
       capabilities: capability || null,
-      capability_source: publicItem?.capability_source || (builtinCapability && localOverride ? 'builtin+local'
+      provider_contract: contractItem?.provider_contract || publicItem?.provider_contract
+        || capability?.provider_contract || '',
+      provider_create_path: contractItem?.provider_create_path || publicItem?.provider_create_path
+        || capability?.provider_create_path || '',
+      provider_query_path: contractItem?.provider_query_path || publicItem?.provider_query_path
+        || capability?.provider_query_path || '',
+      provider_content_path: contractItem?.provider_content_path || publicItem?.provider_content_path
+        || capability?.provider_content_path || '',
+      capability_source: contractItem?.capability_source || publicItem?.capability_source || (builtinCapability && localOverride ? 'builtin+local'
         : localOverride ? 'local' : builtinCapability ? 'builtin' : 'unknown'),
-      contract_status: publicItem?.contract_status || (builtinCapability ? 'known' : localOverride ? 'local' : 'missing'),
+      contract_status: contractItem?.contract_status || publicItem?.contract_status || (builtinCapability ? 'known' : localOverride ? 'local' : 'missing'),
       local_capability_override: localOverride || null,
       automatic_eligible: capability?.automatic_eligible === true,
       availability_scope: discovery?.availability_scope || 'credential',
       scope_verified: discovery?.snapshot?.scope_verified === true,
+      credential_verified: discovery?.snapshot?.scope_verified === true,
+      smart_routing_candidate: smartRouting,
+      public_catalog: Boolean(publicItem),
+      manual_only: false,
       catalog_source: discovery?.source_url || null,
       provider,
       catalog_verified: capabilityCatalogVerified,
     };
   });
+  if (provider === 'yinzi' && serviceType === 'video' && options.include_public_catalog === true) {
+    const seen = new Set(catalog.map((item) => String(item.model || '').toLowerCase()));
+    for (const publicItem of publicItems) {
+      const model = String(publicItem?.model || '').trim();
+      const modelKey = model.toLowerCase();
+      if (!model || seen.has(modelKey) || !endpointTypes(publicItem).includes('openai-video')) continue;
+      seen.add(modelKey);
+      const localOverride = findModelCapabilityOverride(capabilityOverrides, model);
+      const capability = mergeModelCapability(publicItem.capabilities || getYinziVideoCapability(model), localOverride);
+      catalog.push({
+        ...publicItem,
+        model,
+        name: publicItem.name || model,
+        endpoint_types: endpointTypes(publicItem),
+        groups: Array.isArray(publicItem.groups) ? publicItem.groups : [],
+        prices: Array.isArray(publicItem.prices) ? publicItem.prices : [],
+        capabilities: capability || null,
+        provider_contract: publicItem.provider_contract || capability?.provider_contract || '',
+        provider_create_path: publicItem.provider_create_path || capability?.provider_create_path || '',
+        provider_query_path: publicItem.provider_query_path || capability?.provider_query_path || '',
+        provider_content_path: publicItem.provider_content_path || capability?.provider_content_path || '',
+        capability_source: publicItem.capability_source || (localOverride ? 'builtin+local' : capability ? 'builtin' : 'unknown'),
+        contract_status: publicItem.contract_status || (localOverride ? 'local' : capability ? 'known' : 'missing'),
+        local_capability_override: localOverride || null,
+        // Public pricing proves that the site sells a model, not that this Key
+        // has a physical route for it. Keep the offer visible for an explicit
+        // manual attempt, but never promote it into zero-config automation.
+        automatic_eligible: false,
+        availability_scope: 'public',
+        scope_verified: false,
+        credential_verified: false,
+        smart_routing_candidate: false,
+        public_catalog: true,
+        manual_only: true,
+        catalog_source: publicCatalog?.source || pricingCatalog?.source || null,
+        provider,
+        catalog_verified: false,
+      });
+    }
+  }
+  // A key-scoped capability entry can safely enrich the manual picker even if
+  // the standard model projection has not caught up. It still does not prove
+  // an eligible physical Smart Router route: only /v1/models grants automatic
+  // availability. This keeps capability advice separate from dispatch truth.
+  if (provider === 'yinzi' && serviceType === 'video' && pricingCatalog?.catalog_verified === true) {
+    const seen = new Set(catalog.map((item) => String(item.model || '').toLowerCase()));
+    const scopeVerified = discovery?.snapshot?.scope_verified === true
+      || pricingCatalog?.scope_verified === true;
+    for (const contractItem of contractItems) {
+      const model = String(contractItem?.model || '').trim();
+      const modelKey = model.toLowerCase();
+      if (!model || seen.has(modelKey) || !endpointTypes(contractItem).includes('openai-video')) continue;
+      seen.add(modelKey);
+      const localOverride = findModelCapabilityOverride(capabilityOverrides, model);
+      const capability = mergeModelCapability(contractItem.capabilities || null, localOverride);
+      catalog.push({
+        ...contractItem,
+        model,
+        name: contractItem.name || model,
+        endpoint_types: endpointTypes(contractItem),
+        groups: Array.isArray(contractItem.groups) ? contractItem.groups : [],
+        prices: Array.isArray(contractItem.prices) ? contractItem.prices : [],
+        capabilities: capability || null,
+        provider_contract: contractItem.provider_contract || capability?.provider_contract || '',
+        provider_create_path: contractItem.provider_create_path || capability?.provider_create_path || '',
+        provider_query_path: contractItem.provider_query_path || capability?.provider_query_path || '',
+        provider_content_path: contractItem.provider_content_path || capability?.provider_content_path || '',
+        capability_source: contractItem.capability_source || (localOverride ? 'local' : 'unknown'),
+        contract_status: contractItem.contract_status || (localOverride ? 'local' : 'missing'),
+        local_capability_override: localOverride || null,
+        automatic_eligible: false,
+        availability_scope: 'credential',
+        scope_verified: scopeVerified,
+        credential_verified: false,
+        smart_routing_candidate: false,
+        public_catalog: false,
+        manual_only: true,
+        catalog_source: pricingCatalog?.source || discovery?.source_url || null,
+        provider,
+        catalog_verified: true,
+      });
+    }
+  }
   return {
     version: pricingCatalog?.version || 1,
     pricing_version: pricingCatalog?.pricing_version || '',
@@ -965,6 +1126,12 @@ function mergeDiscoveredCatalog(discovery, pricingCatalog, options = {}) {
     source: discovery?.source_url || pricingCatalog?.source || null,
     availability_scope: discovery?.availability_scope || 'credential',
     scope_verified: discovery?.snapshot?.scope_verified === true,
+    discovery_outcome: discovery?.discovery_outcome || 'live',
+    stale_snapshot: discovery?.stale_snapshot === true,
+    warnings: [
+      ...(Array.isArray(discovery?.warnings) ? discovery.warnings : []),
+      ...(Array.isArray(pricingCatalog?.warnings) ? pricingCatalog.warnings : []),
+    ],
     video: catalog,
   };
 }

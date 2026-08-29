@@ -701,6 +701,20 @@ function ensureAllColumns(database) {
   ensureColumns(database, 'production_runs', [
     { name: 'idempotency_key', type: 'TEXT' },
   ]);
+  // V0.4 parent/child media actions.  These columns are deliberately
+  // additive so databases created by older releases remain readable and the
+  // migration can be run repeatedly during desktop startup.
+  ensureColumns(database, 'production_actions', [
+    { name: 'parent_action_id', type: 'INTEGER' },
+    { name: 'parent_action_key', type: 'TEXT' },
+    { name: 'segment_index', type: 'INTEGER' },
+    { name: 'cancel_mode', type: 'TEXT' },
+    { name: 'external_outcome', type: 'TEXT' },
+  ]);
+  database.exec(`
+    CREATE INDEX IF NOT EXISTS idx_production_actions_parent
+      ON production_actions (parent_action_id, segment_index, id);
+  `);
   database.exec(`
     CREATE TABLE IF NOT EXISTS model_prices (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -777,6 +791,111 @@ function ensureAllColumns(database) {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_production_runs_idempotency
       ON production_runs (drama_id, IFNULL(episode_id, 0), idempotency_key)
       WHERE idempotency_key IS NOT NULL AND deleted_at IS NULL;
+  `);
+
+  // V0.4 P3: resumable asset-import plans and immutable series-group refs.
+  // These tables are additive and deliberately keep the pre-apply phase
+  // separate from production_artifacts so a preview can be discarded safely.
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS asset_import_sessions (
+      id TEXT PRIMARY KEY,
+      status TEXT NOT NULL DEFAULT 'draft',
+      source_label TEXT NOT NULL DEFAULT '',
+      target_run_id TEXT,
+      options_json TEXT NOT NULL DEFAULT '{}',
+      plan_json TEXT NOT NULL DEFAULT '{}',
+      snapshot_json TEXT NOT NULL DEFAULT '{}',
+      error_code TEXT,
+      error_message TEXT,
+      version INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      applied_at TEXT,
+      rolled_back_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_asset_import_sessions_status
+      ON asset_import_sessions(status, updated_at DESC);
+    CREATE TABLE IF NOT EXISTS asset_import_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL,
+      relative_path TEXT NOT NULL,
+      source_path TEXT,
+      file_name TEXT NOT NULL DEFAULT '',
+      extension TEXT NOT NULL DEFAULT '',
+      mime_type TEXT,
+      bytes INTEGER NOT NULL DEFAULT 0,
+      mtime TEXT,
+      sha256 TEXT,
+      detected_type TEXT NOT NULL DEFAULT 'unknown',
+      candidate_stage TEXT,
+      candidate_scope_type TEXT,
+      candidate_scope_id TEXT,
+      confidence REAL,
+      evidence_json TEXT NOT NULL DEFAULT '{}',
+      status TEXT NOT NULL DEFAULT 'pending',
+      error_code TEXT,
+      error_message TEXT,
+      metadata_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(session_id, relative_path)
+    );
+    CREATE INDEX IF NOT EXISTS idx_asset_import_items_session
+      ON asset_import_items(session_id, status, id);
+    CREATE INDEX IF NOT EXISTS idx_asset_import_items_hash
+      ON asset_import_items(sha256, session_id);
+    CREATE TABLE IF NOT EXISTS series_groups (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      metadata_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      archived_at TEXT,
+      UNIQUE(name)
+    );
+    CREATE TABLE IF NOT EXISTS series_group_episodes (
+      series_group_id INTEGER NOT NULL,
+      drama_id INTEGER NOT NULL,
+      episode_id INTEGER,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(series_group_id, drama_id, episode_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_series_group_episodes_lookup
+      ON series_group_episodes(series_group_id, drama_id, episode_id);
+    CREATE TABLE IF NOT EXISTS series_assets (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      series_group_id INTEGER NOT NULL,
+      asset_key TEXT NOT NULL,
+      asset_type TEXT NOT NULL,
+      title TEXT NOT NULL DEFAULT '',
+      current_version_id INTEGER,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(series_group_id, asset_key)
+    );
+    CREATE TABLE IF NOT EXISTS series_asset_versions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      series_asset_id INTEGER NOT NULL,
+      version INTEGER NOT NULL,
+      content_json TEXT NOT NULL DEFAULT '{}',
+      source_artifact_id INTEGER,
+      content_hash TEXT,
+      created_at TEXT NOT NULL,
+      UNIQUE(series_asset_id, version)
+    );
+    CREATE TABLE IF NOT EXISTS episode_asset_refs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      series_asset_id INTEGER NOT NULL,
+      series_asset_version_id INTEGER NOT NULL,
+      drama_id INTEGER NOT NULL,
+      episode_id INTEGER,
+      mode TEXT NOT NULL DEFAULT 'reuse',
+      created_at TEXT NOT NULL,
+      UNIQUE(series_asset_version_id, drama_id, episode_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_episode_asset_refs_episode
+      ON episode_asset_refs(drama_id, episode_id, created_at DESC);
   `);
 }
 

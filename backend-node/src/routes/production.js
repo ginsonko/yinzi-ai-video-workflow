@@ -17,6 +17,7 @@ function sendError(res, log, label, error) {
   if (code === 'VERSION_CONFLICT') return response.error(res, 409, code, error.message);
   if (code === 'SHOT_OPERATION_BUSY') return response.error(res, 409, code, error.message);
   if (code === 'PRODUCTION_ASPECT_RATIO_LOCKED') return response.error(res, 409, code, error.message, error.details);
+  if (code.startsWith('SERIES_')) return response.error(res, 409, code, error.message);
   if (code === 'STAGE_INCOMPLETE') return response.error(res, 409, code, error.message, error.details);
   if (code.includes('BUDGET')) return response.error(res, 409, code, error.message, error.details);
   if (code === 'AMBIGUOUS_ACTION') return response.error(res, 409, code, error.message);
@@ -222,6 +223,38 @@ function routes(db, cfg, log, injected = {}) {
         repo.appendEvent(db, run.id, 'run.cancelled', { stage: run.current_stage });
         response.success(res, repo.getRunSummary(db, run.id));
       } catch (error) { sendError(res, log, 'production cancel', error); }
+    },
+    detach: async (req, res) => {
+      try {
+        const result = await service.detachRunView(req.params.id, req.body || {});
+        if (!result) return response.notFound(res, '制作任务不存在');
+        response.success(res, result);
+      } catch (error) { sendError(res, log, 'production detach view', error); }
+    },
+    cancelAction: async (req, res) => {
+      try {
+        const result = await service.cancelRunAction(req.params.id, req.body || {});
+        if (!result || result.status === 'not_found') return response.notFound(res, '当前没有可取消的任务动作');
+        response.success(res, result);
+      } catch (error) { sendError(res, log, 'production cancel action', error); }
+    },
+    cancelLocal: async (req, res) => {
+      try {
+        const result = await service.cancelRunAction(req.params.id, {
+          ...(req.body || {}), cancel_mode: 'cancel_local_request',
+        });
+        if (!result || result.status === 'not_found') return response.notFound(res, '当前没有可停止的任务动作');
+        response.success(res, result);
+      } catch (error) { sendError(res, log, 'production cancel local observation', error); }
+    },
+    cancelProvider: async (req, res) => {
+      try {
+        const result = await service.cancelRunAction(req.params.id, {
+          ...(req.body || {}), cancel_mode: 'cancel_provider_task',
+        });
+        if (!result || result.status === 'not_found') return response.notFound(res, '当前没有可取消的任务动作');
+        response.success(res, result);
+      } catch (error) { sendError(res, log, 'production cancel provider task', error); }
     },
     transition: (req, res) => {
       try {

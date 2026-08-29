@@ -5,13 +5,31 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const yaml = require('js-yaml');
-const { normalizeMacSigningEnvironment, npmExecutable } = require('../scripts/mac-build-utils');
+const {
+  MAC_VARIANTS,
+  normalizeMacSigningEnvironment,
+  npmExecutable,
+  resolveMacVariant,
+} = require('../scripts/mac-build-utils');
 const { isMaterializedTrackedExecutable, resolveSource } = require('../scripts/prepare-media-tools');
 
 const desktopDir = path.join(__dirname, '..');
 const repositoryDir = path.join(desktopDir, '..');
 
 describe('release packaging contract', () => {
+  it('keeps the universal Mac profile explicit and isolated from the Yinzi profile', () => {
+    assert.equal(resolveMacVariant('yinzi'), MAC_VARIANTS.yinzi);
+    assert.equal(resolveMacVariant('universal'), MAC_VARIANTS.universal);
+    assert.deepEqual(MAC_VARIANTS.universal, {
+      id: 'universal',
+      config: 'electron-builder-mac-universal.json',
+      output: 'release-mac-universal',
+      productName: '银子AI视频工作流-通用版-老李兼容',
+      appId: 'top.yinziapi.ai-video-workflow.universal',
+    });
+    assert.throws(() => resolveMacVariant('unknown'), /不支持的 Mac 发行版/);
+  });
+
   it('uses the native npm launcher on macOS and the command shim on Windows', () => {
     assert.equal(npmExecutable('darwin'), 'npm');
     assert.equal(npmExecutable('linux'), 'npm');
@@ -95,7 +113,10 @@ describe('release packaging contract', () => {
       { arch: 'arm64', runner: 'macos-15' },
     ]);
     assert.equal(macJob['runs-on'], '${{ matrix.runner }}');
+    assert.equal(macJob.env?.AI_VIDEO_MAC_VARIANT, 'universal');
     assert.match(workflowText, /npm run dist:mac:\$\{\{ matrix\.arch \}\}/);
+    assert.match(workflowText, /release-mac-universal/);
+    assert.match(workflowText, /top\.yinziapi\.ai-video-workflow\.universal/);
     assert.match(workflowText, /darwin-\$\{\{ matrix\.arch \}\}\.node/);
     assert.match(workflowText, /-name 'better_sqlite3\.node'/);
   });
@@ -121,6 +142,9 @@ describe('release packaging contract', () => {
 
     assert.equal(job['runs-on'], 'windows-2022');
     assert.equal(job.env?.npm_config_msvs_version, '2022');
+    assert.equal(job.steps.find((step) => step.name === 'Build Windows installer and portable package')?.run, 'npm run dist:universal');
+    const windowsUpload = job.steps.find((step) => step.name === 'Upload Windows artifacts');
+    assert.match(windowsUpload?.with?.path || '', /desktop\/release-universal\/\*\.exe/);
     const setupPython = job.steps.find((step) => step.uses === 'actions/setup-python@v5');
     assert.equal(setupPython?.with?.['python-version'], '3.12');
 
@@ -187,7 +211,7 @@ describe('release packaging contract', () => {
       'utf8'
     ));
 
-    assert.equal(packageJson.version, '0.1.3-beta.4');
+    assert.equal(packageJson.version, '0.1.3-beta.7');
     assert.equal(packageJson.build.directories.output, 'release');
     assert.equal(packageJson.build.electronVersion, packageJson.devDependencies.electron);
     assert.equal(Object.hasOwn(packageJson.build, 'electronDist'), false);
@@ -197,7 +221,18 @@ describe('release packaging contract', () => {
     assert.deepEqual(macConfig.mac.target, ['dmg', 'zip']);
     assert.equal(packageJson.scripts['dist:mac:x64'], 'node scripts/dist-mac.js x64');
     assert.equal(packageJson.scripts['dist:mac:arm64'], 'node scripts/dist-mac.js arm64');
+    assert.equal(packageJson.scripts['dist:universal'], 'node scripts/dist-universal.js');
     assert.match(packageJson.scripts.dist, /electron-builder --win --x64 --publish never$/);
+
+    const universalConfig = JSON.parse(fs.readFileSync(
+      path.join(desktopDir, 'electron-builder-mac-universal.json'),
+      'utf8'
+    ));
+    assert.equal(universalConfig.appId, 'top.yinziapi.ai-video-workflow.universal');
+    assert.equal(universalConfig.productName, '银子AI视频工作流-通用版-老李兼容');
+    assert.equal(universalConfig.executableName, universalConfig.productName);
+    assert.equal(universalConfig.directories.output, 'release-mac-universal');
+    assert.deepEqual(universalConfig.mac.target, ['dmg', 'zip']);
   });
 
   it('requires the guided demo source videos used by every release build', () => {

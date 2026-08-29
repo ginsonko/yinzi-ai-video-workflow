@@ -1,6 +1,7 @@
 const crypto = require('node:crypto');
 const repo = require('./productionRepository');
 const { createProductionService } = require('./productionService');
+const { semanticProgressSignature, idleBackoffDelay } = require('./productionProgress');
 
 const TERMINAL_WAIT_REASONS = new Set([
   'manual_content_required',
@@ -12,6 +13,9 @@ const TERMINAL_WAIT_REASONS = new Set([
   'automation_limit_reached',
   'automation_diagnosis_stopped',
   'automation_recovery_failed',
+  'local_observation_stopped',
+  'provider_cancelled_pending_refund',
+  'provider_cancel_requested_unknown',
 ]);
 
 function shouldScheduleRun(run) {
@@ -42,6 +46,7 @@ function createProductionAutonomyRunner(db, cfg, log, injected = {}) {
   const setIntervalFn = injected.setInterval || setInterval;
   const clearIntervalFn = injected.clearInterval || clearInterval;
   const dueAt = new Map();
+  const consecutiveSemanticIdle = new Map();
   let timer = null;
   let running = false;
   let stopped = false;
@@ -70,14 +75,29 @@ function createProductionAutonomyRunner(db, cfg, log, injected = {}) {
       for (const run of candidates) {
         let outcome;
         try {
+          const beforeSignature = semanticProgressSignature(repo.getRunSummary(db, run.id) || run);
           outcome = await service.advance(run.id, {
             lease_owner: `${ownerPrefix}:${run.id}`,
             lease_ttl_ms: 45000,
             background: true,
           });
-          const latest = repo.getRun(db, run.id);
-          if (shouldScheduleRun(latest)) dueAt.set(run.id, now() + delayForOutcome(outcome, injected));
-          else dueAt.delete(run.id);
+          const latestSummary = repo.getRunSummary(db, run.id);
+          const latest = latestSummary?.run || repo.getRun(db, run.id);
+          const semanticChanged = beforeSignature !== semanticProgressSignature(latestSummary || latest || run);
+          outcome = { ...(outcome || {}), semantic_progress: semanticChanged };
+          if (semanticChanged) consecutiveSemanticIdle.delete(run.id);
+          else if (['progressed', 'approved'].includes(outcome.state)) {
+            consecutiveSemanticIdle.set(run.id, Number(consecutiveSemanticIdle.get(run.id) || 0) + 1);
+          }
+          if (shouldScheduleRun(latest)) {
+            const idleCount = Number(consecutiveSemanticIdle.get(run.id) || 0);
+            dueAt.set(run.id, now() + (idleCount > 0
+              ? idleBackoffDelay(idleCount, injected)
+              : delayForOutcome(outcome, injected)));
+          } else {
+            dueAt.delete(run.id);
+            consecutiveSemanticIdle.delete(run.id);
+          }
         } catch (error) {
           dueAt.set(run.id, now() + delayForOutcome(null, injected));
           log.error('Background production advance failed', {
@@ -107,6 +127,7 @@ function createProductionAutonomyRunner(db, cfg, log, injected = {}) {
     if (timer) clearIntervalFn(timer);
     timer = null;
     dueAt.clear();
+    consecutiveSemanticIdle.clear();
   }
 
   return {
@@ -121,5 +142,6 @@ function createProductionAutonomyRunner(db, cfg, log, injected = {}) {
 module.exports = {
   createProductionAutonomyRunner,
   delayForOutcome,
+  idleBackoffDelay,
   shouldScheduleRun,
 };

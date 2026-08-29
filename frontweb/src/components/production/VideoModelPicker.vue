@@ -43,6 +43,14 @@
       </section>
 
       <el-alert
+        v-if="catalogStatusMessage"
+        :type="routing.catalog?.stale_snapshot ? 'warning' : 'info'"
+        :closable="false"
+        show-icon
+        :title="catalogStatusMessage"
+      />
+
+      <el-alert
         v-if="routing.route_edit_deferred"
         type="info"
         :closable="false"
@@ -217,6 +225,14 @@ const configuredModelLabel = computed(() => props.routing?.effective_route?.mode
   || (props.routing?.project?.mode === 'fixed' ? props.routing.project.model : '')
   || '提交前自动选择')
 const directorDisabled = computed(() => props.routing?.project?.director_mode === 'off')
+const catalogStatusMessage = computed(() => {
+  const catalog = props.routing?.catalog || {}
+  const warnings = Array.isArray(catalog.warnings) ? catalog.warnings.filter(Boolean) : []
+  if (catalog.stale_snapshot) {
+    return warnings[0] || '实时模型目录暂不可用，当前使用此视频配置上次成功保存的目录；可继续选模，也可稍后重新同步。'
+  }
+  return warnings[0] || ''
+})
 const routeEditDeferred = computed(() => props.routing?.route_edit_deferred === true)
 const dialogSubtitle = computed(() => routeEditDeferred.value
   ? '可单独跳过导演台；设置立即保存并在新分镜确认后生效，不会产生费用'

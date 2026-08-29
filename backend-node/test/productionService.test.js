@@ -7,9 +7,19 @@ const { createProductionService } = require('../src/services/productionService')
 const { createProductionMediaService } = require('../src/services/productionMediaService');
 const automationPreferences = require('../src/services/productionAutomationPreferences');
 const aiConfigService = require('../src/services/aiConfigService');
+const director = require('../src/services/productionDirector');
 
 let db;
 const log = { info() {}, warn() {}, error() {} };
+const healthyShortCapability = {
+  provider_contract: 'aizzz-video-v1',
+  duration_mode: 'free', duration_min: 5, duration_max: 15,
+  auto_duration_min: 5, auto_duration_max: 15,
+  max_images: 9, max_videos: 0, max_audios: 3, max_total_references: 12,
+  resolution: '480p', quality_tier: 'fast', automatic_eligible: true,
+  route_profiles: ['short_image_guided'],
+  roles: { image: ['reference'], video: [], audio: ['reference'] },
+};
 
 function migrateQuietly() {
   const originalLog = console.log;
@@ -456,6 +466,68 @@ describe('production executor text stages', () => {
     assert.deepEqual(videoAction.result.visual_evidence.sampled_at_seconds, [0.4, 2.5, 4.6]);
   });
 
+  it('revises director JSON before recording a rejected previs again', async () => {
+    let run = createRun('ai');
+    run = repo.updateRun(db, run.id, {
+      current_stage: 'director_preview', current_scope_type: 'shot', current_scope_id: '1',
+      status: 'running', review_profile: { model: 'vision-review-model', version: 'director-review-v1' },
+    });
+    const shot = repo.createArtifact(db, {
+      run_id: run.id, stage: 'storyboard_plan', scope_type: 'shot', scope_id: '1', title: '镜头一',
+      content: { number: 1, duration: 6, scene_name: '月面温室', character_names: ['林夏'], prop_names: [], included: true },
+      status: 'approved',
+    });
+    const originalDocument = director.createFallbackDirectorDocument(shot.content, '16:9');
+    const plan = repo.createArtifact(db, {
+      run_id: run.id, stage: 'director_plan', scope_type: 'shot', scope_id: '1', title: '镜头一导演方案',
+      content: { source_artifact_id: shot.id, source_revision: shot.revision, document: originalDocument, included: true },
+      status: 'approved', depends_on: [shot.id],
+    });
+    const preview = repo.createArtifact(db, {
+      run_id: run.id, stage: 'director_preview', scope_type: 'shot', scope_id: '1', title: '镜头一预演',
+      content: { source_artifact_id: plan.id, expected_duration: 6, included: true },
+      status: 'draft', media_path: 'director/shot-1.webm', mime_type: 'video/webm', depends_on: [plan.id],
+    });
+    const revisedDocument = structuredClone(originalDocument);
+    revisedDocument.objects.find((item) => item.id === 'camera-1').position = [4.2, 2.7, 6.1];
+    revisedDocument.timeline.keyframes.find((item) => item.object_id === 'camera-1').position = [4.2, 2.7, 6.1];
+    const textCalls = [];
+    const service = createProductionService(db, {}, log, {
+      validateVideo: async () => ({ relative_path: preview.media_path, duration: 6, video_codec: 'vp9' }),
+      prepareReviewEvidence: async () => ({
+        imageSource: { localAbsPath: 'C:\\review\\director-sheet.jpg' },
+        receipt: { kind: 'video_first_middle_last_sheet', media_sha256: 'preview-hash', sampled_at_seconds: [0.5, 3, 5.5] },
+        cleanup() {},
+      }),
+      generateTextWithVision: async () => JSON.stringify({
+        decision: 'rejected', reason: '人物在中段走出画面，结尾构图丢失主体', confidence: 0.96,
+        severity: 'major', blocking_issues: ['调整摄像机跟随关键帧，确保人物全程留在安全框内'],
+        improvement_notes: ['结尾可略微推近'], requires_human_authority: false,
+        scores: { continuity: 35, production_ready: 40 },
+      }),
+      generateText: async (user, system, options) => {
+        textCalls.push({ user, system, options });
+        return JSON.stringify({ ...plan.content, document: revisedDocument });
+      },
+    });
+
+    const result = await service.applyReviewPolicy(run, [preview]);
+    assert.equal(result.state, 'progressed');
+    assert.equal(result.reason, 'director_plan_revised_from_preview');
+    const latestPlan = repo.listArtifacts(db, run.id, {
+      stage: 'director_plan', scope_type: 'shot', scope_id: '1', current: true,
+    }).items[0];
+    assert.equal(latestPlan.revision, 2);
+    assert.equal(latestPlan.status, 'draft');
+    assert.equal(latestPlan.content.revision_source_preview_id, preview.id);
+    assert.equal(latestPlan.content.document.objects.find((item) => item.id === 'camera-1').position[0], 4.2);
+    assert.match(textCalls[0].user, /必须先修改导演台 JSON/);
+    assert.match(textCalls[0].user, /人物在中段走出画面/);
+    assert.equal(repo.listActions(db, run.id, { page_size: 50 }).items
+      .filter((item) => item.stage === 'director_preview' && item.kind === 'client_capture').length, 0);
+    assert.equal(repo.getRun(db, run.id).current_stage, 'director_plan');
+  });
+
   it('bounds independent asset reviews and persists actions and decisions in source order', async () => {
     let run = createRun('ai');
     run = repo.updateRun(db, run.id, {
@@ -569,6 +641,215 @@ describe('production executor text stages', () => {
     assert.equal(repo.getArtifact(db, assets[2].id).status, 'approved');
     const actions = repo.listActions(db, run.id, { page_size: 50 }).items;
     assert.equal(actions.filter((item) => item.kind === 'ai_review' && item.status === 'completed').length, 2);
+  });
+
+  it('regenerates every independently rejected asset image and carries each AI reason forward', async () => {
+    let run = createRun('ai');
+    run = repo.updateRun(db, run.id, {
+      current_stage: 'asset_images', status: 'running',
+      policy: { ...run.policy, image_concurrency: 2 },
+      review_profile: { model: 'vision-review-model', version: 'review-v3' },
+    });
+    automationPreferences.set(db, { review_concurrency: 2 });
+    const definitions = [
+      {
+        scope_type: 'prop', scope_id: 'prop-1', title: '银白长剑',
+        content: { name: '银白长剑', description: '同一柄银白长剑与剑鞘', visual_prompt: '同一件道具四视图', included: true },
+        reason: '画面是双人战斗剧情，不是同一柄长剑的正面、侧面、背面、细节四视图',
+        issue: '必须移除人物、血迹和剧情动作，只展示同一件道具的四个角度',
+      },
+      {
+        scope_type: 'scene', scope_id: 'scene-1', title: '断崖古台',
+        content: { name: '断崖古台', description: '夜晚断崖石台', visual_prompt: '同一地点空间四视图', included: true },
+        reason: '当前只有单张场景图，缺少同一地点的四个空间视角',
+        issue: '必须生成全景、主方向、反方向和关键区域，空间锚点保持一致',
+      },
+    ];
+    const images = definitions.map((definition) => {
+      const source = repo.createArtifact(db, {
+        run_id: run.id, stage: 'asset_text', scope_type: definition.scope_type, scope_id: definition.scope_id,
+        title: definition.title, content: definition.content, status: 'approved',
+      });
+      return repo.createArtifact(db, {
+        run_id: run.id, stage: 'asset_images', scope_type: definition.scope_type, scope_id: definition.scope_id,
+        title: definition.title, content: { source_artifact_id: source.id, included: true }, status: 'draft',
+        media_path: `images/${definition.scope_id}.png`, mime_type: 'image/png', depends_on: [source.id],
+      });
+    });
+    const imageRequests = [];
+    const service = createProductionService(db, {}, log, {
+      validateImage: async (mediaPath) => ({
+        relative_path: mediaPath, width: 1536, height: 1024, format: 'png', nonblank: true,
+      }),
+      prepareReviewEvidence: async (artifact) => ({
+        imageSource: { localAbsPath: `C:\\review\\${artifact.id}.png` },
+        receipt: { kind: 'source_image', media_sha256: `hash-${artifact.id}`, relative_path: artifact.media_path },
+        cleanup() {},
+      }),
+      generateTextWithVision: async (user) => {
+        const definition = definitions.find((item) => user.includes(item.title));
+        return JSON.stringify({
+          decision: 'rejected', reason: definition.reason, confidence: 0.96, severity: 'major',
+          blocking_issues: [definition.issue], improvement_notes: ['保持未被批评的材质与夜景风格'],
+          requires_human_authority: false, scores: { production_ready: 35 },
+        });
+      },
+      media: {
+        createImage: async (request) => {
+          imageRequests.push(request);
+          return { id: 700 + imageRequests.length, task_id: `retry-image-${imageRequests.length}` };
+        },
+      },
+    });
+
+    const result = await service.applyReviewPolicy(run, images);
+    assert.equal(result.state, 'waiting_task');
+    assert.equal(imageRequests.length, 2);
+    for (const definition of definitions) {
+      const request = imageRequests.find((item) => item.prompt.includes(definition.title));
+      assert.ok(request, `missing retry request for ${definition.title}`);
+      assert.match(request.prompt, new RegExp(definition.reason.slice(0, 12)));
+      assert.match(request.prompt, new RegExp(definition.issue.slice(0, 12)));
+      const review = repo.listReviews(db, run.id, {
+        stage: 'asset_images', scope_type: definition.scope_type, scope_id: definition.scope_id, page_size: 1,
+      }).items[0];
+      assert.deepEqual(review.evidence.review_verdict.blocking_issues, [definition.issue]);
+    }
+    const retryActions = repo.listActions(db, run.id, { page_size: 100 }).items
+      .filter((item) => item.kind === 'image_generate' && item.status === 'waiting');
+    assert.equal(retryActions.length, 2);
+  });
+
+  it('keeps a rejected asset regenerating when another parallel AI review times out', async () => {
+    let run = createRun('ai');
+    run = repo.updateRun(db, run.id, {
+      current_stage: 'asset_images', status: 'running',
+      policy: { ...run.policy, image_concurrency: 2 },
+      review_profile: { model: 'vision-review-model', version: 'parallel-failure-v1' },
+    });
+    automationPreferences.set(db, { review_concurrency: 2 });
+    const sources = ['timeout', 'rejected'].map((scopeId, index) => repo.createArtifact(db, {
+      run_id: run.id, stage: 'asset_text', scope_type: 'prop', scope_id: scopeId,
+      title: index === 0 ? '超时道具' : '待返工道具',
+      content: {
+        name: index === 0 ? '超时道具' : '待返工道具', description: '同一件关键道具',
+        visual_prompt: '同一件道具四角度设定板', included: true,
+      },
+      status: 'approved',
+    }));
+    const images = sources.map((source) => repo.createArtifact(db, {
+      run_id: run.id, stage: 'asset_images', scope_type: source.scope_type, scope_id: source.scope_id,
+      title: source.title, content: { source_artifact_id: source.id, included: true },
+      status: 'draft', media_path: `images/${source.scope_id}.png`, mime_type: 'image/png', depends_on: [source.id],
+    }));
+    const imageRequests = [];
+    const diagnosisCalls = [];
+    const service = createProductionService(db, {}, log, {
+      validateImage: async (mediaPath) => ({ relative_path: mediaPath, width: 1536, height: 1024, nonblank: true }),
+      prepareReviewEvidence: async (artifact) => ({
+        imageSource: { localAbsPath: `C:\\review\\${artifact.id}.png` },
+        receipt: { kind: 'source_image', media_sha256: `hash-${artifact.id}` },
+        cleanup() {},
+      }),
+      generateTextWithVision: async (user) => {
+        if (user.includes('超时道具')) {
+          const error = new Error('AI generation silence timeout after 120000ms');
+          error.code = 'AI_SILENCE_TIMEOUT';
+          throw error;
+        }
+        return JSON.stringify({
+          decision: 'rejected', reason: '当前画面是剧情动作，不是同一件道具的四角度设定板',
+          confidence: 0.95, severity: 'major',
+          blocking_issues: ['移除人物与剧情场景，生成同一件道具恰好四个角度'],
+          improvement_notes: [], requires_human_authority: false,
+          scores: { production_ready: 30 },
+        });
+      },
+      generateText: async (_user, _system, options) => {
+        diagnosisCalls.push(options);
+        return JSON.stringify({
+          action: 'retry_same_model', root_cause: '视觉审核暂时超时',
+          correction: '保持当前对象并重新执行一次视觉审核', model_requirements: '',
+        });
+      },
+      media: {
+        createImage: async (request) => {
+          imageRequests.push(request);
+          return { id: 810, task_id: 'retry-after-peer-timeout' };
+        },
+      },
+    });
+
+    const result = await service.applyReviewPolicy(run, images);
+    assert.ok(['progressed', 'waiting_task'].includes(result.state), result.state);
+    assert.equal(imageRequests.length, 1);
+    assert.equal(imageRequests[0].source_artifact_id, sources[1].id);
+    assert.match(imageRequests[0].prompt, /当前画面是剧情动作/);
+    assert.match(imageRequests[0].prompt, /移除人物与剧情场景/);
+    assert.equal(repo.getArtifact(db, images[0].id).status, 'draft');
+    assert.equal(repo.getArtifact(db, images[1].id).status, 'rejected');
+    assert.equal(diagnosisCalls.length, 1);
+    const reviewActions = repo.listActions(db, run.id, { page_size: 100 }).items
+      .filter((item) => item.kind === 'ai_review');
+    assert.equal(reviewActions.some((item) => item.status === 'failed'), false);
+    assert.equal(reviewActions.some((item) => item.status === 'cancelled'), true);
+    assert.equal(repo.listActions(db, run.id, { page_size: 100 }).items
+      .filter((item) => item.kind === 'image_generate' && item.status === 'waiting').length, 1);
+  });
+
+  it('recovers one persisted rejected asset after restart and a competing runner cannot duplicate it', async () => {
+    let run = createRun('ai');
+    run = repo.updateRun(db, run.id, {
+      current_stage: 'asset_images', status: 'running', next_stage_strategy: 'auto_generate',
+      policy: { ...run.policy, image_concurrency: 2 },
+    });
+    const source = repo.createArtifact(db, {
+      run_id: run.id, stage: 'asset_text', scope_type: 'scene', scope_id: 'restart-scene',
+      title: '重启恢复场景',
+      content: {
+        name: '重启恢复场景', description: '同一室内空间', visual_prompt: '同一地点四个空间方向', included: true,
+      },
+      status: 'approved',
+    });
+    const rejected = repo.createArtifact(db, {
+      run_id: run.id, stage: 'asset_images', scope_type: 'scene', scope_id: source.scope_id,
+      title: source.title, content: { source_artifact_id: source.id, included: true },
+      status: 'draft', media_path: 'images/restart-scene.png', mime_type: 'image/png', depends_on: [source.id],
+    });
+    repo.reviewArtifact(db, rejected.id, {
+      reviewer_type: 'ai', decision: 'rejected', reason: '四格不是同一地点，空间锚点发生变化',
+      evidence: {
+        review_verdict: {
+          reason: '四格不是同一地点，空间锚点发生变化', severity: 'major',
+          blocking_issues: ['四格必须共享门、窗、桌椅与墙体的同一空间拓扑'], improvement_notes: [],
+        },
+      },
+    });
+    repo.updateRun(db, run.id, { status: 'running', waiting_reason: null, error_code: null, error_message: null });
+
+    let createCalls = 0;
+    let releaseCreate;
+    const createImage = async () => {
+      createCalls += 1;
+      return new Promise((resolve) => { releaseCreate = () => resolve({ id: 901, task_id: 'restart-retry' }); });
+    };
+    const firstService = createProductionService(db, {}, log, { media: { createImage } });
+    const secondService = createProductionService(db, {}, log, { media: { createImage } });
+    const firstPromise = firstService.advance(run.id, { lease_owner: 'restart-runner-a' });
+    await new Promise((resolve) => setImmediate(resolve));
+    const competing = await secondService.advance(run.id, { lease_owner: 'restart-runner-b' });
+    assert.equal(competing.state, 'waiting_task');
+    assert.equal(competing.reason, 'busy');
+    releaseCreate();
+    const recovered = await firstPromise;
+    assert.equal(recovered.state, 'waiting_task');
+    assert.equal(createCalls, 1);
+    const generated = repo.listActions(db, run.id, { page_size: 100 }).items
+      .filter((item) => item.kind === 'image_generate');
+    assert.equal(generated.length, 1);
+    assert.equal(generated[0].status, 'waiting');
+    assert.match(generated[0].request.prompt, /四格不是同一地点/);
+    assert.match(generated[0].request.prompt, /同一空间拓扑/);
   });
 
   it('keeps storyboard and shot-video reviews serial even when review concurrency is higher', async () => {
@@ -834,6 +1115,8 @@ describe('production executor text stages', () => {
         endpoint_types: ['openai-video'],
         groups: ['特价视频分组(即梦)'],
         prices: [{ group: '特价视频分组(即梦)', billing_unit: 'per_second', effective_price: index ? 0.5148 : 0.4656 }],
+        capabilities: { ...healthyShortCapability, quality_tier: index ? 'balanced' : 'fast' },
+        credential_verified: true, availability_scope: 'credential', scope_verified: true,
       })),
     };
     const service = createProductionService(db, {}, log, {
@@ -1172,6 +1455,8 @@ describe('production executor text stages', () => {
         endpoint_types: ['openai-video'],
         groups: ['特价视频分组(即梦)'],
         prices: [{ group: '特价视频分组(即梦)', billing_unit: 'per_second', effective_price: index ? 0.5148 : 0.4656 }],
+        capabilities: { ...healthyShortCapability, quality_tier: index ? 'balanced' : 'fast' },
+        credential_verified: true, availability_scope: 'credential', scope_verified: true,
       })),
     };
     const service = createProductionService(db, {}, log, {
@@ -1960,8 +2245,8 @@ describe('production executor text stages', () => {
     assert.ok(skipped.every((item) => {
       const payload = JSON.parse(item.payload_json);
       return payload.planned_duration === 2
-        && payload.duration === 5
-        && payload.duration_adjusted === true;
+        && payload.duration === 2
+        && payload.duration_adjusted === false;
     }));
     assert.equal(
       repo.listActions(db, run.id, { page_size: 200 }).items.filter((item) => item.kind === 'client_capture').length,

@@ -33,6 +33,8 @@ function submissionStatusForRow(row) {
 
 function sanitizeSubmissionReceipt(input = {}, status) {
   const receipt = input && typeof input === 'object' ? input : {};
+  const recovery = receipt.smart_route_recovery && typeof receipt.smart_route_recovery === 'object'
+    ? receipt.smart_route_recovery : null;
   return {
     version: 1,
     status,
@@ -47,6 +49,18 @@ function sanitizeSubmissionReceipt(input = {}, status) {
     reference_summary: receipt.reference_summary && typeof receipt.reference_summary === 'object'
       ? receipt.reference_summary
       : null,
+    smart_route_recovery: recovery ? {
+      version: 1,
+      attempted: recovery.attempted === true,
+      from_model: recovery.from_model ? String(recovery.from_model).slice(0, 240) : null,
+      to_model: recovery.to_model ? String(recovery.to_model).slice(0, 240) : null,
+      trigger: recovery.trigger ? String(recovery.trigger).slice(0, 160) : null,
+      first_error_code: recovery.first_error_code ? String(recovery.first_error_code).slice(0, 120) : null,
+      first_http_status: Number.isFinite(Number(recovery.first_http_status)) ? Number(recovery.first_http_status) : null,
+      second_status: recovery.second_status ? String(recovery.second_status).slice(0, 40) : null,
+      second_http_status: Number.isFinite(Number(recovery.second_http_status)) ? Number(recovery.second_http_status) : null,
+      observed_at: recovery.observed_at || new Date().toISOString(),
+    } : null,
     observed_at: receipt.observed_at || new Date().toISOString(),
   };
 }
@@ -211,6 +225,7 @@ const taskService = require('./taskService');
 const storageLayout = require('./storageLayout');
 const costLedger = require('./productionCostLedger');
 const { archiveDetachedVideoGeneration } = require('./productionDetachedMedia');
+const smartRouteRecovery = require('./yinziSmartRouteRecovery');
 const {
   getFfmpegPath,
   getFfprobePath,
@@ -448,7 +463,130 @@ function settleAcceptedVideoCost(db, videoGenId, log) {
 function resolvePersistedVideoConfig(db, row) {
   const config = videoClient.getDefaultVideoConfig(db, row.model, row.video_config_id);
   if (row.video_config_id != null && Number(config?.id) !== Number(row.video_config_id)) return null;
-  return config;
+  const snapshot = parseObject(row.provider_config_snapshot_json);
+  return videoClient.applyProviderConfigSnapshot(config, snapshot);
+}
+
+/**
+ * A smart Yinzi route may be rejected before task creation when the selected
+ * public route has no eligible upstream channel. That one deterministic case
+ * can use a verified alternate from the frozen Key-scoped catalog. Every
+ * other failure remains terminal/ambiguous and is never re-submitted.
+ */
+async function callVideoApiWithSmartRecovery(db, log, row, config, requestOptions) {
+  const initialSnapshot = requestOptions.provider_config_snapshot
+    || parseObject(row.provider_config_snapshot_json);
+  const initialModel = String(
+    requestOptions.model || initialSnapshot?.model || config?.default_model || ''
+  ).trim();
+  const firstResult = await videoClient.callVideoApi(db, log, {
+    ...requestOptions,
+    provider_config_snapshot: initialSnapshot,
+  });
+  if (!smartRouteRecovery.isDeterministicNoEligibleAutomaticRoute(firstResult)
+    || !smartRouteRecovery.isAutomaticRouteRequest(config, row, initialSnapshot)) {
+    return {
+      result: firstResult,
+      model: initialModel,
+      snapshot: initialSnapshot,
+      recovery: null,
+    };
+  }
+
+  const candidate = smartRouteRecovery.selectVerifiedFallbackModel({
+    config,
+    row,
+    snapshot: initialSnapshot,
+    duration: requestOptions.duration,
+    currentModel: initialModel,
+  });
+  if (!candidate) {
+    log.warn('Smart Yinzi route rejected without a verified compatible alternate', {
+      videoGenId: row.id,
+      model: initialModel,
+    });
+    return {
+      result: firstResult,
+      model: initialModel,
+      snapshot: initialSnapshot,
+      recovery: { version: 1, attempted: false, reason: 'no_verified_compatible_alternate' },
+    };
+  }
+
+  const nextSnapshot = videoClient.buildProviderConfigSnapshot(config, candidate.model, {
+    automatic_route: true,
+    smart_routing: true,
+    requested_model_explicit: false,
+    smart_route_recovery_attempted: true,
+    smart_routing_candidate: candidate.smart_routing_candidate === true,
+    capability_model: candidate.model,
+    ...(Object.prototype.hasOwnProperty.call(candidate, 'capabilities')
+      ? { capability_snapshot: candidate.capabilities }
+      : {}),
+    capability_source: candidate.capability_source || 'model_catalog_snapshot',
+    contract_status: candidate.contract_status || (candidate.capabilities ? 'known' : 'missing'),
+    catalog_verified: candidate.catalog_verified === true,
+    provider_protocol_snapshot: candidate.provider_protocol_snapshot || candidate,
+  });
+  if (initialSnapshot?.model_catalog_snapshot && !nextSnapshot.model_catalog_snapshot) {
+    nextSnapshot.model_catalog_snapshot = initialSnapshot.model_catalog_snapshot;
+  }
+  nextSnapshot.smart_route_recovery_attempted = true;
+  nextSnapshot.smart_route_recovery_from = initialModel || null;
+
+  // Freeze the alternate on the generation row before the second request so
+  // a restart cannot fall back to the rejected model or create a third try.
+  const now = new Date().toISOString();
+  try {
+    db.prepare(
+      `UPDATE video_generations SET model = ?, provider_protocol = ?,
+       provider_config_snapshot_json = ?, updated_at = ? WHERE id = ?`
+    ).run(
+      candidate.model,
+      videoClient.resolveVideoProtocol(config, candidate.model),
+      JSON.stringify(nextSnapshot),
+      now,
+      Number(row.id)
+    );
+  } catch (error) {
+    log.warn('Could not persist smart route alternate snapshot before retry', {
+      videoGenId: row.id,
+      error: error.message,
+    });
+  }
+  row.model = candidate.model;
+  row.provider_protocol = videoClient.resolveVideoProtocol(config, candidate.model);
+  row.provider_config_snapshot_json = JSON.stringify(nextSnapshot);
+  Object.assign(config, videoClient.applyProviderConfigSnapshot(config, nextSnapshot));
+
+  log.warn('Recovering deterministic Yinzi smart-route rejection once', {
+    videoGenId: row.id,
+    fromModel: initialModel || null,
+    toModel: candidate.model,
+  });
+  const secondResult = await videoClient.callVideoApi(db, log, {
+    ...requestOptions,
+    model: candidate.model,
+    provider_config_snapshot: nextSnapshot,
+  });
+  const recovery = smartRouteRecovery.recoverySummary(
+    firstResult,
+    initialModel,
+    candidate.model,
+    secondResult
+  );
+  return {
+    result: {
+      ...secondResult,
+      smart_route_recovery: recovery,
+      submission_receipt: secondResult.submission_receipt
+        ? { ...secondResult.submission_receipt, smart_route_recovery: recovery }
+        : secondResult.submission_receipt,
+    },
+    model: candidate.model,
+    snapshot: nextSnapshot,
+    recovery,
+  };
 }
 
 function providerReceiptJson(receipt) {
@@ -1098,7 +1236,7 @@ async function processVideoGeneration(db, log, videoGenId) {
         },
       });
     }
-    const result = await videoClient.callVideoApi(db, log, {
+    const videoRequestOptions = {
       prompt: row.prompt,
       model: row.model,
       duration: effectiveDuration,
@@ -1121,13 +1259,28 @@ async function processVideoGeneration(db, log, videoGenId) {
       storage_local_path: storageLocalPath,
       video_gen_id: videoGenId,
       video_config_id: row.video_config_id,
+      provider_config_snapshot: parseObject(row.provider_config_snapshot_json),
       on_submission_state: (submission) => persistVideoSubmissionState(
         db,
         videoGenId,
         submission.status,
         { http_status: submission.http_status, receipt: submission.receipt }
       ),
-    });
+    };
+    const recoveredCall = await callVideoApiWithSmartRecovery(
+      db,
+      log,
+      row,
+      config,
+      videoRequestOptions
+    );
+    const result = recoveredCall.result;
+    if (recoveredCall.model && recoveredCall.model !== videoRequestOptions.model) {
+      row.model = recoveredCall.model;
+      row.provider_protocol = videoClient.resolveVideoProtocol(config, recoveredCall.model);
+      row.provider_config_snapshot_json = recoveredCall.snapshot
+        ? JSON.stringify(recoveredCall.snapshot) : row.provider_config_snapshot_json;
+    }
     if (result.submission_status) {
       persistVideoSubmissionState(db, videoGenId, result.submission_status, {
         http_status: result.submission_http_status,
@@ -1252,4 +1405,5 @@ module.exports = {
   _validateDownloadedVideoFile: validateDownloadedVideoFile,
   _persistVideoSubmissionState: persistVideoSubmissionState,
   _submissionStatusForRow: submissionStatusForRow,
+  _callVideoApiWithSmartRecovery: callVideoApiWithSmartRecovery,
 };

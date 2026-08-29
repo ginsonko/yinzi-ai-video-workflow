@@ -2,6 +2,8 @@ export const PRODUCTION_NOTIFICATION_STORAGE_KEY = 'yinzi:production-notificatio
 
 export const DEFAULT_PRODUCTION_NOTIFICATION_PREFERENCES = Object.freeze({
   review_concurrency: 3,
+  max_consecutive_review_rejections: 5,
+  max_consecutive_recovery_failures: 5,
   notifications_enabled: true,
   notification_sound_enabled: true,
   moderation_fallback_enabled: false,
@@ -13,10 +15,18 @@ const MAX_SEEN_KEYS = 200
 export function normalizeProductionNotificationPreferences(input = {}) {
   const source = input && typeof input === 'object' && !Array.isArray(input) ? input : {}
   const concurrency = Number(source.review_concurrency)
+  const reviewLimit = Number(source.max_consecutive_review_rejections)
+  const recoveryLimit = Number(source.max_consecutive_recovery_failures)
   return {
     review_concurrency: Number.isFinite(concurrency)
       ? Math.min(8, Math.max(1, Math.floor(concurrency)))
       : DEFAULT_PRODUCTION_NOTIFICATION_PREFERENCES.review_concurrency,
+    max_consecutive_review_rejections: Number.isFinite(reviewLimit)
+      ? Math.min(20, Math.max(1, Math.floor(reviewLimit)))
+      : DEFAULT_PRODUCTION_NOTIFICATION_PREFERENCES.max_consecutive_review_rejections,
+    max_consecutive_recovery_failures: Number.isFinite(recoveryLimit)
+      ? Math.min(20, Math.max(1, Math.floor(recoveryLimit)))
+      : DEFAULT_PRODUCTION_NOTIFICATION_PREFERENCES.max_consecutive_recovery_failures,
     notifications_enabled: source.notifications_enabled !== false,
     notification_sound_enabled: source.notification_sound_enabled !== false,
     moderation_fallback_enabled: source.moderation_fallback_enabled === true,

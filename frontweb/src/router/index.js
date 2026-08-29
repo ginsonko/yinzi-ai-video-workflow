@@ -80,6 +80,18 @@ const router = createRouter({
       name: 'help-center',
       component: () => import('@/views/HelpCenter.vue'),
       meta: { title: '使用指南' }
+    },
+    {
+      path: '/asset-import',
+      name: 'asset-import',
+      component: () => import('@/views/AssetImport.vue'),
+      meta: { title: '智能资产导入' }
+    },
+    {
+      path: '/series-groups',
+      name: 'series-groups',
+      component: () => import('@/views/SeriesGroups.vue'),
+      meta: { title: '剧集组与续集' }
     }
   ]
 })

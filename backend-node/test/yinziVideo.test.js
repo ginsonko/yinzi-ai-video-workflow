@@ -15,6 +15,9 @@ const {
   extractYinziVideoUrl,
   buildYinziPollUrl,
   buildYinziContentUrl,
+  buildProviderConfigSnapshot,
+  applyProviderConfigSnapshot,
+  resolveYinziCapabilityContext,
   callYinziVideoApi,
   callVideoApi,
   pollVideoTask,
@@ -65,6 +68,20 @@ describe('YinziAPI video request mapping', () => {
     assert.equal(body.duration, 5);
   });
 
+  it('uses the fixed thirty-second execution unit for Seedance 2.5 direct submissions', () => {
+    const body = buildYinziVideoRequest({
+      model: 'seedance-2.5-720p', prompt: 'safe short beat', duration: 4, references: [],
+    });
+    assert.equal(body.seconds, 30);
+    assert.equal(body.duration, 30);
+    assert.equal(buildYinziVideoRequest({
+      model: 'seedance-2.5-720p', prompt: 'safe short beat', duration: 0, references: [],
+    }).seconds, 30);
+    assert.equal(buildYinziVideoRequest({
+      model: 'seedance-2.5-720p', prompt: 'safe short beat', duration: 16, references: [],
+    }).seconds, 30);
+  });
+
   it('maps classic first and last frames without mixing generic references', () => {
     const refs = buildYinziReferences(
       { first_frame_url: 'first', last_frame_url: 'last' },
@@ -112,9 +129,222 @@ describe('YinziAPI video request mapping', () => {
     assert.match(typed.references[0].data_url, /^\(base64, \d+ chars\)$/);
     assert.equal(typed.references[0].file_id, '(site file reference)');
   });
+
+  it('preserves explicit first and last frame roles when the model capability is unknown', () => {
+    const refs = buildYinziReferences(
+      {
+        model: 'future-video-model',
+        first_frame_url: 'first',
+        last_frame_url: 'last',
+        reference_urls: ['storyboard'],
+      },
+      {
+        first: 'https://cdn/first.png',
+        last: 'https://cdn/last.png',
+        images: ['https://cdn/storyboard.png'],
+      },
+      null
+    );
+    assert.deepEqual(refs.map((item) => item.role), ['first_frame', 'reference', 'last_frame']);
+  });
 });
 
 describe('YinziAPI asynchronous lifecycle', () => {
+  it('freezes model-specific create, query, and content paths into one task protocol snapshot', () => {
+    const config = {
+      id: 17,
+      provider: 'yinzi',
+      api_protocol: 'yinzi',
+      base_url: 'https://api.yinziapi.top/v1',
+      endpoint: '/videos',
+      query_endpoint: '/videos/{taskId}',
+      settings: JSON.stringify({
+        model_catalog_snapshot: {
+          models: [{
+            model: 'new-task-video',
+            provider_contract: 'newapi-video-generations-v1',
+            provider_create_path: '/video/generations',
+            provider_query_path: '/video/generations/{taskId}',
+            provider_content_path: '/video/generations/{taskId}/content',
+          }],
+        },
+      }),
+    };
+    const snapshot = buildProviderConfigSnapshot(config, 'new-task-video');
+    assert.equal(snapshot.provider_contract, 'newapi-video-generations-v1');
+    assert.equal(snapshot.endpoint, '/video/generations');
+    assert.equal(snapshot.query_endpoint, '/video/generations/{taskId}');
+    assert.equal(snapshot.content_endpoint, '/video/generations/{taskId}/content');
+    assert.equal(snapshot.protocol_source, 'model_catalog_snapshot');
+
+    const frozen = applyProviderConfigSnapshot({ ...config, endpoint: '/changed-after-submit' }, snapshot);
+    assert.equal(buildYinziPollUrl(frozen, 'task 123'), 'https://api.yinziapi.top/v1/video/generations/task%20123');
+    assert.equal(buildYinziContentUrl(frozen, 'task 123'), 'https://api.yinziapi.top/v1/video/generations/task%20123/content');
+  });
+
+  it('freezes a dynamic capability contract and does not replace an explicit unknown contract with the builtin table', () => {
+    const dynamicCapability = {
+      duration_mode: 'range', duration_min: 6, duration_max: 12,
+      max_images: 30, max_videos: 2, max_audios: 1, max_total_references: 33,
+      roles: { image: ['reference', 'first_frame'], video: ['reference'], audio: ['reference'] },
+    };
+    const config = {
+      id: 19,
+      provider: 'yinzi',
+      api_protocol: 'yinzi',
+      base_url: 'https://api.yinziapi.top/v1',
+      settings: JSON.stringify({
+        model_catalog_snapshot: {
+          models: [{
+            model: 'mg-seedance2.0 -480p mini',
+            capabilities: dynamicCapability,
+            capability_source: 'key_scoped_contract',
+            contract_status: 'active',
+            catalog_verified: true,
+          }],
+        },
+      }),
+    };
+    const snapshot = buildProviderConfigSnapshot(config, 'mg-seedance2.0 -480p mini');
+    assert.deepEqual(snapshot.capability_snapshot, dynamicCapability);
+    assert.equal(snapshot.capability_source, 'key_scoped_contract');
+    assert.equal(snapshot.catalog_verified, true);
+
+    const explicitUnknown = resolveYinziCapabilityContext(config, 'mg-seedance2.0 -480p mini', {
+      capability_model: 'mg-seedance2.0 -480p mini',
+      capability_snapshot: null,
+      capability_source: 'key_scoped_contract',
+      contract_status: 'missing',
+      catalog_verified: true,
+    });
+    assert.equal(explicitUnknown.capability, null);
+    assert.equal(explicitUnknown.contract_status, 'missing');
+
+    const wrongModel = resolveYinziCapabilityContext({}, 'another-video-model', snapshot);
+    assert.equal(wrongModel.capability, null);
+    assert.equal(wrongModel.resolution_source, 'unknown');
+  });
+
+  it('uses a catalog snapshot exposed at the normalized config top level', () => {
+    const capability = {
+      duration_mode: 'range', duration_min: 5, duration_max: 15,
+      max_images: 30, max_videos: 0, max_audios: 10,
+      roles: { image: ['reference'], video: [], audio: ['reference'] },
+    };
+    const config = {
+      id: 20,
+      provider: 'yinzi',
+      api_protocol: 'yinzi',
+      base_url: 'https://api.yinziapi.top/v1',
+      settings: JSON.stringify({ routing_mode: 'smart' }),
+      model_catalog_snapshot: {
+        models: [{
+          model: 'seedance-2.5-720p',
+          capabilities: capability,
+          capability_source: 'key_scoped_contract',
+          contract_status: 'active',
+          catalog_verified: true,
+        }],
+      },
+    };
+    const snapshot = buildProviderConfigSnapshot(config, 'seedance-2.5-720p');
+    assert.deepEqual(snapshot.capability_snapshot, capability);
+    assert.deepEqual(snapshot.model_catalog_snapshot, config.model_catalog_snapshot);
+    assert.equal(snapshot.capability_source, 'key_scoped_contract');
+    assert.equal(snapshot.catalog_verified, true);
+  });
+
+  it('uses the frozen dynamic capability for duration, role mapping, limits, and receipt truth', async () => {
+    const db = new Database(':memory:');
+    const originalLog = console.log;
+    const originalWarn = console.warn;
+    console.log = () => {};
+    console.warn = () => {};
+    try { runMigrationsAndEnsure(db); } finally { console.log = originalLog; console.warn = originalWarn; }
+    const config = aiConfigService.createConfig(db, log, {
+      service_type: 'video', provider: 'yinzi', api_protocol: 'yinzi', name: 'dynamic capability task',
+      base_url: 'https://api.yinziapi.top/v1', api_key: 'test-key', model: ['mg-seedance2.0 -480p mini'],
+      default_model: 'mg-seedance2.0 -480p mini', endpoint: '/videos', query_endpoint: '/videos/{taskId}',
+      is_default: true,
+    });
+    const dynamicCapability = {
+      duration_mode: 'range', duration_min: 6, duration_max: 12,
+      max_images: 30, max_videos: 0, max_audios: 0, max_total_references: 30,
+      roles: { image: ['reference', 'first_frame'], video: [], audio: [] },
+    };
+    const frozen = buildProviderConfigSnapshot(config, 'mg-seedance2.0 -480p mini', {
+      capability_model: 'mg-seedance2.0 -480p mini',
+      capability_snapshot: dynamicCapability,
+      capability_source: 'key_scoped_contract',
+      contract_status: 'active',
+      catalog_verified: true,
+    });
+    const originalFetch = global.fetch;
+    let submittedBody;
+    global.fetch = async (_url, init) => {
+      submittedBody = JSON.parse(init.body);
+      return new Response(JSON.stringify({ id: 'dynamic-capability-task', status: 'queued' }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      });
+    };
+    try {
+      const result = await callVideoApi(db, log, {
+        video_config_id: config.id,
+        provider_config_snapshot: frozen,
+        model: 'mg-seedance2.0 -480p mini', prompt: 'dynamic capability request', duration: 5,
+        contract_validation_mode: 'advisory',
+        first_frame_url: 'https://media.test/first.png',
+        reference_urls: Array.from({ length: 5 }, (_, index) => `https://media.test/ref-${index}.png`),
+      });
+      assert.equal(result.task_id, 'dynamic-capability-task');
+      assert.equal(submittedBody.duration, 6);
+      assert.equal(submittedBody.references.length, 6);
+      assert.equal(submittedBody.references[0].role, 'first_frame');
+      assert.equal(result.contract_validation.catalog_verified, true);
+      assert.equal(result.contract_validation.capability_source, 'key_scoped_contract');
+      assert.equal(result.contract_validation.contract_status, 'active');
+      assert.equal(result.contract_validation.warnings.includes('reference_count_over_contract'), false);
+      assert.equal(result.contract_validation.warnings.includes('first_frame_role_unsupported'), false);
+    } finally {
+      global.fetch = originalFetch;
+      db.close();
+    }
+  });
+
+  it('submits unknown-model first and last frame roles without a local contract gate', async () => {
+    const originalFetch = global.fetch;
+    let submittedBody;
+    global.fetch = async (_url, init) => {
+      submittedBody = JSON.parse(init.body);
+      return new Response(JSON.stringify({ id: 'unknown-contract-task', status: 'queued' }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      });
+    };
+    try {
+      const result = await callYinziVideoApi(null, {
+        base_url: 'https://api.yinziapi.top/v1', api_key: 'not-a-real-key', endpoint: '/videos',
+      }, log, {
+        model: 'future-video-model', prompt: 'provider decides the contract', duration: 3,
+        first_frame_url: 'https://media.test/first.png',
+        last_frame_url: 'https://media.test/last.png',
+        reference_urls: ['https://media.test/storyboard.png'],
+        capability_context: {
+          model: 'future-video-model', capability: null,
+          capability_source: 'unknown', contract_status: 'missing', catalog_verified: false,
+        },
+      });
+      assert.equal(result.task_id, 'unknown-contract-task');
+      assert.deepEqual(submittedBody.references.map((item) => item.role), [
+        'first_frame', 'reference', 'last_frame',
+      ]);
+      assert.ok(result.contract_validation.warnings.includes('unknown_contract'));
+      assert.equal(result.contract_validation.warnings.includes('first_frame_role_unsupported'), false);
+      assert.equal(result.contract_validation.warnings.includes('last_frame_role_unsupported'), false);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
   it('classifies the provider asset prompt receipt without trusting a UI label', () => {
     const prompt = '固定角色；固定场景；完整动作时间线；固定道具';
     const verified = normalizeYinziAssetPromptReceipt({
@@ -241,6 +471,32 @@ describe('YinziAPI asynchronous lifecycle', () => {
     }
   });
 
+  it('classifies the deterministic smart-router no-channel 503 as rejected', async () => {
+    const originalFetch = global.fetch;
+    const states = [];
+    global.fetch = async () => new Response(JSON.stringify({
+      code: 'get_channel_failed',
+      message: 'smartrouter: no eligible automatic route',
+      data: null,
+    }), { status: 503, headers: { 'Content-Type': 'application/json' } });
+    try {
+      const result = await callYinziVideoApi(null, {
+        base_url: 'https://api.yinziapi.top/v1', api_key: 'not-a-real-key', endpoint: '/videos',
+      }, log, {
+        model: 'seedance-2.5-720p', prompt: 'safe test', duration: 5,
+        aspect_ratio: '16:9', video_gen_id: 25,
+        on_submission_state: (state) => states.push(state),
+      });
+      assert.equal(result.submission_status, 'rejected');
+      assert.equal(result.submission_http_status, 503);
+      assert.equal(result.ambiguous_submission, false);
+      assert.equal(result.submission_receipt.error_code, 'get_channel_failed');
+      assert.deepEqual(states.map((state) => state.status), ['ambiguous', 'rejected']);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
   it('rejects a fake strict first frame mixed with generic AIZZZ references before upload or POST', async () => {
     const originalFetch = global.fetch;
     let calls = 0;
@@ -322,6 +578,54 @@ describe('YinziAPI asynchronous lifecycle', () => {
       assert.equal(submittedBody.references.length, 11);
     } finally {
       global.fetch = originalFetch;
+    }
+  });
+
+  it('forwards advisory mode and a routing protocol snapshot through the common dispatcher', async () => {
+    const db = new Database(':memory:');
+    const originalLog = console.log;
+    const originalWarn = console.warn;
+    console.log = () => {};
+    console.warn = () => {};
+    try { runMigrationsAndEnsure(db); } finally { console.log = originalLog; console.warn = originalWarn; }
+    const config = aiConfigService.createConfig(db, log, {
+      service_type: 'video', provider: 'yinzi', api_protocol: 'yinzi', name: 'smart route snapshot',
+      base_url: 'https://api.yinziapi.top/v1', api_key: 'test-key', model: ['mg-seedance2.0 -480p mini'],
+      default_model: 'mg-seedance2.0 -480p mini', endpoint: '/videos', query_endpoint: '/videos/{taskId}',
+      is_default: true,
+    });
+    const originalFetch = global.fetch;
+    let submittedUrl = '';
+    const states = [];
+    global.fetch = async (url) => {
+      submittedUrl = String(url);
+      return new Response(JSON.stringify({ id: 'smart-protocol-task', status: 'queued' }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      });
+    };
+    try {
+      const result = await callVideoApi(db, log, {
+        video_config_id: config.id,
+        model: 'mg-seedance2.0 -480p mini', prompt: 'safe abstract light movement', duration: 5,
+        contract_validation_mode: 'advisory',
+        reference_urls: Array.from({ length: 5 }, (_, i) => `https://media.test/image-${i}.png`),
+        routing_receipt: { provider_protocol_snapshot: {
+          contract: 'newapi-video-generations-v1',
+          create_path: '/video/generations',
+          query_path: '/video/generations/{taskId}',
+          content_path: '/video/generations/{taskId}/content',
+          source: 'test-contract',
+        } },
+        on_submission_state: (state) => states.push(state.status),
+      });
+      assert.equal(submittedUrl, 'https://api.yinziapi.top/v1/video/generations');
+      assert.equal(result.task_id, 'smart-protocol-task');
+      assert.equal(result.contract_validation.mode, 'advisory');
+      assert.ok(result.contract_validation.warnings.includes('reference_count_over_contract'));
+      assert.deepEqual(states, ['ambiguous', 'accepted']);
+    } finally {
+      global.fetch = originalFetch;
+      db.close();
     }
   });
 

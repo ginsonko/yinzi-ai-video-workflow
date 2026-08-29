@@ -23,7 +23,8 @@
         </nav>
         <div class="toc-support">
           <span>服务与模型</span>
-          <a href="https://www.yinziapi.top" target="_blank" rel="noopener noreferrer">www.yinziapi.top<el-icon><TopRight /></el-icon></a>
+          <a v-if="distributionProfile.smart_routing_entry" href="https://www.yinziapi.top" target="_blank" rel="noopener noreferrer">www.yinziapi.top<el-icon><TopRight /></el-icon></a>
+          <span v-else>通用 NewAPI / sub2 与老李兼容站点</span>
         </div>
       </aside>
 
@@ -72,12 +73,18 @@
             </article>
           </div>
           <div class="configuration-steps">
-            <h3>使用银子 API 一键配置</h3>
-            <ol>
+            <h3>{{ distributionProfile.smart_routing_entry ? '使用银子 API 一键配置' : '通用版：分别配置文本、图片、视频服务' }}</h3>
+            <ol v-if="distributionProfile.smart_routing_entry">
               <li>在 <a href="https://www.yinziapi.top" target="_blank" rel="noopener noreferrer">www.yinziapi.top</a> 创建对应分组的 Key。文本、生图、视频可以使用不同 Key。</li>
               <li>首页点击“缺 N 项配置”或“一键配置银子API”，填写 Base URL：<code>https://api.yinziapi.top/v1</code>。</li>
               <li>分别填写文本 Key、生图 Key和视频 Key，再选择对应模型。资源图与分镜图会共用生图 Key，但保存为两个独立默认服务。</li>
               <li>保存后返回首页确认显示 4/4。只有需要排查 Key 或网络时，才在配置页主动点击“测试”。</li>
+            </ol>
+            <ol v-else>
+              <li>文本服务单独填写一个兼容 OpenAI Chat Completions 的 Base URL 和 Key；老李站点没有文本模型。</li>
+              <li>图片服务填写老李站点的 Base URL 和图片 Key；该 Key 同时用于资源图与分镜图。</li>
+              <li>视频服务填写老李站点的 Base URL 和视频 Key；3.5 固定 30 秒，3.0 支持 5 / 10 / 15 秒。</li>
+              <li>保存后返回首页确认四项配置已就绪；每项 URL 和 Key 都独立保存，互不串用。</li>
             </ol>
             <div class="field-guide"><div><strong>Base URL</strong><span>接口根地址，通常以 <code>/v1</code> 结尾。</span></div><div><strong>API Key</strong><span>仅保存在本地后端；前端只会收到“是否已填写”。</span></div><div><strong>模型</strong><span>可配置多个候选，但必须有一个默认模型。</span></div><div><strong>默认 / 启用</strong><span>每个服务类型需要一条同时启用且设为默认的配置。</span></div></div>
           </div>
@@ -129,7 +136,7 @@
         <section id="about" class="help-section about-section">
           <p class="section-label">08 · 关于</p>
           <h2>银子AI视频工作流</h2>
-          <dl><div><dt>作者</dt><dd>银子</dd></div><div><dt>GitHub</dt><dd><a href="https://github.com/ginsonko" target="_blank" rel="noopener noreferrer">ginsonko<el-icon><TopRight /></el-icon></a></dd></div><div><dt>联系 QQ</dt><dd>474764004</dd></div><div><dt>API 中转站</dt><dd><a href="https://www.yinziapi.top" target="_blank" rel="noopener noreferrer">www.yinziapi.top<el-icon><TopRight /></el-icon></a></dd></div></dl>
+          <dl><div><dt>作者</dt><dd>银子</dd></div><div><dt>GitHub</dt><dd><a href="https://github.com/ginsonko" target="_blank" rel="noopener noreferrer">ginsonko<el-icon><TopRight /></el-icon></a></dd></div><div><dt>联系 QQ</dt><dd>474764004</dd></div><div v-if="distributionProfile.smart_routing_entry"><dt>API 中转站</dt><dd><a href="https://www.yinziapi.top" target="_blank" rel="noopener noreferrer">www.yinziapi.top<el-icon><TopRight /></el-icon></a></dd></div></dl>
           <p>本项目基于开源项目持续开发。原始许可证、提交历史与上游作者信息保留在仓库中；此处展示的是当前产品品牌和维护联系信息。</p>
         </section>
       </main>
@@ -138,11 +145,13 @@
 </template>
 
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ArrowLeft, Camera, CircleCheckFilled, Link, PictureFilled, Search, TopRight, User, VideoPlay } from '@element-plus/icons-vue'
+import { aiAPI } from '@/api/ai'
 
 const router = useRouter()
+const distributionProfile = ref({ id: 'universal', smart_routing_entry: false })
 const helpSearch = ref('')
 const topics = [
   { id: 'overview', title: '工作流原理', keywords: '故事 剧本 审批 版本 顺序生成' },
@@ -190,8 +199,12 @@ function jumpTo(id) {
 }
 
 function goConfigure() {
-  router.push({ path: '/', query: { config: 'yinzi' } })
+  router.push({ path: '/', query: { config: distributionProfile.value.smart_routing_entry ? 'yinzi' : 'laoli' } })
 }
+
+onMounted(async () => {
+  try { distributionProfile.value = await aiAPI.getDistributionProfile() } catch (_) { /* universal-safe fallback */ }
+})
 </script>
 
 <style scoped>

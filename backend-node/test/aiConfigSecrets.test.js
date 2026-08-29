@@ -4,6 +4,7 @@ const Database = require('better-sqlite3');
 const aiConfigService = require('../src/services/aiConfigService');
 const videoClient = require('../src/services/videoClient');
 const createAiConfigRoutes = require('../src/routes/aiConfig');
+const { runMigrationsAndEnsure } = require('../src/db/migrate');
 
 function createDb() {
   const db = new Database(':memory:');
@@ -29,6 +30,16 @@ function createDb() {
       deleted_at TEXT
     );
   `);
+  return db;
+}
+
+function createMigratedDb() {
+  const db = new Database(':memory:');
+  const originalLog = console.log;
+  const originalWarn = console.warn;
+  console.log = () => {};
+  console.warn = () => {};
+  try { runMigrationsAndEnsure(db); } finally { console.log = originalLog; console.warn = originalWarn; }
   return db;
 }
 
@@ -331,5 +342,34 @@ describe('AI config secret boundaries', () => {
     routes.modelCapabilities({ params: { id: String(created.id) } }, listResponse);
     assert.equal(JSON.stringify(listResponse.body).includes('route-secret'), false);
     assert.equal(listResponse.body.data.models[0].override.duration_min, 5);
+  });
+
+  it('creates the image.yinzi three-key profile through the public setup route without leaking credentials', async () => {
+    const db = createMigratedDb();
+    const routes = createAiConfigRoutes(db, log, {});
+    const res = captureResponse();
+    await routes.setupImageYinzi({ body: {
+      base_url: 'https://image.yinziapi.top',
+      text_api_key: 'text-secret-value',
+      image_api_key: 'image-secret-value',
+      video_api_key: 'video-secret-value',
+    } }, res);
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.success, true);
+    assert.equal(res.body.data.routing_mode, 'group');
+    assert.equal(res.body.data.smart_routing, false);
+    assert.equal(res.body.data.configured.length, 4);
+    assert.equal(JSON.stringify(res.body).includes('secret-value'), false);
+    const rows = db.prepare('SELECT service_type, provider, api_protocol, base_url, api_key, default_model, settings FROM ai_service_configs ORDER BY service_type').all();
+    assert.equal(rows.length, 4);
+    assert.deepEqual(rows.map((row) => row.service_type), ['image', 'storyboard_image', 'text', 'video']);
+    assert.equal(rows.find((row) => row.service_type === 'text').api_key, 'text-secret-value');
+    assert.equal(rows.find((row) => row.service_type === 'image').api_key, 'image-secret-value');
+    assert.equal(rows.find((row) => row.service_type === 'video').api_key, 'video-secret-value');
+    assert.equal(rows.find((row) => row.service_type === 'video').base_url, 'https://image.yinziapi.top/v1');
+    assert.equal(rows.find((row) => row.service_type === 'video').default_model, 'Seedance 2.5-720');
+    const videoSettings = JSON.parse(rows.find((row) => row.service_type === 'video').settings);
+    assert.equal(videoSettings.smart_routing_enabled, false);
+    assert.deepEqual(videoSettings.model_capabilities['Seedance 2.5-720'].allowed_durations, [30]);
   });
 });

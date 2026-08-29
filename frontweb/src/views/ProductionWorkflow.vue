@@ -16,6 +16,12 @@
           </span>
           <el-button :icon="Clock" circle title="任务历史" @click="historyVisible = true" />
           <el-button :icon="Setting" title="模型、Key 与制作设置" @click="openSettings">模型与 Key</el-button>
+          <el-button
+            v-if="!['paused', 'completed', 'cancelled'].includes(activeRun.status)"
+            :icon="Close"
+            title="停止当前页面等待；后台任务继续"
+            @click="detachView"
+          >停止查看</el-button>
           <el-button v-if="activeRun.status === 'paused'" :icon="VideoPlay" title="继续制作" @click="resumeRun">继续</el-button>
           <el-button v-else-if="!['completed', 'cancelled'].includes(activeRun.status)" :icon="VideoPause" title="暂停制作" @click="pauseRun">暂停</el-button>
         </template>
@@ -139,6 +145,21 @@
             </el-radio-group>
             <p v-if="newRun.directorMode === 'off'">不生成导演台 JSON、不录制本地预演、不向视频模型携带导演台参考视频，最终导出也不包含导演台文件。</p>
             <p v-else>只有确实需要连续动作控制的长镜头才进入导演台；每个分镜仍可单独选择跳过。</p>
+          </div>
+          <div class="option-block series-context-choice">
+            <label>续集资源复用（可选）</label>
+            <div class="series-context-row">
+              <el-select v-model="newRun.seriesGroupId" clearable filterable placeholder="不加入剧集组" @change="loadSeriesAssets">
+                <el-option v-for="group in seriesGroups" :key="group.id" :label="group.name" :value="group.id" />
+              </el-select>
+              <el-button v-if="newRun.seriesGroupId" :loading="seriesAssetsLoading" @click="loadSeriesAssets">查看可复用资产</el-button>
+              <el-button link @click="router.push('/series-groups')">管理剧集组</el-button>
+            </div>
+            <p v-if="newRun.seriesGroupId">已选择的剧集组资产会作为一致性上下文传给文本模型；未明确复用的候选只会给出建议，不会静默覆盖。</p>
+            <p v-else>不需要续集时保持空白；已有项目不会被改动。</p>
+            <div v-if="newRun.seriesGroupId && seriesAssets.length" class="series-assets-picker">
+              <el-checkbox v-for="asset in seriesAssets" :key="asset.id" v-model="asset.selected">{{ asset.title }} · {{ asset.asset_type }} · v{{ asset.current_version || '—' }}</el-checkbox>
+            </div>
           </div>
           <div class="routing-promise">
             <el-icon><MagicStick /></el-icon>
@@ -345,6 +366,19 @@
           :configured-model="currentRoute.model"
           :bundle-model="currentRoute.receipt_model || currentRouteSource.route?.model || ''"
         />
+        <el-alert
+          v-if="activeProviderAction && ['reserved', 'submitted', 'waiting'].includes(activeProviderAction.status)"
+          class="provider-cancel-strip"
+          type="info"
+          :closable="false"
+          show-icon
+        >
+          <template #title>云端任务正在处理</template>
+          <template #default>
+            <span>可以停止本页等待，不影响后台生成；如需请求供应商取消，请展开操作。</span>
+            <el-button link type="primary" :loading="actionCancelling" @click="cancelCurrentAction">停止当前请求</el-button>
+          </template>
+        </el-alert>
 
         <div class="substage-row" aria-label="当前阶段明细">
           <button
@@ -844,7 +878,7 @@
                 :label="`${config.name || config.provider || '图片配置'} · ${config.default_model || config.model?.[0] || '未选择模型'}${config.is_default ? '（默认）' : ''}`"
                 :value="config.id"
               />
-              <el-option label="＋ 新建一套 Yinzi 图片配置" :value="`new:${kind.serviceType}`" />
+              <el-option label="＋ 新建一套图片配置" :value="`new:${kind.serviceType}`" />
             </el-select>
             <div class="image-config-grid">
               <div>
@@ -897,7 +931,7 @@
           </div>
 
           <div class="video-provider-receipt">
-            <span><small>提供方</small><strong>YinziAPI</strong></span>
+            <span><small>提供方</small><strong>{{ activeVideoProviderLabel }}</strong></span>
             <span><small>当前视频配置</small><strong>{{ activeVideoConfig?.name || '未找到启用的视频配置' }}</strong></span>
             <span><small>当前有效镜头模型</small><strong>{{ projectVideoModelLabel }}</strong></span>
             <el-button :icon="Refresh" :loading="videoCatalogLoading" @click="refreshSelectedVideoCatalog">刷新模型目录</el-button>
@@ -981,7 +1015,7 @@
           </div>
 
           <div class="settings-grid">
-            <div><label>每镜自动尝试上限</label><el-input-number v-model="settingsDraft.max_video_attempts_per_shot" :min="1" :max="6" /></div>
+            <div><label>每镜自动尝试上限</label><el-input-number v-model="settingsDraft.max_video_attempts_per_shot" :min="1" :max="20" /></div>
             <div><label>全片视频任务上限</label><el-input-number v-model="settingsDraft.max_video_attempts" :min="1" :max="120" /></div>
           </div>
           <el-alert type="info" :closable="false" show-icon title="目录和能力提示只用于自动建议与费用预估；手动选中的任意模型都会按原名提交。上游若拒绝，会保留原始原因和参考包，供你调整后重试。高价破甲模型仍需单独确认价格。" />
@@ -990,6 +1024,10 @@
           <div><label>目标镜头</label><el-input-number v-model="settingsDraft.target_shots" :min="1" :max="12" /></div>
           <div><label>总秒数上限</label><el-input-number v-model="settingsDraft.max_video_seconds" :min="5" :max="180" :step="1" /></div>
           <div><label>资产并发生图（1–8）</label><el-input-number v-model="settingsDraft.image_concurrency" :min="1" :max="8" /></div>
+          <div><label>文字连续返工上限</label><el-input-number v-model="settingsDraft.max_text_revisions" :min="1" :max="20" /></div>
+          <div><label>资源图连续返工上限</label><el-input-number v-model="settingsDraft.max_image_revisions" :min="1" :max="20" /></div>
+          <div><label>导演方案/预演返工上限</label><el-input-number v-model="settingsDraft.max_director_revisions" :min="1" :max="20" /></div>
+          <div><label>自动故障恢复上限</label><el-input-number v-model="settingsDraft.max_auto_recoveries" :min="1" :max="20" /></div>
           <div class="run-budget-setting">
             <label>本任务金额上限（USD）</label>
             <el-input-number v-model="settingsDraft.max_cost_usd" :min="0" :max="1000000" :precision="6" :step="0.1" controls-position="right" placeholder="不限额" />
@@ -1152,6 +1190,7 @@ import { dramaAPI } from '@/api/drama'
 import { aiAPI } from '@/api/ai'
 import { productionAPI } from '@/api/production'
 import { advancedSettingsAPI } from '@/api/advancedSettings'
+import { seriesGroupsAPI } from '@/api/seriesGroups'
 import FieldAssist from '@/components/production/FieldAssist.vue'
 import DirectorCapture from '@/components/production/DirectorCapture.vue'
 import ShotContinuityPanel from '@/components/production/ShotContinuityPanel.vue'
@@ -1217,6 +1256,7 @@ import {
   productionNotificationEvent,
   rememberProductionNotification,
 } from '@/utils/productionNotifications'
+import { productionIdleBackoffDelay, productionSemanticProgressSignature } from '@/utils/productionProgress'
 
 const route = useRoute()
 const router = useRouter()
@@ -1225,6 +1265,7 @@ const dramaId = Number(route.params.id)
 const loading = ref(true)
 const starting = ref(false)
 const driving = ref(false)
+const semanticIdleCount = ref(0)
 const savingId = ref(null)
 const suggestingId = ref(null)
 const shotOperationBusy = ref(false)
@@ -1244,6 +1285,9 @@ const novelChapters = ref([])
 const selectedChapterIndexes = ref([])
 const preflightResult = ref(null)
 const videoCatalog = ref([])
+const seriesGroups = ref([])
+const seriesAssetsLoading = ref(false)
+const seriesAssets = ref([])
 const videoConfigs = ref([])
 const videoCatalogLoading = ref(false)
 const videoConfigsLoading = ref(false)
@@ -1288,6 +1332,7 @@ const videoRoutingError = ref('')
 const videoRoutingLoading = ref(false)
 const videoRoutingSaving = ref(false)
 const resolvingIntervention = ref(false)
+const actionCancelling = ref(false)
 const notificationPreferences = reactive(normalizeProductionNotificationPreferences())
 const costsVisible = ref(false)
 const costsLoading = ref(false)
@@ -1315,7 +1360,14 @@ const newRun = reactive({
   videoModel: '',
   videoQuality: 'balanced',
   directorMode: 'auto',
+  seriesGroupId: null,
 })
+// The series page passes only the group identity. The user still chooses
+// explicit asset versions in this wizard, so navigation never implies reuse.
+const requestedSeriesGroupId = Number(route.query.series_group_id)
+if (Number.isSafeInteger(requestedSeriesGroupId) && requestedSeriesGroupId > 0) {
+  newRun.seriesGroupId = requestedSeriesGroupId
+}
 const creationAspectOptions = PRODUCTION_ASPECT_RATIOS.filter((item) => ['16:9', '9:16', '1:1'].includes(item.value))
 
 const activeRun = computed(() => runSummary.value?.run || null)
@@ -1474,6 +1526,15 @@ const activeVideoConfig = computed(() => {
   || videoConfigs.value.find((item) => item.is_active !== false)
   || videoConfigs.value[0]
   || null
+})
+const activeVideoProviderLabel = computed(() => {
+  const config = activeVideoConfig.value
+  if (!config) return '未配置'
+  const name = String(config.name || '')
+  if (/老李/.test(name)) return '老李站点'
+  if (/银子媒体/.test(name)) return '银子媒体站'
+  if (/YinziAPI|银子 API/i.test(name)) return 'YinziAPI'
+  return String(config.provider || '当前配置')
 })
 const projectVideoModelLabel = computed(() => projectVideoModelDisplay({
   settingsVisible: settingsVisible.value,
@@ -2048,7 +2109,7 @@ function imageConfigDraft(serviceType, config = null, fallbackModel = '') {
     name: config?.name || '',
     provider: config?.provider || '',
     api_protocol: config?.api_protocol || '',
-    base_url: config?.base_url || 'https://api.yinziapi.top/v1',
+    base_url: config?.base_url || '',
     api_key: '',
     has_api_key: Boolean(config?.has_api_key),
     model: config?.default_model || models[0] || fallbackModel || 'gpt-image-2',
@@ -2063,8 +2124,8 @@ function selectImageConfig(serviceType) {
   if (String(draft.id || '').startsWith('new:')) {
     Object.assign(draft, imageConfigDraft(serviceType, null, draft.model), {
       id: `new:${serviceType}`,
-      name: serviceType === 'storyboard_image' ? 'YinziAPI 分镜图配置' : 'YinziAPI 资源图配置',
-      provider: 'yinzi',
+      name: serviceType === 'storyboard_image' ? '分镜图配置' : '资源图配置',
+      provider: 'openai',
       api_protocol: 'openai',
       api_key: '',
       has_api_key: false,
@@ -2103,8 +2164,8 @@ async function saveImageConfig(serviceType) {
       ? await aiAPI.create({
         ...body,
         service_type: serviceType,
-        name: String(draft.name || '').trim() || (serviceType === 'storyboard_image' ? 'YinziAPI 分镜图配置' : 'YinziAPI 资源图配置'),
-        provider: draft.provider || 'yinzi',
+        name: String(draft.name || '').trim() || (serviceType === 'storyboard_image' ? '分镜图配置' : '资源图配置'),
+        provider: draft.provider || 'openai',
         api_protocol: draft.api_protocol || 'openai',
         endpoint: '/images/generations',
       })
@@ -2147,7 +2208,7 @@ async function testImageConfig(serviceType) {
         ...(String(draft.api_key || '').trim() ? { api_key: draft.api_key.trim() } : {}),
         model: [draft.model],
         default_model: draft.model,
-        provider: draft.provider || 'yinzi',
+         provider: draft.provider || 'openai',
         api_protocol: draft.api_protocol || 'openai',
         service_type: serviceType,
         endpoint: '/images/generations',
@@ -2172,7 +2233,8 @@ async function initialize() {
     newRun.aspectRatio = normalizeProductionAspectRatio(dramaResult?.metadata?.aspect_ratio)
     const automationResult = await advancedSettingsAPI.getAutomationPreferences().catch(() => null)
     Object.assign(notificationPreferences, normalizeProductionNotificationPreferences(automationResult || {}))
-    await Promise.all([loadRuns(), loadCatalogs()])
+    await Promise.all([loadRuns(), loadCatalogs(), loadSeriesGroups()])
+    if (newRun.seriesGroupId) await loadSeriesAssets()
     const requestedRun = route.query.run
     if (requestedRun && runs.value.some((item) => item.id === requestedRun)) {
       await loadRun(requestedRun)
@@ -2183,6 +2245,28 @@ async function initialize() {
     loading.value = false
   }
   if (resumeActiveRun) await driveRun()
+}
+
+async function loadSeriesGroups() {
+  try {
+    const result = await seriesGroupsAPI.list({ page_size: 100 })
+    seriesGroups.value = result?.items || []
+  } catch (_) {
+    seriesGroups.value = []
+  }
+}
+
+async function loadSeriesAssets() {
+  if (!newRun.seriesGroupId) { seriesAssets.value = []; return }
+  seriesAssetsLoading.value = true
+  try {
+    const result = await seriesGroupsAPI.assets(newRun.seriesGroupId)
+    seriesAssets.value = result?.items || []
+  } catch (_) {
+    seriesAssets.value = []
+  } finally {
+    seriesAssetsLoading.value = false
+  }
 }
 
 function browserCapabilities() {
@@ -2199,6 +2283,11 @@ async function createAndStartRun() {
   starting.value = true
   try {
     const episodeId = Number(route.query.episode) || drama.value?.episodes?.[0]?.id || null
+    const selectedSeriesGroup = seriesGroups.value.find((group) => Number(group.id) === Number(newRun.seriesGroupId))
+    const seriesAssetRefs = (seriesAssets.value || []).filter((item) => item.selected).map((item) => ({
+      series_asset_id: item.id,
+      series_asset_version_id: item.current_version_id,
+    }))
     const created = await productionAPI.createRun({
       drama_id: dramaId,
       episode_id: episodeId,
@@ -2234,6 +2323,9 @@ async function createAndStartRun() {
         video_quality: newRun.videoQuality,
         keep_provider_audio: true,
         subtitles: false,
+        series_group_id: selectedSeriesGroup?.id || null,
+        series_group_name: selectedSeriesGroup?.name || null,
+        series_asset_refs: seriesAssetRefs,
       },
       budget: {
         max_video_attempts: newRun.maxAttempts,
@@ -2273,12 +2365,21 @@ async function driveRun() {
   let loopExhausted = true
   try {
     for (let index = 0; index < 60; index += 1) {
+      const beforeSignature = productionSemanticProgressSignature(runSummary.value || { run: activeRun.value })
       const outcome = await productionAPI.advance(activeRun.value.id, { lease_owner: `browser-${activeRun.value.id}` })
       lastOutcome.value = outcome
       const autonomyOutcome = String(outcome.reason || '').startsWith('automatic')
       await loadRun(activeRun.value.id, {
         loadEvidence: autonomyOutcome || outcome.state === 'waiting_review' || outcome.state === 'completed',
       })
+      const semanticChanged = beforeSignature !== productionSemanticProgressSignature(runSummary.value || { run: activeRun.value })
+      if (semanticChanged) semanticIdleCount.value = 0
+      else if (['progressed', 'approved'].includes(outcome.state)) {
+        semanticIdleCount.value += 1
+        loopExhausted = false
+        schedulePoll(productionIdleBackoffDelay(semanticIdleCount.value))
+        break
+      }
       if (outcome.state === 'client_action') { loopExhausted = false; break }
       if (['waiting_task', 'waiting_provider'].includes(outcome.state)) {
         loopExhausted = false
@@ -2304,9 +2405,9 @@ async function driveRun() {
   }
 }
 
-function schedulePoll() {
+function schedulePoll(delayMs = 3500) {
   clearPoll()
-  pollTimer = window.setTimeout(() => driveRun(), 3500)
+  pollTimer = window.setTimeout(() => driveRun(), Math.max(250, Number(delayMs) || 3500))
 }
 
 function clearPoll() {
@@ -2317,6 +2418,41 @@ function clearPoll() {
 async function refreshAndAdvance() {
   await loadRun(activeRun.value.id)
   await driveRun()
+}
+
+async function detachView() {
+  clearPoll()
+  if (!activeRun.value) return
+  try {
+    const result = await productionAPI.detach(activeRun.value.id, { reason: '用户停止当前页面查看' })
+    ElMessage.success(result?.background_continues === false
+      ? '已停止查看'
+      : '已停止当前页面等待，任务会在后台继续')
+    // Do not navigate or reload the run here: the user can inspect history or
+    // another page without changing the active production state.
+  } catch (error) {
+    ElMessage.error(error.message || '停止当前页面等待失败')
+  }
+}
+
+async function cancelCurrentAction() {
+  if (!activeRun.value || !activeProviderAction.value || actionCancelling.value) return
+  actionCancelling.value = true
+  try {
+    const result = await productionAPI.cancelProvider(activeRun.value.id, {
+      action_id: activeProviderAction.value.id,
+      reason: '用户请求停止当前供应商任务',
+    })
+    if (result?.status === 'cancelled_local') ElMessage.success(result.message || '已在本地取消')
+    else if (result?.status === 'cancel_requested_provider_unknown') ElMessage.warning(result.message || '已停止本地等待，供应商任务可能继续')
+    else ElMessage.info(result?.message || '取消请求已处理')
+    await loadRun(activeRun.value.id, { loadEvidence: false })
+    clearPoll()
+  } catch (error) {
+    ElMessage.error(error.message || '停止当前请求失败')
+  } finally {
+    actionCancelling.value = false
+  }
 }
 
 async function rebuildFinalEdit() {
@@ -3143,6 +3279,10 @@ async function openSettings() {
     max_video_seconds: activeRun.value.budget?.max_video_seconds || 60,
     max_video_attempts: activeRun.value.budget?.max_video_attempts || 10,
     max_video_attempts_per_shot: activeRun.value.budget?.max_video_attempts_per_shot || 2,
+    max_text_revisions: activeRun.value.budget?.max_text_revisions || 5,
+    max_image_revisions: activeRun.value.budget?.max_image_revisions || 5,
+    max_director_revisions: activeRun.value.budget?.max_director_revisions || 5,
+    max_auto_recoveries: activeRun.value.budget?.max_auto_recoveries || 5,
     max_cost_usd: activeRun.value.budget?.max_cost_usd ?? null,
     allow_unknown_price: activeRun.value.budget?.allow_unknown_price === true,
     manual_next_default: !!activeRun.value.manual_next_default,
@@ -3218,6 +3358,10 @@ async function saveSettings() {
         max_video_seconds: value.max_video_seconds,
         max_video_attempts: value.max_video_attempts,
         max_video_attempts_per_shot: value.max_video_attempts_per_shot,
+        max_text_revisions: value.max_text_revisions,
+        max_image_revisions: value.max_image_revisions,
+        max_director_revisions: value.max_director_revisions,
+        max_auto_recoveries: value.max_auto_recoveries,
         max_cost_usd: value.max_cost_usd == null || value.max_cost_usd === '' ? null : Number(value.max_cost_usd),
         allow_unknown_price: value.allow_unknown_price === true,
       },
@@ -3485,6 +3629,9 @@ onBeforeUnmount(clearPoll)
 
 <style scoped>
 .workflow-page { min-height: 100vh; overflow-x: clip; background: #f3f5f6; color: #1e2930; --accent: #16766b; --accent-soft: #e9f4f1; --line: #dbe2e5; --muted: #6f7d85; --el-color-primary: #16766b; --el-color-primary-light-3: #5b9f97; --el-color-primary-light-5: #86bab3; --el-color-primary-light-7: #b8d8d4; --el-color-primary-light-8: #d5e8e5; --el-color-primary-light-9: #ecf5f3; --el-color-primary-dark-2: #125f56; }
+.provider-cancel-strip { margin: 0 0 18px; }
+.provider-cancel-strip :deep(.el-alert__content) { width: 100%; }
+.provider-cancel-strip :deep(.el-alert__description) { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .workflow-page :deep(.el-button--primary:not(.is-link):not(.is-plain):not(.is-disabled)) { background: var(--accent) !important; border-color: var(--accent) !important; box-shadow: 0 2px 7px rgba(22, 118, 107, .2) !important; }
 .workflow-page :deep(.el-button--primary:not(.is-link):not(.is-plain):not(.is-disabled):hover) { background: #125f56 !important; border-color: #125f56 !important; box-shadow: 0 3px 9px rgba(22, 118, 107, .26) !important; }
 .autonomy-strip { min-height: 84px; margin: 0 0 20px; padding: 14px 0; display: grid; grid-template-columns: 28px minmax(220px, 1fr) minmax(420px, 1.4fr); align-items: center; gap: 14px; border-top: 1px solid #bdd8d2; border-bottom: 1px solid #bdd8d2; color: #28564f; background: #eef7f5; }.autonomy-strip > .el-icon { font-size: 20px; }.autonomy-strip.needs-attention { border-color: #dfbaa9; color: #914b3d; background: #fff5f1; }.autonomy-copy { min-width: 0; display: grid; gap: 4px; }.autonomy-copy strong { font-size: 14px; }.autonomy-copy span { color: #607b76; font-size: 11px; line-height: 1.55; }.needs-attention .autonomy-copy span { color: #8a665c; }.autonomy-facts { margin: 0; display: grid; grid-template-columns: .9fr .65fr 1.45fr; gap: 12px; }.autonomy-facts div { min-width: 0; display: grid; gap: 3px; }.autonomy-facts dt { color: #79908b; font-size: 9px; }.autonomy-facts dd { margin: 0; overflow-wrap: anywhere; color: #365e58; font-size: 11px; font-weight: 650; }.needs-attention .autonomy-facts dd { color: #81584e; }

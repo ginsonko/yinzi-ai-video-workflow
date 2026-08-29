@@ -5,6 +5,7 @@ const {
   capabilitySupportsRoute,
   capabilityAcceptsDuration,
   capabilitySupportsRole,
+  providerDurationForCapability,
 } = require('./yinziVideoCapabilities');
 
 const ROUTE_PROFILES = Object.freeze({
@@ -15,7 +16,6 @@ const ROUTE_PROFILES = Object.freeze({
 function classifyShotRoute(shot, policy = {}) {
   const content = shot?.content || shot || {};
   const plannedDuration = Math.max(1, Math.round(Number(content.duration) || 5));
-  const duration = Math.max(5, plannedDuration);
   const requested = String(content.route_profile || '').trim();
   const profile = requested === ROUTE_PROFILES.SHORT || requested === ROUTE_PROFILES.LONG
     ? requested
@@ -38,9 +38,13 @@ function classifyShotRoute(shot, policy = {}) {
   return {
     profile,
     planned_duration: plannedDuration,
-    duration,
-    duration_adjusted: duration !== plannedDuration,
-    duration_adjustment_reason: duration !== plannedDuration ? 'jimeng_minimum_5_seconds' : null,
+    // `duration` is kept as the currently planned provider unit for backwards
+    // compatible receipts. It is materialized again after a concrete model is
+    // selected; no global five-second floor is applied here.
+    provider_duration: plannedDuration,
+    duration: plannedDuration,
+    duration_adjusted: false,
+    duration_adjustment_reason: null,
     // Reference support is a capability of the chosen model; using it is a
     // per-shot editorial decision. Explicit skip must win for every duration.
     uses_reference_video: isLongTake && previsMode !== 'skip',
@@ -49,6 +53,32 @@ function classifyShotRoute(shot, policy = {}) {
     director_mode: directorMode,
     transition_mode: transitionMode,
     requires_strict_first_frame: transitionMode === 'strict_continuation',
+  };
+}
+
+function materializeRouteDuration(route, capability) {
+  const planned = Math.max(1, Number(route?.planned_duration) || 1);
+  if (!capability) {
+    return {
+      ...route,
+      provider_duration: planned,
+      duration: planned,
+      duration_adjusted: false,
+      duration_adjustment_reason: null,
+    };
+  }
+  const providerDuration = providerDurationForCapability(capability, planned);
+  const adjusted = providerDuration !== planned;
+  const reason = !adjusted ? null
+    : capability.duration_mode === 'fixed' ? 'provider_fixed_duration'
+      : capability.duration_mode === 'enumerated' ? 'provider_enumerated_duration'
+        : 'provider_duration_boundary';
+  return {
+    ...route,
+    provider_duration: providerDuration,
+    duration: providerDuration,
+    duration_adjusted: adjusted,
+    duration_adjustment_reason: reason,
   };
 }
 
@@ -61,6 +91,12 @@ function normalizeCatalog(catalog) {
     groups: item?.groups || item?.enable_groups || [],
     prices: Array.isArray(item?.prices) ? item.prices : [],
   })).filter((item) => item.model);
+}
+
+function capabilityForCatalogItem(item) {
+  return Object.prototype.hasOwnProperty.call(item || {}, 'capabilities')
+    ? (item.capabilities || null)
+    : getYinziVideoCapability(item?.model);
 }
 
 function shotModelOverride(shot, policy = {}) {
@@ -112,6 +148,25 @@ function qualityPreferenceRank(capability, qualityPolicy) {
   return index === -1 ? order.length : index;
 }
 
+function yinziFamilyPreferenceRank(model) {
+  const value = String(model || '').trim().toLowerCase();
+  if (value.includes('seedance') && !value.includes('破甲')) return 0;
+  if (value.includes('seedance')) return 2;
+  return 10;
+}
+
+function modelProtocolSnapshot(item = {}, capability = null) {
+  const profile = capability || item.capabilities || null;
+  const value = (key) => String(item[key] || profile?.[key] || '').trim();
+  const snapshot = {
+    contract: value('provider_contract') || null,
+    create_path: value('provider_create_path') || null,
+    query_path: value('provider_query_path') || null,
+    content_path: value('provider_content_path') || null,
+  };
+  return Object.values(snapshot).some(Boolean) ? snapshot : null;
+}
+
 function materialRoutePayload(route) {
   return {
     profile: route.profile,
@@ -127,6 +182,11 @@ function materialRoutePayload(route) {
     requires_strict_first_frame: route.requires_strict_first_frame,
     group: route.group || null,
     group_available: route.group_available !== false,
+    video_config_id: route.video_config_id == null ? null : Number(route.video_config_id),
+    video_config_updated_at: route.video_config_updated_at || null,
+    video_config_fingerprint: route.video_config_fingerprint || null,
+    smart_routing_candidate: route.smart_routing_candidate === true,
+    provider_protocol_snapshot: route.provider_protocol_snapshot || null,
     contract_status: route.contract_status || (route.capability ? 'known' : 'missing'),
     contract_warnings: route.contract_warnings || [],
     limits: route.limits,
@@ -148,6 +208,7 @@ function fixedModelRoute(shot, model, policy = {}, capabilityInput = undefined, 
       ...classified,
       model: String(model || '').trim(),
       capability: null,
+      capability_source: 'unknown',
       catalog_verified: false,
       automatic: false,
       resolution: policy.video_resolution || null,
@@ -158,18 +219,21 @@ function fixedModelRoute(shot, model, policy = {}, capabilityInput = undefined, 
       contract_warnings: ['unknown_contract'],
       estimated_price: null,
       billing_unit: null,
+      provider_protocol_snapshot: modelProtocolSnapshot({}, capability),
     };
     route.material_signature = routingMaterialSignature(route);
     return route;
   }
+  const materialized = materializeRouteDuration(classified, capability);
   const contractWarnings = [];
-  if (!capabilityAcceptsDuration(capability, classified.duration)) contractWarnings.push('duration_mismatch');
-  if (classified.uses_reference_video && Number(capability.max_videos) < 1) contractWarnings.push('video_reference_unsupported');
-  if (classified.requires_strict_first_frame && !capabilitySupportsRole(capability, 'image', 'first_frame')) contractWarnings.push('strict_first_frame_unsupported');
+  if (!capabilityAcceptsDuration(capability, materialized.duration)) contractWarnings.push('duration_mismatch');
+  if (materialized.uses_reference_video && Number(capability.max_videos) < 1) contractWarnings.push('video_reference_unsupported');
+  if (materialized.requires_strict_first_frame && !capabilitySupportsRole(capability, 'image', 'first_frame')) contractWarnings.push('strict_first_frame_unsupported');
   const route = {
-    ...classified,
+    ...materialized,
     model: String(model || '').trim(),
     capability,
+    capability_source: 'builtin',
     catalog_verified: false,
     automatic: false,
     resolution: policy.video_resolution || capability.resolution,
@@ -184,6 +248,7 @@ function fixedModelRoute(shot, model, policy = {}, capabilityInput = undefined, 
     contract_warnings: contractWarnings,
     estimated_price: null,
     billing_unit: null,
+    provider_protocol_snapshot: modelProtocolSnapshot({}, capability),
   };
   route.material_signature = routingMaterialSignature(route);
   return route;
@@ -211,7 +276,10 @@ function selectShotVideoRoute(input) {
     const groupAvailable = !group || Boolean(catalogItem?.groups?.includes(group));
     const price = catalogItem ? priceForCatalogItem(catalogItem, group, fixed.duration) : null;
     fixed.reason_codes = manualModel ? ['shot_model_override'] : fixed.reason_codes;
-    fixed.catalog_verified = Boolean(catalogItem);
+    fixed.catalog_verified = Boolean(catalogItem) && catalogItem.catalog_verified !== false;
+    fixed.capability_source = catalogItem?.capability_source
+      || (fixed.capability ? 'builtin' : 'unknown');
+    fixed.contract_status = catalogItem?.contract_status || fixed.contract_status;
     fixed.catalog_version = String(catalog?.pricing_version || '');
     fixed.catalog_fetched_at = catalog?.fetched_at || null;
     fixed.group = group || price?.group || catalogItem?.groups?.[0] || null;
@@ -225,6 +293,7 @@ function selectShotVideoRoute(input) {
     fixed.unit_price = price?.effective_price ?? null;
     fixed.estimated_price = estimatePrice(price, fixed.duration);
     fixed.currency = price?.currency || null;
+    fixed.provider_protocol_snapshot = modelProtocolSnapshot(catalogItem || {}, fixed.capability);
     fixed.material_signature = routingMaterialSignature(fixed);
     return fixed;
   }
@@ -237,21 +306,38 @@ function selectShotVideoRoute(input) {
   const qualityPolicy = String(policy.video_quality || 'balanced');
   const group = String(policy.video_group || '').trim();
   const allowBypass = policy.allow_expensive_bypass === true;
+  const hasCredentialEvidence = catalogItems.some((item) => (
+    item.credential_verified !== undefined
+    || item.public_catalog !== undefined
+    || item.availability_scope === 'public'
+  ));
   const evaluated = [];
   for (const item of catalogItems) {
-    const capability = item.capabilities || getYinziVideoCapability(item.model);
+    const capability = capabilityForCatalogItem(item);
+    const candidateRoute = capability ? materializeRouteDuration(classified, capability) : classified;
     const reasons = [];
     if (!capability) reasons.push('unknown_contract');
-    if (capability && !capabilitySupportsRoute(capability, classified.profile)) reasons.push('profile_mismatch');
-    if (capability && !capabilityAcceptsDuration(capability, classified.duration, { automatic: true })) reasons.push('duration_mismatch');
-    if (capability && classified.uses_reference_video && capability.max_videos < 1) reasons.push('video_reference_required');
-    if (capability && classified.requires_strict_first_frame
+    if (capability && !capabilitySupportsRoute(capability, candidateRoute.profile)) reasons.push('profile_mismatch');
+    if (capability && !capabilityAcceptsDuration(capability, candidateRoute.duration, { automatic: true })) reasons.push('duration_mismatch');
+    if (capability && candidateRoute.uses_reference_video && capability.max_videos < 1) reasons.push('video_reference_required');
+    if (capability && candidateRoute.requires_strict_first_frame
       && !capabilitySupportsRole(capability, 'image', 'first_frame')) reasons.push('strict_first_frame_required');
     if (capability && !capability.automatic_eligible) reasons.push(capability.exclusion_reason || 'not_automatic');
     if (capability?.expensive_bypass && !allowBypass) reasons.push('expensive_bypass_disabled');
+    const credentialVerified = item.credential_verified === true
+      || (item.scope_verified === true && item.availability_scope === 'credential');
+    // Old snapshots may have promoted a public price offer to a Smart Router
+    // candidate. Re-assert the evidence boundary at dispatch time so upgrading
+    // the app cannot auto-submit an unavailable model from a stale snapshot.
+    const smartRoutingCandidate = item.smart_routing_candidate === true
+      && item.public_catalog !== true
+      && item.manual_only !== true;
+    if (hasCredentialEvidence && !credentialVerified && !smartRoutingCandidate) reasons.push('credential_unverified');
     if (group && Array.isArray(item.groups) && !item.groups.includes(group)) reasons.push('group_unavailable');
-    const price = priceForCatalogItem(item, group, classified.duration);
-    const estimated = estimatePrice(price, classified.duration);
+    const price = priceForCatalogItem(item, group, candidateRoute.duration);
+    // Price against the concrete provider execution unit. For a fixed 30s
+    // product this must not use the shorter creative/planned duration.
+    const estimated = estimatePrice(price, candidateRoute.duration);
     if (estimated == null) reasons.push('price_unknown');
     const shortMultimodalPenalty = capability
       && !classified.uses_reference_video
@@ -260,19 +346,39 @@ function selectShotVideoRoute(input) {
     evaluated.push({
       item,
       capability,
+      route: candidateRoute,
       price,
       estimated,
       reasons: [...new Set(reasons)],
+      credential_verified: credentialVerified,
+      smart_routing_candidate: smartRoutingCandidate,
+      family_rank: yinziFamilyPreferenceRank(item.model),
       quality_rank: qualityPreferenceRank(capability, qualityPolicy),
       short_multimodal_penalty: shortMultimodalPenalty,
     });
   }
-  const eligible = evaluated.filter((candidate) => candidate.reasons.length === 0)
-    .sort((left, right) => Number(left.estimated) - Number(right.estimated)
+  let eligible = evaluated.filter((candidate) => candidate.reasons.length === 0)
+    .sort((left, right) => left.family_rank - right.family_rank
+      || Number(left.estimated) - Number(right.estimated)
       || left.quality_rank - right.quality_rank
       || left.short_multimodal_penalty - right.short_multimodal_penalty
       || Number(left.capability?.preference_rank || 1000) - Number(right.capability?.preference_rank || 1000)
       || left.item.model.localeCompare(right.item.model));
+  if (!eligible.length) {
+    // The key-scoped /models directory proves availability. Missing local
+    // contracts are advisory: prefer a priced unknown model, then the stable
+    // directory order, and let the upstream protocol return the real limits.
+    eligible = evaluated.filter((candidate) => !candidate.capability
+      && (candidate.credential_verified === true || candidate.smart_routing_candidate === true)
+      && !candidate.reasons.includes('group_unavailable'))
+      .sort((left, right) => {
+        const leftPrice = left.estimated == null ? Number.POSITIVE_INFINITY : Number(left.estimated);
+        const rightPrice = right.estimated == null ? Number.POSITIVE_INFINITY : Number(right.estimated);
+        return left.family_rank - right.family_rank
+          || leftPrice - rightPrice
+          || left.item.model.localeCompare(right.item.model);
+      });
+  }
   if (!eligible.length) {
     const error = new Error(`${classified.duration} 秒镜头没有满足媒体、时长和费用策略的视频模型`);
     error.code = 'VIDEO_ROUTE_NO_ELIGIBLE_MODEL';
@@ -281,15 +387,52 @@ function selectShotVideoRoute(input) {
   }
   const selected = eligible[0];
   const capability = selected.capability;
+  if (!capability) {
+    const route = fixedModelRoute(shot, selected.item.model, policy, null, selected.item.contract_status || 'missing');
+    route.automatic = true;
+    route.catalog_verified = selected.item.catalog_verified !== false;
+    route.capability_source = selected.item.capability_source || 'unknown';
+    route.availability_scope = selected.item.availability_scope;
+    route.scope_verified = selected.item.scope_verified === true;
+    route.smart_routing_candidate = selected.smart_routing_candidate === true;
+    route.catalog_version = String(catalog?.pricing_version || '');
+    route.catalog_fetched_at = catalog?.fetched_at || null;
+    route.group = group || selected.price?.group || selected.item.groups?.[0] || null;
+    route.group_available = true;
+    route.billing_unit = selected.price?.billing_unit || null;
+    route.unit_price = selected.price?.effective_price ?? null;
+    route.estimated_price = selected.estimated;
+    route.currency = selected.price?.currency || null;
+    route.reason_codes = ['automatic_discovered_model_fallback', 'unknown_contract_advisory',
+      ...(selected.smart_routing_candidate ? ['smart_routing_public_candidate'] : [])];
+    route.contract_warnings = [...new Set([...(route.contract_warnings || []), 'unknown_contract'])];
+    route.provider_protocol_snapshot = modelProtocolSnapshot(selected.item, null);
+    route.candidates = eligible.slice(0, 4).map((candidate) => ({
+      model: candidate.item.model,
+      estimated_price: candidate.estimated,
+      billing_unit: candidate.price?.billing_unit || null,
+      currency: candidate.price?.currency || null,
+      resolution: null,
+      quality_tier: null,
+      contract_status: candidate.item.contract_status || 'missing',
+      smart_routing_candidate: candidate.smart_routing_candidate,
+    }));
+    route.material_signature = routingMaterialSignature(route);
+    return route;
+  }
   const route = {
-    ...classified,
+    ...materializeRouteDuration(selected.route || classified, capability),
     model: selected.item.model,
     capability,
-    catalog_verified: true,
+    capability_source: selected.item.capability_source || 'builtin',
+    contract_status: selected.item.contract_status || 'known',
+    catalog_verified: selected.item.catalog_verified !== false,
     catalog_version: String(catalog?.pricing_version || ''),
     catalog_fetched_at: catalog?.fetched_at || null,
     group: group || selected.price?.group || selected.item.groups?.[0] || null,
     automatic: true,
+    smart_routing_candidate: selected.smart_routing_candidate === true,
+    provider_protocol_snapshot: modelProtocolSnapshot(selected.item, capability),
     resolution: policy.video_resolution || capability.resolution,
     limits: {
       images: capability.max_images,
@@ -305,7 +448,7 @@ function selectShotVideoRoute(input) {
     reason_codes: classified.profile === ROUTE_PROFILES.SHORT
       ? [
         'short_complete_visual_beat',
-        ...(classified.duration_adjusted ? ['provider_minimum_duration_5s'] : ['free_duration_exact_fit']),
+        ...(classified.duration_adjusted ? ['provider_duration_adjusted'] : ['free_duration_exact_fit']),
         'image_references_only',
         ...(classified.director_mode === 'off' ? ['director_disabled_for_run'] : []),
         ...(classified.previs_mode === 'force' ? ['director_preview_forced_locally'] : []),
@@ -315,7 +458,7 @@ function selectShotVideoRoute(input) {
           'long_continuous_take',
           classified.director_mode === 'off' ? 'director_disabled_for_run' : 'director_preview_skipped_by_user',
           'image_references_only',
-          ...(classified.duration_adjusted ? ['provider_minimum_duration_5s'] : []),
+          ...(classified.duration_adjusted ? ['provider_duration_adjusted'] : []),
         ]
         : ['long_continuous_take', 'reference_video_supported', 'director_preview_required'],
     candidates: eligible.slice(0, 4).map((candidate) => ({
@@ -325,6 +468,7 @@ function selectShotVideoRoute(input) {
       currency: candidate.price?.currency || null,
       resolution: candidate.capability.resolution,
       quality_tier: candidate.capability.quality_tier,
+      smart_routing_candidate: candidate.smart_routing_candidate,
     })),
   };
   route.material_signature = routingMaterialSignature(route);
@@ -341,7 +485,7 @@ function listShotVideoRouteOptions(input) {
   const currentModel = shotModelOverride(shot, policy)
     || (projectMode === 'fixed' ? String(policy.video_model || '').trim() : '');
   return items.map((item) => {
-    const capability = item.capabilities || getYinziVideoCapability(item.model);
+    const capability = capabilityForCatalogItem(item);
     const groupAvailable = !group || item.groups.includes(group);
     let route = null;
     let error = null;
@@ -354,6 +498,9 @@ function listShotVideoRouteOptions(input) {
     const warnings = [];
     if (capability?.expensive_bypass) warnings.push('expensive_bypass');
     if (capability?.duration_mode === 'fixed') warnings.push('fixed_duration_product');
+    if (capability?.automatic_availability === 'temporarily_unavailable') {
+      warnings.push(capability.exclusion_reason || 'channel_temporarily_unavailable');
+    }
     if (!capability) warnings.push('unknown_contract');
     if (!groupAvailable) warnings.push('group_unavailable');
     warnings.push(...(route?.contract_warnings || []));
@@ -387,6 +534,7 @@ function listShotVideoRouteOptions(input) {
           || (contractIssue ? `本地能力提示：${contractIssue}` : null),
       warnings: [...new Set(warnings)],
       requires_explicit_confirmation: capability?.expensive_bypass === true,
+      automatic_eligible: capability?.automatic_eligible === true,
       resolution: capability?.resolution || null,
       quality_tier: capability?.quality_tier || null,
       duration_mode: capability?.duration_mode || null,
