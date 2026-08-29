@@ -135,6 +135,20 @@ describe('release packaging contract', () => {
     assert.match(manifest.run, /native-mac-build-\$\{ARCH\}\.json/);
   });
 
+  it('normalizes cross-runner filenames before the draft release is uploaded', () => {
+    const workflowPath = path.join(repositoryDir, '.github', 'workflows', 'release.yml');
+    const workflow = yaml.load(fs.readFileSync(workflowPath, 'utf8'));
+    const publish = workflow.jobs['publish-draft'];
+    const normalize = publish.steps.find((step) => step.name === 'Normalize downloaded release asset names');
+    assert.ok(normalize);
+    assert.match(normalize.run, /GITHUB_REF_NAME#v/);
+    assert.match(normalize.run, /\*-Setup-\*\.exe/);
+    assert.match(normalize.run, /\*-Portable-\*\.exe/);
+    assert.match(normalize.run, /\*-mac-\$\{?ARCH\}?\.\$\{?EXT\}?/);
+    assert.match(normalize.run, /release-unexpected/);
+    assert.match(normalize.run, /builder-debug\.yml/);
+  });
+
   it('pins a supported Windows native toolchain and stops before tests when install fails', () => {
     const workflowPath = path.join(repositoryDir, '.github', 'workflows', 'release.yml');
     const workflow = yaml.load(fs.readFileSync(workflowPath, 'utf8'));

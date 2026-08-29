@@ -278,6 +278,49 @@ jobs:
           path: release-assets
           merge-multiple: true
 
+      - name: Normalize downloaded release asset names
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          RELEASE_DIR="$PWD/release-assets"
+          PRODUCT='银子AI视频工作流-通用版-老李兼容'
+          rename_one() {
+            local target="$1"
+            local pattern="$2"
+            local destination="$RELEASE_DIR/$target"
+            if [ -f "$destination" ]; then return 0; fi
+            local candidate
+            candidate=$(find "$RELEASE_DIR" -maxdepth 1 -type f -name "$pattern" -print -quit)
+            if [ -z "$candidate" ]; then
+              echo "Missing release asset for $target (pattern $pattern)" >&2
+              exit 1
+            fi
+            mv "$candidate" "$destination"
+          }
+          rename_one "${PRODUCT}-Setup-${VERSION}-x64.exe" '*-Setup-*.exe'
+          rename_one "${PRODUCT}-Portable-${VERSION}-x64.exe" '*-Portable-*.exe'
+          for ARCH in x64 arm64; do
+            for EXT in dmg zip; do
+              rename_one "${PRODUCT}-${VERSION}-mac-${ARCH}.${EXT}" "*-mac-${ARCH}.${EXT}"
+            done
+          done
+          mkdir -p "$RUNNER_TEMP/release-unexpected"
+          while IFS= read -r -d '' file; do
+            base=$(basename "$file")
+            case "$base" in
+              "${PRODUCT}-Setup-${VERSION}-x64.exe"|"${PRODUCT}-Portable-${VERSION}-x64.exe"|\
+              "${PRODUCT}-${VERSION}-mac-x64.dmg"|"${PRODUCT}-${VERSION}-mac-x64.zip"|\
+              "${PRODUCT}-${VERSION}-mac-arm64.dmg"|"${PRODUCT}-${VERSION}-mac-arm64.zip"|\
+              native-mac-build-x64.json|native-mac-build-arm64.json|\
+              SHA256SUMS-x64.txt|SHA256SUMS-arm64.txt)
+                ;;
+              *) mv "$file" "$RUNNER_TEMP/release-unexpected/$base" ;;
+            esac
+          done < <(find "$RELEASE_DIR" -maxdepth 1 -type f -print0)
+          find "$RELEASE_DIR" -maxdepth 1 -type f -name 'builder-debug.yml' -print -delete
+          printf '%s\n' "[release] normalized assets:"; find "$RELEASE_DIR" -maxdepth 1 -type f -printf '%f\n' | sort
+
       - name: Create combined SHA-256 manifest
         working-directory: release-assets
         run: find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
