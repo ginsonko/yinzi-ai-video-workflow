@@ -68,13 +68,35 @@ jobs:
         working-directory: desktop
         run: npm run dist:universal
 
+      - name: Normalize Windows artifact names
+        working-directory: desktop
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = (Get-Content -Raw package.json | ConvertFrom-Json).version
+          $release = Join-Path $PWD 'release-universal'
+          $targets = @{
+            'Portable' = "银子AI视频工作流-通用版-老李兼容-Portable-$version-x64.exe"
+            'Setup' = "银子AI视频工作流-通用版-老李兼容-Setup-$version-x64.exe"
+          }
+          foreach ($kind in $targets.Keys) {
+            $destination = Join-Path $release $targets[$kind]
+            if (Test-Path -LiteralPath $destination) { continue }
+            $candidate = Get-ChildItem -LiteralPath $release -Filter "*$kind-$version-x64.exe" -File |
+              Where-Object { $_.Name -ne $targets[$kind] } | Select-Object -First 1
+            if (-not $candidate) { throw "Windows $kind artifact not found in $release" }
+            Move-Item -LiteralPath $candidate.FullName -Destination $destination
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $release $targets['Portable']))) { throw 'Portable artifact rename failed' }
+          if (-not (Test-Path -LiteralPath (Join-Path $release $targets['Setup']))) { throw 'Setup artifact rename failed' }
+
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:
           name: windows-x64
           path: |
-            desktop/release-universal/*.exe
-            desktop/release-universal/*.yml
+            desktop/release-universal/*-Setup-*.exe
+            desktop/release-universal/*-Portable-*.exe
           if-no-files-found: error
           retention-days: 14
 
@@ -157,6 +179,24 @@ jobs:
       - name: Build native DMG and ZIP
         working-directory: desktop
         run: npm run dist:mac:${{ matrix.arch }}
+
+      - name: Normalize macOS artifact names
+        working-directory: desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          PRODUCT_NAME='银子AI视频工作流-通用版-老李兼容'
+          RELEASE_DIR='release-mac-universal'
+          for EXT in dmg zip; do
+            TARGET="${RELEASE_DIR}/${PRODUCT_NAME}-${VERSION}-mac-${{ matrix.arch }}.${EXT}"
+            if [ -f "$TARGET" ]; then continue; fi
+            CANDIDATE=$(find "$RELEASE_DIR" -maxdepth 1 -type f -name "*.${EXT}" -print -quit)
+            test -n "$CANDIDATE"
+            mv "$CANDIDATE" "$TARGET"
+          done
+          test -s "${RELEASE_DIR}/${PRODUCT_NAME}-${VERSION}-mac-${{ matrix.arch }}.dmg"
+          test -s "${RELEASE_DIR}/${PRODUCT_NAME}-${VERSION}-mac-${{ matrix.arch }}.zip"
 
       - name: Verify native macOS artifacts
         working-directory: desktop

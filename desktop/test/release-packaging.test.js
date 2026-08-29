@@ -114,6 +114,7 @@ describe('release packaging contract', () => {
     ]);
     assert.equal(macJob['runs-on'], '${{ matrix.runner }}');
     assert.equal(macJob.env?.AI_VIDEO_MAC_VARIANT, 'universal');
+    assert.ok(macJob.steps.some((step) => step.name === 'Normalize macOS artifact names'));
     assert.match(workflowText, /npm run dist:mac:\$\{\{ matrix\.arch \}\}/);
     assert.match(workflowText, /release-mac-universal/);
     assert.match(workflowText, /top\.yinziapi\.ai-video-workflow\.universal/);
@@ -143,8 +144,11 @@ describe('release packaging contract', () => {
     assert.equal(job['runs-on'], 'windows-2022');
     assert.equal(job.env?.npm_config_msvs_version, '2022');
     assert.equal(job.steps.find((step) => step.name === 'Build Windows installer and portable package')?.run, 'npm run dist:universal');
+    assert.ok(job.steps.some((step) => step.name === 'Normalize Windows artifact names'));
     const windowsUpload = job.steps.find((step) => step.name === 'Upload Windows artifacts');
-    assert.match(windowsUpload?.with?.path || '', /desktop\/release-universal\/\*\.exe/);
+    assert.match(windowsUpload?.with?.path || '', /desktop\/release-universal\/\*-Setup-\*\.exe/);
+    assert.match(windowsUpload?.with?.path || '', /desktop\/release-universal\/\*-Portable-\*\.exe/);
+    assert.doesNotMatch(windowsUpload?.with?.path || '', /builder-debug/);
     const setupPython = job.steps.find((step) => step.uses === 'actions/setup-python@v5');
     assert.equal(setupPython?.with?.['python-version'], '3.12');
 
