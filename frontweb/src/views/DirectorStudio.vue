@@ -82,7 +82,7 @@
         <div><strong>Blender 专业参考成果</strong><span v-if="blenderRendering">正在渲染当前场景，完成后会保留可编辑工程和参考视频</span><span v-else>{{ blenderRenderResult?.status === 'succeeded' ? '渲染完成，可继续修改场景或下载成果' : blenderRenderResult?.blocked_reason ? `暂时无法运行：${blenderRenderResult.blocked_reason}` : '渲染未完成，已保留可恢复的中间结果' }}</span></div>
         <el-tag v-if="blenderRenderResult" :type="blenderRenderResult.status === 'succeeded' ? 'success' : blenderRenderResult.status === 'blocked' ? 'warning' : 'danger'" effect="plain">{{ blenderRenderResult.status }}</el-tag>
       </div>
-      <el-progress v-if="blenderRendering" :percentage="60" :indeterminate="true" :show-text="false" />
+      <el-progress v-if="blenderRendering" :indeterminate="true" :show-text="false" />
       <div v-if="blenderRenderLinks.length" class="blender-render-links">
         <a v-for="item in blenderRenderLinks" :key="item.href" :href="item.href" target="_blank" rel="noreferrer">{{ item.label }}</a>
       </div>
