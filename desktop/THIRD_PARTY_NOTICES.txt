@@ -1,0 +1,38 @@
+银子AI视频工作流 - 第三方软件声明
+====================================
+
+本产品基于 LocalMiniDrama 开源项目继续开发。原项目及本项目代码按 MIT License
+提供，完整文本见 LICENSE.txt。
+
+FFmpeg / FFprobe
+----------------
+Windows x64 媒体工具来自 gyan.dev 的 FFmpeg GPL v3 static essentials build：
+https://www.gyan.dev/ffmpeg/builds/
+FFmpeg 项目：https://ffmpeg.org/
+对应源代码提交：https://github.com/FFmpeg/FFmpeg/commit/76f09ab647
+许可证：GNU General Public License version 3
+发布包内附 LICENSE-FFMPEG-GPLv3.txt 与 README-FFMPEG-BUILD.txt。
+
+macOS x64/arm64 FFmpeg 来自 ffmpeg-static-electron-v5 的对应平台包；实际
+二进制在发行前检查 Mach-O 架构、GPL 构建标记、libx264、AAC、MP3、字幕、
+文字和混音能力，并拒绝包含 nonfree 构建标记的候选。
+项目：https://gitee.com/anzhen9/ffmpeg-static-electron-v5
+
+macOS FFprobe 来自 @ffprobe-installer 的对应平台包。各架构的准确包版本、
+下载地址、许可证和 SHA-256 见应用 resources/ffmpeg/MEDIA-MANIFEST.json，
+完整许可证随二进制放在同一目录。
+
+node-edge-tts 1.2.10
+--------------------
+Copyright (c) SchneeHertz and contributors
+许可证：MIT
+项目：https://github.com/SchneeHertz/node-edge-tts
+该组件通过 Microsoft Edge 的在线语音服务合成音频，无需 Python，但需要联网。
+
+Kenney 3D assets
+----------------
+3D 导演台使用的 Kenney 素材随前端资源提供。具体许可文本见应用资源中的
+director-assets/kenney/LICENSE-KENNEY.txt。
+
+其他 JavaScript 依赖的名称、版本和许可证可在应用 resources/app.asar 内的
+package.json 与 node_modules 各包元数据中查阅。

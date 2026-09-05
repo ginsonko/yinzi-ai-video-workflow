@@ -1,0 +1,132 @@
+# 银子AI视频工作流
+
+面向短剧、漫剧和分镜视频生产的本地工作流。项目把故事/小说、剧本、角色/场景/道具资产、逐镜分镜、可选 3D 导演台、视频生成、旁白字幕和最终剪辑组织成可恢复、可审批、可全自动运行的一条生产链。
+
+- 当前 Windows 与 macOS 测试版：`0.1.3-beta.7`（macOS 由原生 x64/arm64 runner 构建）
+- 源码支持两个发行版：银子 API 专属版与不带银子智能路由入口、兼容老李站点三 Key 的 `通用版-老李兼容` 版；本次 `beta.7` Release 上传通用版，银子专属版的 `beta.4` Release 保留不覆盖。
+- 维护者：银子
+- GitHub：[`ginsonko`](https://github.com/ginsonko)
+- 联系 QQ：`474764004`
+- API：[`www.yinziapi.top`](https://www.yinziapi.top)
+- 许可证：MIT，详见 [LICENSE](LICENSE) 与 [第三方声明](desktop/THIRD_PARTY_NOTICES.txt)
+
+## 下载与启动
+
+从 Release 下载与设备架构匹配的版本：
+
+| 文件 | 平台与用途 |
+| --- | --- |
+| `银子AI视频工作流-通用版-老李兼容-Setup-0.1.3-beta.7-x64.exe` | 通用 NewAPI / sub2 与老李站点，三组文本/图片/视频 URL + Key |
+| `银子AI视频工作流-通用版-老李兼容-Portable-0.1.3-beta.7-x64.exe` | 通用版便携运行，不安装，直接双击运行 |
+| `银子AI视频工作流-通用版-老李兼容-0.1.3-beta.7-mac-arm64.dmg` | Apple Silicon Mac（M1/M2/M3/M4 及后续），推荐 |
+| `银子AI视频工作流-通用版-老李兼容-0.1.3-beta.7-mac-arm64.zip` | Apple Silicon Mac 备用包 |
+| `银子AI视频工作流-通用版-老李兼容-0.1.3-beta.7-mac-x64.dmg` | Intel Mac，推荐 |
+| `银子AI视频工作流-通用版-老李兼容-0.1.3-beta.7-mac-x64.zip` | Intel Mac 备用包 |
+
+安装包已经内置 Node.js 运行时、SQLite、FFmpeg/FFprobe 和图片处理模块，不要求用户安装 Node、npm、Python 或 FFmpeg。首次打开不会自动调用付费 API；没有 Key 也可以从首页进入零成本模拟体验。
+
+> 当前 Windows 与 macOS 安装包均未做商业代码签名。Windows 可能显示 SmartScreen 提示；Mac 从浏览器下载后可能显示“应用已损坏，无法打开”，这通常是未签名包的隔离标记。请只从项目 Release 下载、先对照 `SHA256SUMS.txt`，再按 [Mac 小白测试说明](desktop/release-docs/Mac小白测试说明.md) 的“已损坏”分支放行，不要关闭整个 Gatekeeper。
+
+## 标准工作流
+
+1. 输入故事梗概或导入小说，生成可阅读、可编辑、可打回的剧本。
+2. 审批剧本中的角色、场景和道具清单，并发生成资产图；每项均可新增、修改、删除、确认或重做。
+3. 按真实拍摄顺序逐镜生成分镜脚本、参考图和连续性约束，前一镜批准后再构建下一镜素材包。
+4. 根据镜头需要选择是否生成 3D 导演台预演；它不是强制门控，也可以完全关闭。
+5. 对需要无缝连续的镜头提取上一段尾帧作为下一段首帧；普通切镜不制造刻意遮挡转场。
+6. 自动路由合适的视频模型，也允许在任务中手动覆盖模型、时长、参考图、参考视频和首帧策略。
+7. 每段视频批准后生成旁白、字幕并保留原声，最终由内置 FFmpeg 完成节奏对齐、混音和成片合成。
+
+三种运行模式共享同一条工作流：
+
+- `人工审批`：逐阶段、逐对象确认或打回，适合精细控制。
+- `AI 审批`：AI 自动评估、把结构化打回理由用于下一次修改并复审；同一对象连续失败达到可配置上限才交给人。
+- `全自动`：从故事一路运行到成片，仅在预算、资源不足或连续异常时暂停。
+
+## 关键能力
+
+- 资产图可配置并发，分镜按依赖顺序逐镜推进。
+- 角色、场景、道具、分镜图、镜头视频和成片均可版本化审批与回退。
+- 已批准资产可以重新打回，也可以加入素材库供其它项目复用。
+- 3D 导演台支持本地 JSON 驱动、关键帧时间线、相机和对象动作；整段预演可选携带。
+- 自动按镜头长度、参考媒体能力和供应商状态路由视频模型，并保留人工覆盖入口。V0.1.3 会从当前 Key 只读发现模型目录；能力合同或公开价格暂时不可用不影响保存和手动选择。切换后参考包、派发请求和生成记录保持同一模型，不复用已失效的旧路由。
+- 旁白默认可使用 Xiaoyi Edge Neural 在线音色；无需 Python，但合成语音时需要联网。
+- 高级设置可编辑全部系统/审核提示词，导入导出提示词包，维护模型价格和项目预算。
+- 默认生产提示词覆盖剧本、资产、分镜、四视图、3D、视频和成片返工，均含目标、输出契约、正反例与自检；用户自定义覆盖不会被升级重置。
+- 用户配置支持快照、回滚、备份、导入与跨设备迁移。
+- 作品、素材、日志和配置存放在 `%APPDATA%\银子AI视频工作流`，升级和卸载默认不删除。
+
+## 小白入口
+
+打开应用后按首页顺序操作：
+
+1. 先点“模拟体验”，使用随包演示素材走一遍审批流程。
+2. 查看配置准备度，按提示分别配置文本、生图和视频服务。
+   已保存配置可直接点“测试”，无需再次粘贴 Key；编辑时也可用“测试当前填写”验证尚未保存的 URL、模型或临时 Key。
+3. 通过“开始制作”输入故事或导入小说。
+4. 在人工审批、AI 审批和全自动中选择需要的模式。
+5. 任务关闭或电脑重启后，从首页“最近项目”继续原进度。
+
+应用内“说明书”包含 API 配置、3D 导演台、首尾帧、模型路由、预算和故障恢复说明。Windows 发行包也携带 [小白使用说明](desktop/release-docs/小白使用说明.md)。
+
+## 源码开发
+
+要求：Windows/macOS/Linux，Node.js `>=22`。预编译发布包支持 Windows x64、macOS Intel x64 与 macOS Apple Silicon arm64。
+
+```powershell
+git clone https://github.com/ginsonko/yinzi-ai-video-workflow.git
+cd yinzi-ai-video-workflow
+git lfs install
+git lfs pull
+
+cd backend-node
+npm install
+npm start
+
+# 新终端
+cd frontweb
+npm install
+npm run dev
+```
+
+开发模式可直接运行仓库根目录的 `start-ai-video-demo.cmd`。默认前端会选择可用端口，后端仅监听本机回环地址。
+
+## Windows 打包
+
+```powershell
+cd desktop
+$env:ELECTRON_MIRROR='https://npmmirror.com/mirrors/electron/'
+npm install
+npm run dist
+```
+
+打包脚本会构建前端、同步后端、生成图标、准备并探测 FFmpeg、扫描发布输入中的凭据，再生成安装版和便携版。正式发布前还应运行全量测试、隔离用户目录启动、端口冲突、双开、迁移、安装/卸载数据保留和最终 EXE 敏感信息扫描。
+
+## macOS 测试包
+
+macOS 包必须在对应架构的真实 Mac 上原生构建。正式发行工作流使用 `macos-15-intel` 生成 Intel x64 的 DMG/ZIP，使用 `macos-15` 生成 Apple Silicon arm64 的 DMG/ZIP；Windows 上的旧手工重打包入口已停用，避免再次产生能解压但不能可靠安装或运行的伪 Mac 包。
+
+在真实 Mac 源码构建时执行：
+
+```bash
+git lfs pull
+cd desktop
+npm ci
+npm run dist:mac:x64     # 仅 Intel Mac
+npm run dist:mac:arm64   # 仅 Apple Silicon Mac
+```
+
+通用版产物位于 `desktop/release-mac-universal`，优先分发 DMG，ZIP 作为备用；银子 API 专属版仍位于 `desktop/release-mac`。未配置 Apple Developer 凭据时是未签名内测包；配置 `CSC_LINK`、`CSC_KEY_PASSWORD`、`APPLE_ID`、`APPLE_APP_SPECIFIC_PASSWORD` 和 `APPLE_TEAM_ID` 后可走签名/公证链。安装、Gatekeeper 放行和反馈日志位置见 [Mac 小白测试说明](desktop/release-docs/Mac小白测试说明.md)。
+
+## 数据与隐私
+
+- API Key 只写入用户本机配置，不写入源码、演示素材或安装包。
+- 模拟体验、3D 导演台和本地剪辑无需付费 API；文本、生图、视频与 Edge Neural 语音需要联网。
+- 默认服务可使用 YinziAPI，也支持其它 OpenAI 兼容站点；其它站点可能需要手动配置模型能力和价格。
+- `https://image.yinziapi.top/` 可在「AI 配置 → 配置银子媒体站」中一次填写文本、图片、视频三个 Key；它是普通分组站点，不使用智能路由。系统预置 `gpt-5.6-sol`、`gpt-image-2`、Seedance 2.5-720（固定 30 秒）和 Seedance 2.0-720（5/10/15 秒），仍可在配置列表中手动修改或输入新模型。
+- 工作流内核支持 `yinzi`（银子 API 专用版）与 `universal`（通用 NewAPI/sub2 版）发行版 profile；profile 只改变引导文案和默认站点，不构成模型/能力门控。`image.yinziapi.top` 在两个版本均为三 Key、老李兼容协议的普通站点。
+- 达到预算上限只停止新的外部提交，不删除已经生成的资产。
+
+## 开源来源
+
+本项目基于 LocalMiniDrama 继续开发。原项目版权与 MIT 授权信息保留在 [LICENSE](LICENSE)、Git 历史和 [第三方声明](desktop/THIRD_PARTY_NOTICES.txt) 中。当前产品品牌、维护入口与发行包均由银子维护；旧项目的个人联系方式、群二维码和收款二维码不属于本产品入口。
