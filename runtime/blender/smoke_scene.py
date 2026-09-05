@@ -91,13 +91,25 @@ def build_scene(engine):
 
 
 def export_glb(path):
-    # Blender 4.x exposes wm.gltf_export; older versions use export_scene.gltf.
+    # Blender 4.x/5.x may expose a placeholder wm operator until the bundled
+    # glTF add-on is enabled; older versions use export_scene.gltf directly.
     if hasattr(bpy.ops.wm, "gltf_export"):
-        bpy.ops.wm.gltf_export(filepath=path, export_format="GLB")
-        return "wm.gltf_export"
+        try:
+            bpy.ops.wm.gltf_export(filepath=path, export_format="GLB")
+            return "wm.gltf_export"
+        except (AttributeError, RuntimeError):
+            pass
+    if hasattr(bpy.ops.preferences, "addon_enable"):
+        try:
+            bpy.ops.preferences.addon_enable(module="io_scene_gltf2")
+        except (AttributeError, RuntimeError):
+            pass
     if hasattr(bpy.ops.export_scene, "gltf"):
-        bpy.ops.export_scene.gltf(filepath=path, export_format="GLB")
-        return "export_scene.gltf"
+        try:
+            bpy.ops.export_scene.gltf(filepath=path, export_format="GLB")
+            return "export_scene.gltf"
+        except (AttributeError, RuntimeError):
+            pass
     return None
 
 
