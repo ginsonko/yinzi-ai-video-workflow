@@ -84,6 +84,10 @@ function routes(db, cfg, log, injected = {}) {
       try { response.success(res, blender.prepareBlenderSmoke(cfg, req.body || {})); }
       catch (error) { sendError(res, log, 'blender smoke prepare', error); }
     },
+    renderBlenderScene: (req, res) => {
+      try { response.success(res, blender.runBlenderRender(cfg, req.body || {})); }
+      catch (error) { sendError(res, log, 'blender scene render', error); }
+    },
     productionMedia: (req, res) => {
       try {
         const result = repo.listProductionMedia(db, req.query || {});

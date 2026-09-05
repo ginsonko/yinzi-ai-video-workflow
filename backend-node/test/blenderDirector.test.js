@@ -5,11 +5,14 @@ const os = require('node:os');
 const path = require('node:path');
 const {
   CAPABILITY_SCHEMA,
+  RENDER_PLAN_SCHEMA,
   SMOKE_PLAN_SCHEMA,
   candidateExecutables,
   detectBlender,
   parseVersion,
   prepareBlenderSmoke,
+  prepareBlenderRender,
+  runBlenderRender,
   probeOne,
 } = require('../src/services/blenderDirector');
 const { getModule } = require('../src/services/orchestrationModuleCatalog');
@@ -83,6 +86,10 @@ test('publishes the smoke bridge as a discoverable, zero-side-effect orchestrati
   assert.equal(contract.side_effects.filesystem_write, false);
   assert.equal(contract.side_effects.paid, false);
   assert.deepEqual(contract.outputs, ['blender_capability', 'smoke_plan']);
+  const renderContract = getModule('director.blender-render');
+  assert.equal(renderContract.availability, 'integrated');
+  assert.equal(renderContract.side_effects.paid, false);
+  assert.deepEqual(renderContract.outputs, ['blend_project', 'rendered_frames', 'glb_preview', 'reference_video', 'render_manifest']);
 });
 
 test('prepares a deterministic, no-side-effect smoke plan from the director scene contract', () => {
@@ -151,4 +158,58 @@ test('rejects missing or invalid scenes before capability probing', () => {
     request_key: 'session-4',
     scene: { active_camera_id: 'missing', objects: [], timeline: { duration: 5, keyframes: [] } },
   }, { candidates: ['missing'], spawnSync: () => ({}) }), /导演台方案必须包含/);
+});
+
+test('prepares a bounded professional render plan and executes it idempotently', () => {
+  const storageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'blender-director-render-'));
+  let calls = 0;
+  let renderCalls = 0;
+  try {
+    const input = {
+      request_key: 'session-5:shot-1',
+      scene: {
+        ...scene(),
+        timeline: {
+          duration: 5,
+          keyframes: [
+            { object_id: 'camera', time: 0, position: [4, -4, 3] },
+            { object_id: 'camera', time: 5, position: [2, -2, 2.5] },
+          ],
+        },
+      },
+      max_preview_frames: 6,
+      width: 320,
+      height: 180,
+    };
+    const options = {
+      candidates: ['fake-blender'],
+      now: () => '2026-09-05T00:00:00.000Z',
+      spawnSync: (_executable, args) => {
+        calls += 1;
+        if (args.includes('--python')) {
+          renderCalls += 1;
+          const outputIndex = args.indexOf('--output');
+          const output = args[outputIndex + 1];
+          fs.mkdirSync(output, { recursive: true });
+          fs.writeFileSync(path.join(output, 'manifest.json'), JSON.stringify({ schema: 'yinzi.blender-render-result/v1', status: 'succeeded', frames: ['frames/frame-0001.png'], blend: 'scene.blend', glb: 'scene.glb' }));
+        }
+        return { status: 0, stdout: 'Blender 5.2.1\\n', stderr: '' };
+      },
+    };
+    const plan = prepareBlenderRender({ storage: { local_path: storageDir } }, input, options);
+    assert.equal(plan.schema, RENDER_PLAN_SCHEMA);
+    assert.equal(plan.status, 'ready_to_execute');
+    assert.equal(plan.executed, false);
+    assert.equal(plan.profile.frames.length, 6);
+    assert.equal(plan.profile.resolution.width, 320);
+    const result = runBlenderRender({ storage: { local_path: storageDir } }, input, { ...options, encodeVideo: false });
+    assert.equal(result.executed, true);
+    assert.equal(result.status, 'succeeded');
+    assert.equal(result.side_effects.paid, false);
+    const repeated = runBlenderRender({ storage: { local_path: storageDir } }, input, { ...options, encodeVideo: false });
+    assert.equal(repeated.reused, true);
+    assert.equal(renderCalls, 1);
+  } finally {
+    fs.rmSync(storageDir, { recursive: true, force: true });
+  }
 });

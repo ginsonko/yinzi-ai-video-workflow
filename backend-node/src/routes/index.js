@@ -106,6 +106,7 @@ function setupRouter(cfg, db, log, injected = {}) {
   // they never start Blender or a paid provider request.
   r.get('/production-director/blender/capability', production.blenderCapability);
   r.post('/production-director/blender/smoke/prepare', production.prepareBlenderSmoke);
+  r.post('/production-director/blender/render', production.renderBlenderScene);
   r.get('/production-media', production.productionMedia);
   r.get('/production-runs', production.listRuns);
   r.post('/production-runs', production.createRun);

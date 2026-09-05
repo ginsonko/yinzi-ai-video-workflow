@@ -69,6 +69,7 @@ const MODULES = Object.freeze([
   // and smoke-plan bridge. Actual rendering is deliberately a later module
   // after the local Blender installation and artifact contracts are verified.
   moduleContract('director.blender-smoke', 'V3', 'create', 'local', 'bridge', 'Probe the local Blender installation and prepare a deterministic offline smoke plan without starting a process or creating media.', ['scene_document', 'request_key'], ['blender_capability', 'smoke_plan'], { filesystem_write: false, database_write: false }),
+  moduleContract('director.blender-render', 'V3', 'create', 'local', 'integrated', 'Render a normalized director scene locally with Blender, export an editable project, sampled frames and a browser GLB proxy, then encode an optional reference preview without provider charges.', ['scene_document', 'request_key'], ['blend_project', 'rendered_frames', 'glb_preview', 'reference_video', 'render_manifest'], { filesystem_write: true, database_write: false }),
 
   // V4 - proposal/sandbox capabilities. Application remains a deliberate
   // Codex action with diff, tests, confirmation and rollback outside this API.
