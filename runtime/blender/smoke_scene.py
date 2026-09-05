@@ -31,13 +31,21 @@ def clean_scene():
 
 def build_scene(engine):
     scene = bpy.context.scene
-    if engine in {"BLENDER_EEVEE_NEXT", "BLENDER_EEVEE"}:
+    # Blender renamed the Eevee enum across releases. Try the requested
+    # engine first, then known compatible fallbacks instead of assuming a
+    # particular version's identifier.
+    engine_candidates = []
+    for candidate in (engine, "BLENDER_EEVEE_NEXT", "BLENDER_EEVEE", "BLENDER_WORKBENCH", "CYCLES"):
+        if candidate and candidate not in engine_candidates:
+            engine_candidates.append(candidate)
+    for candidate in engine_candidates:
         try:
-            scene.render.engine = engine
-        except Exception:
-            scene.render.engine = "BLENDER_EEVEE_NEXT"
+            scene.render.engine = candidate
+            break
+        except (TypeError, ValueError):
+            continue
     else:
-        scene.render.engine = "BLENDER_EEVEE_NEXT"
+        raise RuntimeError("No supported Blender render engine is available")
     scene.render.resolution_x = 320
     scene.render.resolution_y = 180
     scene.render.resolution_percentage = 100
