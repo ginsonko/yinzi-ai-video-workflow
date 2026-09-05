@@ -67,6 +67,7 @@
       </el-radio-group>
       <el-button :icon="Camera" circle title="下载当前画面" @click="downloadScreenshot" />
       <el-button :icon="Crop" circle title="保存为项目参考图" :loading="uploadingFrame" @click="saveFrameToProject" />
+      <el-button :icon="VideoCamera" :loading="blenderRendering" title="用 Blender 生成专业参考成果" @click="renderWithBlender">Blender 专业渲染</el-button>
       <el-button
         :icon="recording ? VideoPause : VideoCamera"
         circle
@@ -75,6 +76,18 @@
         @click="toggleRecording"
       />
     </div>
+
+    <section v-if="blenderRendering || blenderRenderResult" class="blender-render-result" aria-live="polite">
+      <div class="blender-render-heading">
+        <div><strong>Blender 专业参考成果</strong><span v-if="blenderRendering">正在渲染当前场景，完成后会保留可编辑工程和参考视频</span><span v-else>{{ blenderRenderResult?.status === 'succeeded' ? '渲染完成，可继续修改场景或下载成果' : blenderRenderResult?.blocked_reason ? `暂时无法运行：${blenderRenderResult.blocked_reason}` : '渲染未完成，已保留可恢复的中间结果' }}</span></div>
+        <el-tag v-if="blenderRenderResult" :type="blenderRenderResult.status === 'succeeded' ? 'success' : blenderRenderResult.status === 'blocked' ? 'warning' : 'danger'" effect="plain">{{ blenderRenderResult.status }}</el-tag>
+      </div>
+      <el-progress v-if="blenderRendering" :percentage="60" :indeterminate="true" :show-text="false" />
+      <div v-if="blenderRenderLinks.length" class="blender-render-links">
+        <a v-for="item in blenderRenderLinks" :key="item.href" :href="item.href" target="_blank" rel="noreferrer">{{ item.label }}</a>
+      </div>
+      <small v-if="blenderRenderResult?.error_message" class="blender-render-error">{{ blenderRenderResult.error_message }}</small>
+    </section>
 
     <main class="director-main">
       <section ref="viewportRef" class="director-viewport">
@@ -404,6 +417,8 @@ const saveState = ref('未保存')
 const uploadingFrame = ref(false)
 const recording = ref(false)
 const workflowSaving = ref(false)
+const blenderRendering = ref(false)
+const blenderRenderResult = ref(null)
 const playing = ref(false)
 const currentTime = ref(0)
 const timelineDuration = ref(5)
@@ -419,6 +434,21 @@ const assetCategory = ref('all')
 const tutorialVisible = ref(false)
 const autoRecordKeyframes = ref(true)
 const workflowAspectRatio = ref('16:9')
+
+const blenderRenderLinks = computed(() => {
+  const result = blenderRenderResult.value
+  const outputDir = result?.command?.output_dir || (result?.plan_id ? `blender/render/${result.plan_id}` : '')
+  if (!outputDir) return []
+  const base = `/static/${String(outputDir).replace(/^\/+|\/+$/g, '')}`
+  const links = []
+  const manifest = result?.blender || result
+  if (manifest?.blend) links.push({ label: '下载 .blend 工程', href: `${base}/${manifest.blend}` })
+  if (manifest?.glb) links.push({ label: '查看 GLB 预览', href: `${base}/${manifest.glb}` })
+  if (result?.video?.relative_path) links.push({ label: '播放参考 MP4', href: `${base}/${result.video.relative_path}` })
+  const firstFrame = Array.isArray(manifest?.frames) ? manifest.frames[0] : null
+  if (firstFrame) links.push({ label: '查看首帧 PNG', href: `${base}/${firstFrame}` })
+  return links
+})
 
 const selectedForm = reactive({
   name: '', px: 0, py: 0, pz: 0,
@@ -1036,6 +1066,29 @@ async function saveLocal() {
   }
 }
 
+async function renderWithBlender() {
+  if (blenderRendering.value) return
+  applyInspector()
+  blenderRendering.value = true
+  try {
+    const result = await productionAPI.renderBlenderScene({
+      request_key: `director:${workflowRunId.value || dramaId.value || 'standalone'}:${workflowShotId.value || storyboardId.value || 'scene'}`,
+      scene: serializeDocument(),
+      max_preview_frames: 24,
+      width: 640,
+      height: 360,
+    })
+    blenderRenderResult.value = result
+    if (result?.status === 'succeeded') ElMessage.success('Blender 参考成果已生成')
+    else if (result?.status === 'blocked') ElMessage.warning('当前设备没有可用 Blender，已保留 Three.js 预演')
+    else ElMessage.warning('Blender 渲染未完成，但已保留可恢复结果')
+  } catch (error) {
+    ElMessage.error(error.message || 'Blender 渲染失败')
+  } finally {
+    blenderRendering.value = false
+  }
+}
+
 function exportJson() {
   applyInspector()
   const blob = new Blob([JSON.stringify(serializeDocument(), null, 2)], { type: 'application/json' })
@@ -1498,6 +1551,15 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
+.blender-render-result { margin: 0 20px 14px; padding: 12px 14px; border: 1px solid #c8ddd7; background: #f5fbf8; display: grid; gap: 9px; }
+.blender-render-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.blender-render-heading > div { display: grid; gap: 3px; min-width: 0; }
+.blender-render-heading strong { color: #183f38; font-size: 13px; }
+.blender-render-heading span { color: #63736e; font-size: 11px; line-height: 1.45; }
+.blender-render-links { display: flex; flex-wrap: wrap; gap: 8px 14px; }
+.blender-render-links a { color: #0f766e; font-size: 12px; text-decoration: none; }
+.blender-render-links a:hover { text-decoration: underline; }
+.blender-render-error { color: #a33a2f; line-height: 1.5; }
 .director-studio {
   height: 100vh;
   min-height: 560px;

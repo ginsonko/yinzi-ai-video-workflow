@@ -4,6 +4,12 @@ export const productionAPI = {
   graph() {
     return request.get('/production-graph')
   },
+  blenderCapability() {
+    return request.get('/production-director/blender/capability')
+  },
+  renderBlenderScene(body) {
+    return request.post('/production-director/blender/render', body, { timeout: 600000 })
+  },
   listRuns(params = {}) {
     return request.get('/production-runs', { params })
   },
